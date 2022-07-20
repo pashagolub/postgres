@@ -3,4 +3,11 @@ tasks:
       sudo apt-get -yq install build-essential libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache
       ./configure
       make
-  - command: echo "let's start"
+      sudo make install
+      sudo adduser --disabled-password --gecos "" postgres
+      sudo mkdir /usr/local/pgsql/data
+      sudo chown postgres /usr/local/pgsql/data
+      sudo sudo -u postgres /usr/local/pgsql/bin/initdb -D /usr/local/pgsql/data
+      sudo sudo -u postgres /usr/local/pgsql/bin/pg_ctl -D /usr/local/pgsql/data -l /usr/local/pgsql/data/postgres.log start
+      sudo sudo -u postgres /usr/local/pgsql/bin/createdb test
+      sudo sudo -u postgres /usr/local/pgsql/bin/psql test
