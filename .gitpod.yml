@@ -10,4 +10,4 @@ tasks:
       sudo sudo -u postgres /usr/local/pgsql/bin/initdb -D /usr/local/pgsql/data
       sudo sudo -u postgres /usr/local/pgsql/bin/pg_ctl -D /usr/local/pgsql/data -l /usr/local/pgsql/data/postgres.log start
       sudo sudo -u postgres /usr/local/pgsql/bin/createdb test
-      sudo sudo -u postgres /usr/local/pgsql/bin/psql test
+      sudo sudo -u postgres /usr/local/pgsql/bin/psql test -c "select version()"
