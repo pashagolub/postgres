@@ -75,6 +75,7 @@
 #include <dirent.h>
 #include <sys/file.h>
 #include <sys/param.h>
+#include <sys/resource.h>		/* for getrlimit */
 #include <sys/stat.h>
 #include <sys/types.h>
 #ifndef WIN32
@@ -83,9 +84,6 @@
 #include <limits.h>
 #include <unistd.h>
 #include <fcntl.h>
-#ifdef HAVE_SYS_RESOURCE_H
-#include <sys/resource.h>		/* for getrlimit */
-#endif
 
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -442,20 +440,12 @@ pg_fsync_writethrough(int fd)
 
 /*
  * pg_fdatasync --- same as fdatasync except does nothing if enableFsync is off
- *
- * Not all platforms have fdatasync; treat as fsync if not available.
  */
 int
 pg_fdatasync(int fd)
 {
 	if (enableFsync)
-	{
-#ifdef HAVE_FDATASYNC
 		return fdatasync(fd);
-#else
-		return fsync(fd);
-#endif
-	}
 	else
 		return 0;
 }
@@ -895,11 +885,7 @@ count_usable_fds(int max_to_probe, int *usable_fds, int *already_open)
 	fd = (int *) palloc(size * sizeof(int));
 
 #ifdef HAVE_GETRLIMIT
-#ifdef RLIMIT_NOFILE			/* most platforms use RLIMIT_NOFILE */
 	getrlimit_status = getrlimit(RLIMIT_NOFILE, &rlim);
-#else							/* but BSD doesn't ... */
-	getrlimit_status = getrlimit(RLIMIT_OFILE, &rlim);
-#endif							/* RLIMIT_NOFILE */
 	if (getrlimit_status != 0)
 		ereport(WARNING, (errmsg("getrlimit failed: %m")));
 #endif							/* HAVE_GETRLIMIT */
@@ -992,7 +978,7 @@ set_max_safe_fds(void)
 		ereport(FATAL,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 				 errmsg("insufficient file descriptors available to start server process"),
-				 errdetail("System allows %d, we need at least %d.",
+				 errdetail("System allows %d, server needs at least %d.",
 						   max_safe_fds + NUM_RESERVED_FDS,
 						   FD_MINFREE + NUM_RESERVED_FDS)));
 
@@ -2517,8 +2503,7 @@ OpenPipeStream(const char *command, const char *mode)
 	ReleaseLruFiles();
 
 TryAgain:
-	fflush(stdout);
-	fflush(stderr);
+	fflush(NULL);
 	pqsignal(SIGPIPE, SIG_DFL);
 	errno = 0;
 	file = popen(command, mode);
@@ -3171,17 +3156,11 @@ RemovePgTempFilesInDir(const char *tmpdirname, bool missing_ok, bool unlink_all)
 					PG_TEMP_FILE_PREFIX,
 					strlen(PG_TEMP_FILE_PREFIX)) == 0)
 		{
-			struct stat statbuf;
+			PGFileType	type = get_dirent_type(rm_path, temp_de, false, LOG);
 
-			if (lstat(rm_path, &statbuf) < 0)
-			{
-				ereport(LOG,
-						(errcode_for_file_access(),
-						 errmsg("could not stat file \"%s\": %m", rm_path)));
+			if (type == PGFILETYPE_ERROR)
 				continue;
-			}
-
-			if (S_ISDIR(statbuf.st_mode))
+			else if (type == PGFILETYPE_DIR)
 			{
 				/* recursively remove contents, then directory itself */
 				RemovePgTempFilesInDir(rm_path, false, true);
@@ -3377,7 +3356,6 @@ SyncDataDirectory(void)
 	 */
 	xlog_is_symlink = false;
 
-#ifndef WIN32
 	{
 		struct stat st;
 
@@ -3389,10 +3367,6 @@ SyncDataDirectory(void)
 		else if (S_ISLNK(st.st_mode))
 			xlog_is_symlink = true;
 	}
-#else
-	if (pgwin32_is_junction("pg_wal"))
-		xlog_is_symlink = true;
-#endif
 
 #ifdef HAVE_SYNCFS
 	if (recovery_init_sync_method == RECOVERY_INIT_SYNC_METHOD_SYNCFS)

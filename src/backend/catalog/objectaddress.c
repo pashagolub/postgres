@@ -27,6 +27,7 @@
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_attrdef.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_auth_members.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
@@ -382,6 +383,20 @@ static const ObjectPropertyType ObjectProperty[] =
 		Anum_pg_authid_rolname,
 		InvalidAttrNumber,
 		InvalidAttrNumber,
+		InvalidAttrNumber,
+		-1,
+		true
+	},
+	{
+		"role membership",
+		AuthMemRelationId,
+		AuthMemOidIndexId,
+		-1,
+		-1,
+		Anum_pg_auth_members_oid,
+		InvalidAttrNumber,
+		InvalidAttrNumber,
+		Anum_pg_auth_members_grantor,
 		InvalidAttrNumber,
 		-1,
 		true
@@ -786,6 +801,10 @@ static const struct object_type_map
 	/* OCLASS_ROLE */
 	{
 		"role", OBJECT_ROLE
+	},
+	/* OCLASS_ROLE_MEMBERSHIP */
+	{
+		"role membership", -1	/* unmapped */
 	},
 	/* OCLASS_DATABASE */
 	{
@@ -2186,7 +2205,7 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 	else
 	{
 		name = textarray_to_strvaluelist(namearr);
-		if (list_length(name) < 1)
+		if (name == NIL)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("name list length must be at least %d", 1)));
@@ -2235,10 +2254,16 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 	 */
 	switch (type)
 	{
+		case OBJECT_PUBLICATION_NAMESPACE:
+		case OBJECT_USER_MAPPING:
+			if (list_length(name) != 1)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("name list length must be exactly %d", 1)));
+			/* fall through to check args length */
+			/* FALLTHROUGH */
 		case OBJECT_DOMCONSTRAINT:
 		case OBJECT_CAST:
-		case OBJECT_USER_MAPPING:
-		case OBJECT_PUBLICATION_NAMESPACE:
 		case OBJECT_PUBLICATION_REL:
 		case OBJECT_DEFACL:
 		case OBJECT_TRANSFORM:
@@ -3644,6 +3669,48 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
+		case OCLASS_ROLE_MEMBERSHIP:
+			{
+				Relation	amDesc;
+				ScanKeyData skey[1];
+				SysScanDesc rcscan;
+				HeapTuple	tup;
+				Form_pg_auth_members amForm;
+
+				amDesc = table_open(AuthMemRelationId, AccessShareLock);
+
+				ScanKeyInit(&skey[0],
+							Anum_pg_auth_members_oid,
+							BTEqualStrategyNumber, F_OIDEQ,
+							ObjectIdGetDatum(object->objectId));
+
+				rcscan = systable_beginscan(amDesc, AuthMemOidIndexId, true,
+											NULL, 1, skey);
+
+				tup = systable_getnext(rcscan);
+
+				if (!HeapTupleIsValid(tup))
+				{
+					if (!missing_ok)
+						elog(ERROR, "could not find tuple for role membership %u",
+							 object->objectId);
+
+					systable_endscan(rcscan);
+					table_close(amDesc, AccessShareLock);
+					break;
+				}
+
+				amForm = (Form_pg_auth_members) GETSTRUCT(tup);
+
+				appendStringInfo(&buffer, _("membership of role %s in role %s"),
+								 GetUserNameFromId(amForm->member, false),
+								 GetUserNameFromId(amForm->roleid, false));
+
+				systable_endscan(rcscan);
+				table_close(amDesc, AccessShareLock);
+				break;
+			}
+
 		case OCLASS_DATABASE:
 			{
 				char	   *datname;
@@ -4531,6 +4598,10 @@ getObjectTypeDescription(const ObjectAddress *object, bool missing_ok)
 
 		case OCLASS_ROLE:
 			appendStringInfoString(&buffer, "role");
+			break;
+
+		case OCLASS_ROLE_MEMBERSHIP:
+			appendStringInfoString(&buffer, "role membership");
 			break;
 
 		case OCLASS_DATABASE:
@@ -5473,6 +5544,49 @@ getObjectIdentityParts(const ObjectAddress *object,
 					*objname = list_make1(username);
 				appendStringInfoString(&buffer,
 									   quote_identifier(username));
+				break;
+			}
+
+		case OCLASS_ROLE_MEMBERSHIP:
+			{
+				Relation	authMemDesc;
+				ScanKeyData skey[1];
+				SysScanDesc amscan;
+				HeapTuple	tup;
+				Form_pg_auth_members amForm;
+
+				authMemDesc = table_open(AuthMemRelationId,
+										 AccessShareLock);
+
+				ScanKeyInit(&skey[0],
+							Anum_pg_auth_members_oid,
+							BTEqualStrategyNumber, F_OIDEQ,
+							ObjectIdGetDatum(object->objectId));
+
+				amscan = systable_beginscan(authMemDesc, AuthMemOidIndexId, true,
+											NULL, 1, skey);
+
+				tup = systable_getnext(amscan);
+
+				if (!HeapTupleIsValid(tup))
+				{
+					if (!missing_ok)
+						elog(ERROR, "could not find tuple for pg_auth_members entry %u",
+							 object->objectId);
+
+					systable_endscan(amscan);
+					table_close(authMemDesc, AccessShareLock);
+					break;
+				}
+
+				amForm = (Form_pg_auth_members) GETSTRUCT(tup);
+
+				appendStringInfo(&buffer, _("membership of role %s in role %s"),
+								 GetUserNameFromId(amForm->member, false),
+								 GetUserNameFromId(amForm->roleid, false));
+
+				systable_endscan(amscan);
+				table_close(authMemDesc, AccessShareLock);
 				break;
 			}
 

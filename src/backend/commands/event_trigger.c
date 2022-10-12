@@ -94,7 +94,7 @@ static void AlterEventTriggerOwner_internal(Relation rel,
 static void error_duplicate_filter_variable(const char *defname);
 static Datum filter_list_to_array(List *filterlist);
 static Oid	insert_event_trigger_tuple(const char *trigname, const char *eventname,
-									   Oid evtOwner, Oid funcoid, List *tags);
+									   Oid evtOwner, Oid funcoid, List *taglist);
 static void validate_ddl_tags(const char *filtervar, List *taglist);
 static void validate_table_rewrite_tags(const char *filtervar, List *taglist);
 static void EventTriggerInvoke(List *fn_oid_list, EventTriggerData *trigdata);
@@ -1015,6 +1015,7 @@ EventTriggerSupportsObjectClass(ObjectClass objclass)
 		case OCLASS_DATABASE:
 		case OCLASS_TBLSPACE:
 		case OCLASS_ROLE:
+		case OCLASS_ROLE_MEMBERSHIP:
 		case OCLASS_PARAMETER_ACL:
 			/* no support for global objects */
 			return false;
@@ -1143,9 +1144,9 @@ trackDroppedObjectsNeeded(void)
 	 * true if any sql_drop, table_rewrite, ddl_command_end event trigger
 	 * exists
 	 */
-	return list_length(EventCacheLookup(EVT_SQLDrop)) > 0 ||
-		list_length(EventCacheLookup(EVT_TableRewrite)) > 0 ||
-		list_length(EventCacheLookup(EVT_DDLCommandEnd)) > 0;
+	return (EventCacheLookup(EVT_SQLDrop) != NIL) ||
+		(EventCacheLookup(EVT_TableRewrite) != NIL) ||
+		(EventCacheLookup(EVT_DDLCommandEnd) != NIL);
 }
 
 /*
@@ -1616,7 +1617,7 @@ EventTriggerAlterTableEnd(void)
 	parent = currentEventTriggerState->currentCommand->parent;
 
 	/* If no subcommands, don't collect */
-	if (list_length(currentEventTriggerState->currentCommand->d.alterTable.subcmds) != 0)
+	if (currentEventTriggerState->currentCommand->d.alterTable.subcmds != NIL)
 	{
 		MemoryContext oldcxt;
 

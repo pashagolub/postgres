@@ -32,6 +32,8 @@
  * If none of the caches have overflowed, we can assume that an XID that's not
  * listed anywhere in the PGPROC array is not a running transaction.  Else we
  * have to look at pg_subtrans.
+ *
+ * See src/test/isolation/specs/subxid-overflow.spec if you change this.
  */
 #define PGPROC_MAX_CACHED_SUBXIDS 64	/* XXX guessed-at value */
 
@@ -191,7 +193,11 @@ struct PGPROC
 
 	int			pgxactoff;		/* offset into various ProcGlobal->arrays with
 								 * data mirrored from this PGPROC */
-	int			pgprocno;
+
+	int			pgprocno;		/* Number of this PGPROC in
+								 * ProcGlobal->allProcs array. This is set
+								 * once by InitProcGlobal().
+								 * ProcGlobal->allProcs[n].pgprocno == n */
 
 	/* These fields are zero while a backend is still starting up: */
 	BackendId	backendId;		/* This backend's backend ID (if assigned) */

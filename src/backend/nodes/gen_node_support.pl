@@ -174,7 +174,7 @@ push @scalar_types, qw(QualCost);
 
 
 ## check that we have the expected number of files on the command line
-die "wrong number of input files, expected @all_input_files\n"
+die "wrong number of input files, expected:\n@all_input_files\ngot:\n@ARGV\n"
   if ($#ARGV != $#all_input_files);
 
 ## read input
@@ -983,29 +983,29 @@ _read${n}(void)
 		}
 		elsif ($t eq 'double')
 		{
-			print $off "\tWRITE_FLOAT_FIELD($f, \"%.6f\");\n";
+			print $off "\tWRITE_FLOAT_FIELD($f);\n";
 			print $rff "\tREAD_FLOAT_FIELD($f);\n" unless $no_read;
 		}
 		elsif ($t eq 'Cardinality')
 		{
-			print $off "\tWRITE_FLOAT_FIELD($f, \"%.0f\");\n";
+			print $off "\tWRITE_FLOAT_FIELD($f);\n";
 			print $rff "\tREAD_FLOAT_FIELD($f);\n" unless $no_read;
 		}
 		elsif ($t eq 'Cost')
 		{
-			print $off "\tWRITE_FLOAT_FIELD($f, \"%.2f\");\n";
+			print $off "\tWRITE_FLOAT_FIELD($f);\n";
 			print $rff "\tREAD_FLOAT_FIELD($f);\n" unless $no_read;
 		}
 		elsif ($t eq 'QualCost')
 		{
-			print $off "\tWRITE_FLOAT_FIELD($f.startup, \"%.2f\");\n";
-			print $off "\tWRITE_FLOAT_FIELD($f.per_tuple, \"%.2f\");\n";
+			print $off "\tWRITE_FLOAT_FIELD($f.startup);\n";
+			print $off "\tWRITE_FLOAT_FIELD($f.per_tuple);\n";
 			print $rff "\tREAD_FLOAT_FIELD($f.startup);\n"   unless $no_read;
 			print $rff "\tREAD_FLOAT_FIELD($f.per_tuple);\n" unless $no_read;
 		}
 		elsif ($t eq 'Selectivity')
 		{
-			print $off "\tWRITE_FLOAT_FIELD($f, \"%.4f\");\n";
+			print $off "\tWRITE_FLOAT_FIELD($f);\n";
 			print $rff "\tREAD_FLOAT_FIELD($f);\n" unless $no_read;
 		}
 		elsif ($t eq 'char*')

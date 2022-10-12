@@ -63,6 +63,7 @@
 #include "access/xlogreader.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
+#include "backup/basebackup.h"
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
 #include "catalog/pg_database.h"
@@ -77,7 +78,6 @@
 #include "postmaster/bgwriter.h"
 #include "postmaster/startup.h"
 #include "postmaster/walwriter.h"
-#include "replication/basebackup.h"
 #include "replication/logical.h"
 #include "replication/origin.h"
 #include "replication/slot.h"
@@ -97,7 +97,8 @@
 #include "storage/smgr.h"
 #include "storage/spin.h"
 #include "storage/sync.h"
-#include "utils/guc.h"
+#include "utils/guc_hooks.h"
+#include "utils/guc_tables.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/relmapper.h"
@@ -105,6 +106,7 @@
 #include "utils/snapmgr.h"
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
+#include "utils/varlena.h"
 
 extern uint32 bootstrap_data_checksum_version;
 
@@ -161,6 +163,12 @@ static double CheckPointDistanceEstimate = 0;
 static double PrevCheckPointDistance = 0;
 
 /*
+ * Track whether there were any deferred checks for custom resource managers
+ * specified in wal_consistency_checking.
+ */
+static bool check_wal_consistency_checking_deferred = false;
+
+/*
  * GUC support
  */
 const struct config_enum_entry sync_method_options[] = {
@@ -168,13 +176,11 @@ const struct config_enum_entry sync_method_options[] = {
 #ifdef HAVE_FSYNC_WRITETHROUGH
 	{"fsync_writethrough", SYNC_METHOD_FSYNC_WRITETHROUGH, false},
 #endif
-#ifdef HAVE_FDATASYNC
 	{"fdatasync", SYNC_METHOD_FDATASYNC, false},
-#endif
-#ifdef OPEN_SYNC_FLAG
+#ifdef O_SYNC
 	{"open_sync", SYNC_METHOD_OPEN, false},
 #endif
-#ifdef OPEN_DATASYNC_FLAG
+#ifdef O_DSYNC
 	{"open_datasync", SYNC_METHOD_OPEN_DSYNC, false},
 #endif
 	{NULL, 0, false}
@@ -642,7 +648,7 @@ static void XLogReportParameters(void);
 static int	LocalSetXLogInsertAllowed(void);
 static void CreateEndOfRecoveryRecord(void);
 static XLogRecPtr CreateOverwriteContrecordRecord(XLogRecPtr aborted_lsn,
-												  XLogRecPtr missingContrecPtr,
+												  XLogRecPtr pagePtr,
 												  TimeLineID newTLI);
 static void CheckPointGuts(XLogRecPtr checkPointRedo, int flags);
 static void KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo);
@@ -659,8 +665,9 @@ static void PreallocXlogFiles(XLogRecPtr endptr, TimeLineID tli);
 static void RemoveTempXlogFiles(void);
 static void RemoveOldXlogFiles(XLogSegNo segno, XLogRecPtr lastredoptr,
 							   XLogRecPtr endptr, TimeLineID insertTLI);
-static void RemoveXlogFile(const char *segname, XLogSegNo recycleSegNo,
-						   XLogSegNo *endlogSegNo, TimeLineID insertTLI);
+static void RemoveXlogFile(const struct dirent *segment_de,
+						   XLogSegNo recycleSegNo, XLogSegNo *endlogSegNo,
+						   TimeLineID insertTLI);
 static void UpdateLastRemovedPtr(char *filename);
 static void ValidateXLOGDirectoryStructure(void);
 static void CleanupBackupHistory(void);
@@ -1778,7 +1785,7 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 	XLogRecPtr	NewPageEndPtr = InvalidXLogRecPtr;
 	XLogRecPtr	NewPageBeginPtr;
 	XLogPageHeader NewPage;
-	int			npages = 0;
+	int			npages pg_attribute_unused() = 0;
 
 	LWLockAcquire(WALBufMappingLock, LW_EXCLUSIVE);
 
@@ -3038,8 +3045,7 @@ XLogFileInitInternal(XLogSegNo logsegno, TimeLineID logtli,
 	pgstat_report_wait_start(WAIT_EVENT_WAL_INIT_SYNC);
 	if (pg_fsync(fd) != 0)
 	{
-		int			save_errno = errno;
-
+		save_errno = errno;
 		close(fd);
 		errno = save_errno;
 		ereport(ERROR,
@@ -3599,8 +3605,7 @@ RemoveOldXlogFiles(XLogSegNo segno, XLogRecPtr lastredoptr, XLogRecPtr endptr,
 				/* Update the last removed location in shared memory first */
 				UpdateLastRemovedPtr(xlde->d_name);
 
-				RemoveXlogFile(xlde->d_name, recycleSegNo, &endlogSegNo,
-							   insertTLI);
+				RemoveXlogFile(xlde, recycleSegNo, &endlogSegNo, insertTLI);
 			}
 		}
 	}
@@ -3672,8 +3677,7 @@ RemoveNonParentXlogFiles(XLogRecPtr switchpoint, TimeLineID newTLI)
 			 * - but seems safer to let them be archived and removed later.
 			 */
 			if (!XLogArchiveIsReady(xlde->d_name))
-				RemoveXlogFile(xlde->d_name, recycleSegNo, &endLogSegNo,
-							   newTLI);
+				RemoveXlogFile(xlde, recycleSegNo, &endLogSegNo, newTLI);
 		}
 	}
 
@@ -3683,9 +3687,9 @@ RemoveNonParentXlogFiles(XLogRecPtr switchpoint, TimeLineID newTLI)
 /*
  * Recycle or remove a log file that's no longer needed.
  *
- * segname is the name of the segment to recycle or remove.  recycleSegNo
- * is the segment number to recycle up to.  endlogSegNo is the segment
- * number of the current (or recent) end of WAL.
+ * segment_de is the dirent structure of the segment to recycle or remove.
+ * recycleSegNo is the segment number to recycle up to.  endlogSegNo is
+ * the segment number of the current (or recent) end of WAL.
  *
  * endlogSegNo gets incremented if the segment is recycled so as it is not
  * checked again with future callers of this function.
@@ -3694,14 +3698,15 @@ RemoveNonParentXlogFiles(XLogRecPtr switchpoint, TimeLineID newTLI)
  * should be used for this timeline.
  */
 static void
-RemoveXlogFile(const char *segname, XLogSegNo recycleSegNo,
-			   XLogSegNo *endlogSegNo, TimeLineID insertTLI)
+RemoveXlogFile(const struct dirent *segment_de,
+			   XLogSegNo recycleSegNo, XLogSegNo *endlogSegNo,
+			   TimeLineID insertTLI)
 {
 	char		path[MAXPGPATH];
 #ifdef WIN32
 	char		newpath[MAXPGPATH];
 #endif
-	struct stat statbuf;
+	const char *segname = segment_de->d_name;
 
 	snprintf(path, MAXPGPATH, XLOGDIR "/%s", segname);
 
@@ -3713,7 +3718,7 @@ RemoveXlogFile(const char *segname, XLogSegNo recycleSegNo,
 	if (wal_recycle &&
 		*endlogSegNo <= recycleSegNo &&
 		XLogCtl->InstallXLogFileSegmentActive &&	/* callee rechecks this */
-		lstat(path, &statbuf) == 0 && S_ISREG(statbuf.st_mode) &&
+		get_dirent_type(path, segment_de, false, DEBUG2) == PGFILETYPE_REG &&
 		InstallXLogFileSegment(endlogSegNo, path,
 							   true, recycleSegNo, insertTLI))
 	{
@@ -4308,6 +4313,172 @@ check_wal_buffers(int *newval, void **extra, GucSource source)
 }
 
 /*
+ * GUC check_hook for wal_consistency_checking
+ */
+bool
+check_wal_consistency_checking(char **newval, void **extra, GucSource source)
+{
+	char	   *rawstring;
+	List	   *elemlist;
+	ListCell   *l;
+	bool		newwalconsistency[RM_MAX_ID + 1];
+
+	/* Initialize the array */
+	MemSet(newwalconsistency, 0, (RM_MAX_ID + 1) * sizeof(bool));
+
+	/* Need a modifiable copy of string */
+	rawstring = pstrdup(*newval);
+
+	/* Parse string into list of identifiers */
+	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	{
+		/* syntax error in list */
+		GUC_check_errdetail("List syntax is invalid.");
+		pfree(rawstring);
+		list_free(elemlist);
+		return false;
+	}
+
+	foreach(l, elemlist)
+	{
+		char	   *tok = (char *) lfirst(l);
+		int			rmid;
+
+		/* Check for 'all'. */
+		if (pg_strcasecmp(tok, "all") == 0)
+		{
+			for (rmid = 0; rmid <= RM_MAX_ID; rmid++)
+				if (RmgrIdExists(rmid) && GetRmgr(rmid).rm_mask != NULL)
+					newwalconsistency[rmid] = true;
+		}
+		else
+		{
+			/* Check if the token matches any known resource manager. */
+			bool		found = false;
+
+			for (rmid = 0; rmid <= RM_MAX_ID; rmid++)
+			{
+				if (RmgrIdExists(rmid) && GetRmgr(rmid).rm_mask != NULL &&
+					pg_strcasecmp(tok, GetRmgr(rmid).rm_name) == 0)
+				{
+					newwalconsistency[rmid] = true;
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+			{
+				/*
+				 * During startup, it might be a not-yet-loaded custom
+				 * resource manager.  Defer checking until
+				 * InitializeWalConsistencyChecking().
+				 */
+				if (!process_shared_preload_libraries_done)
+				{
+					check_wal_consistency_checking_deferred = true;
+				}
+				else
+				{
+					GUC_check_errdetail("Unrecognized key word: \"%s\".", tok);
+					pfree(rawstring);
+					list_free(elemlist);
+					return false;
+				}
+			}
+		}
+	}
+
+	pfree(rawstring);
+	list_free(elemlist);
+
+	/* assign new value */
+	*extra = guc_malloc(ERROR, (RM_MAX_ID + 1) * sizeof(bool));
+	memcpy(*extra, newwalconsistency, (RM_MAX_ID + 1) * sizeof(bool));
+	return true;
+}
+
+/*
+ * GUC assign_hook for wal_consistency_checking
+ */
+void
+assign_wal_consistency_checking(const char *newval, void *extra)
+{
+	/*
+	 * If some checks were deferred, it's possible that the checks will fail
+	 * later during InitializeWalConsistencyChecking(). But in that case, the
+	 * postmaster will exit anyway, so it's safe to proceed with the
+	 * assignment.
+	 *
+	 * Any built-in resource managers specified are assigned immediately,
+	 * which affects WAL created before shared_preload_libraries are
+	 * processed. Any custom resource managers specified won't be assigned
+	 * until after shared_preload_libraries are processed, but that's OK
+	 * because WAL for a custom resource manager can't be written before the
+	 * module is loaded anyway.
+	 */
+	wal_consistency_checking = extra;
+}
+
+/*
+ * InitializeWalConsistencyChecking: run after loading custom resource managers
+ *
+ * If any unknown resource managers were specified in the
+ * wal_consistency_checking GUC, processing was deferred.  Now that
+ * shared_preload_libraries have been loaded, process wal_consistency_checking
+ * again.
+ */
+void
+InitializeWalConsistencyChecking(void)
+{
+	Assert(process_shared_preload_libraries_done);
+
+	if (check_wal_consistency_checking_deferred)
+	{
+		struct config_generic *guc;
+
+		guc = find_option("wal_consistency_checking", false, false, ERROR);
+
+		check_wal_consistency_checking_deferred = false;
+
+		set_config_option_ext("wal_consistency_checking",
+							  wal_consistency_checking_string,
+							  guc->scontext, guc->source, guc->srole,
+							  GUC_ACTION_SET, true, ERROR, false);
+
+		/* checking should not be deferred again */
+		Assert(!check_wal_consistency_checking_deferred);
+	}
+}
+
+/*
+ * GUC show_hook for archive_command
+ */
+const char *
+show_archive_command(void)
+{
+	if (XLogArchivingActive())
+		return XLogArchiveCommand;
+	else
+		return "(disabled)";
+}
+
+/*
+ * GUC show_hook for in_hot_standby
+ */
+const char *
+show_in_hot_standby(void)
+{
+	/*
+	 * We display the actual state based on shared memory, so that this GUC
+	 * reports up-to-date state if examined intra-query.  The underlying
+	 * variable (in_hot_standby_guc) changes only when we transmit a new value
+	 * to the client.
+	 */
+	return RecoveryInProgress() ? "on" : "off";
+}
+
+
+/*
  * Read the control file, set respective GUCs.
  *
  * This is to be called during startup, including a crash recovery cycle,
@@ -4503,9 +4674,7 @@ BootStrapXLOG(void)
 	pg_crc32c	crc;
 
 	/* allow ordinary WAL segment creation, like StartupXLOG() would */
-	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
-	XLogCtl->InstallXLogFileSegmentActive = true;
-	LWLockRelease(ControlFileLock);
+	SetInstallXLogFileSegmentActive();
 
 	/*
 	 * Select a hopefully-unique system identifier code for this installation.
@@ -4725,7 +4894,6 @@ XLogInitNewTimeline(TimeLineID endTLI, XLogRecPtr endOfLog, TimeLineID newTLI)
 
 		if (close(fd) != 0)
 		{
-			char		xlogfname[MAXFNAMELEN];
 			int			save_errno = errno;
 
 			XLogFileName(xlogfname, newTLI, startLogSegNo, wal_segment_size);
@@ -5310,6 +5478,12 @@ StartupXLOG(void)
 	missingContrecPtr = endOfRecoveryInfo->missingContrecPtr;
 
 	/*
+	 * Reset ps status display, so as no information related to recovery
+	 * shows up.
+	 */
+	set_ps_display("");
+
+	/*
 	 * When recovering from a backup (we are in recovery, and archive recovery
 	 * was requested), complain if we did not roll forward far enough to reach
 	 * the point where the database is consistent.  For regular online
@@ -5370,9 +5544,7 @@ StartupXLOG(void)
 	 * Allow ordinary WAL segment creation before possibly switching to a new
 	 * timeline, which creates a new segment, and after the last ReadRecord().
 	 */
-	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
-	XLogCtl->InstallXLogFileSegmentActive = true;
-	LWLockRelease(ControlFileLock);
+	SetInstallXLogFileSegmentActive();
 
 	/*
 	 * Consider whether we need to assign a new timeline ID.
@@ -5441,6 +5613,14 @@ StartupXLOG(void)
 	 */
 	if (!XLogRecPtrIsInvalid(missingContrecPtr))
 	{
+		/*
+		 * We should only have a missingContrecPtr if we're not switching to
+		 * a new timeline. When a timeline switch occurs, WAL is copied from
+		 * the old timeline to the new only up to the end of the last complete
+		 * record, so there can't be an incomplete WAL record that we need to
+		 * disregard.
+		 */
+		Assert(newTLI == endOfRecoveryInfo->lastRecTLI);
 		Assert(!XLogRecPtrIsInvalid(abortedRecPtr));
 		EndOfLog = missingContrecPtr;
 	}
@@ -7894,10 +8074,10 @@ get_sync_bit(int method)
 
 	/*
 	 * Optimize writes by bypassing kernel cache with O_DIRECT when using
-	 * O_SYNC/O_FSYNC and O_DSYNC.  But only if archiving and streaming are
-	 * disabled, otherwise the archive command or walsender process will read
-	 * the WAL soon after writing it, which is guaranteed to cause a physical
-	 * read if we bypassed the kernel cache. We also skip the
+	 * O_SYNC and O_DSYNC.  But only if archiving and streaming are disabled,
+	 * otherwise the archive command or walsender process will read the WAL
+	 * soon after writing it, which is guaranteed to cause a physical read if
+	 * we bypassed the kernel cache. We also skip the
 	 * posix_fadvise(POSIX_FADV_DONTNEED) call in XLogFileClose() for the same
 	 * reason.
 	 *
@@ -7921,13 +8101,13 @@ get_sync_bit(int method)
 		case SYNC_METHOD_FSYNC_WRITETHROUGH:
 		case SYNC_METHOD_FDATASYNC:
 			return 0;
-#ifdef OPEN_SYNC_FLAG
+#ifdef O_SYNC
 		case SYNC_METHOD_OPEN:
-			return OPEN_SYNC_FLAG | o_direct_flag;
+			return O_SYNC | o_direct_flag;
 #endif
-#ifdef OPEN_DATASYNC_FLAG
+#ifdef O_DSYNC
 		case SYNC_METHOD_OPEN_DSYNC:
-			return OPEN_DATASYNC_FLAG | o_direct_flag;
+			return O_DSYNC | o_direct_flag;
 #endif
 		default:
 			/* can't happen (unless we are out of sync with option array) */
@@ -8015,12 +8195,10 @@ issue_xlog_fsync(int fd, XLogSegNo segno, TimeLineID tli)
 				msg = _("could not fsync write-through file \"%s\": %m");
 			break;
 #endif
-#ifdef HAVE_FDATASYNC
 		case SYNC_METHOD_FDATASYNC:
 			if (pg_fdatasync(fd) != 0)
 				msg = _("could not fdatasync file \"%s\": %m");
 			break;
-#endif
 		case SYNC_METHOD_OPEN:
 		case SYNC_METHOD_OPEN_DSYNC:
 			/* not reachable */
@@ -8064,24 +8242,23 @@ issue_xlog_fsync(int fd, XLogSegNo segno, TimeLineID tli)
 /*
  * do_pg_backup_start is the workhorse of the user-visible pg_backup_start()
  * function. It creates the necessary starting checkpoint and constructs the
- * backup label and tablespace map.
+ * backup state and tablespace map.
  *
- * Input parameters are "backupidstr" (the backup label string) and "fast"
- * (if true, we do the checkpoint in immediate mode to make it faster).
+ * Input parameters are "state" (the backup state), "fast" (if true, we do
+ * the checkpoint in immediate mode to make it faster), and "tablespaces"
+ * (if non-NULL, indicates a list of tablespaceinfo structs describing the
+ * cluster's tablespaces.).
  *
- * The backup label and tablespace map contents are appended to *labelfile and
- * *tblspcmapfile, and the caller is responsible for including them in the
- * backup archive as 'backup_label' and 'tablespace_map'.
- * tblspcmapfile is required mainly for tar format in windows as native windows
- * utilities are not able to create symlinks while extracting files from tar.
- * However for consistency and platform-independence, we do it the same way
- * everywhere.
+ * The tablespace map contents are appended to passed-in parameter
+ * tablespace_map and the caller is responsible for including it in the backup
+ * archive as 'tablespace_map'. The tablespace_map file is required mainly for
+ * tar format in windows as native windows utilities are not able to create
+ * symlinks while extracting files from tar. However for consistency and
+ * platform-independence, we do it the same way everywhere.
  *
- * If "tablespaces" isn't NULL, it receives a list of tablespaceinfo structs
- * describing the cluster's tablespaces.
- *
- * Returns the minimum WAL location that must be present to restore from this
- * backup, and the corresponding timeline ID in *starttli_p.
+ * It fills in "state" with the information required for the backup, such
+ * as the minimum WAL location that must be present to restore from this
+ * backup (starttli) and the corresponding timeline ID (starttli).
  *
  * Every successfully started backup must be stopped by calling
  * do_pg_backup_stop() or do_pg_abort_backup(). There can be many
@@ -8090,20 +8267,13 @@ issue_xlog_fsync(int fd, XLogSegNo segno, TimeLineID tli)
  * It is the responsibility of the caller of this function to verify the
  * permissions of the calling user!
  */
-XLogRecPtr
-do_pg_backup_start(const char *backupidstr, bool fast, TimeLineID *starttli_p,
-				   StringInfo labelfile, List **tablespaces,
-				   StringInfo tblspcmapfile)
+void
+do_pg_backup_start(const char *backupidstr, bool fast, List **tablespaces,
+				   BackupState *state, StringInfo tblspcmapfile)
 {
 	bool		backup_started_in_recovery = false;
-	XLogRecPtr	checkpointloc;
-	XLogRecPtr	startpoint;
-	TimeLineID	starttli;
-	pg_time_t	stamp_time;
-	char		strfbuf[128];
-	char		xlogfilename[MAXFNAMELEN];
-	XLogSegNo	_logSegNo;
 
+	Assert(state != NULL);
 	backup_started_in_recovery = RecoveryInProgress();
 
 	/*
@@ -8121,6 +8291,8 @@ do_pg_backup_start(const char *backupidstr, bool fast, TimeLineID *starttli_p,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("backup label too long (max %d bytes)",
 						MAXPGPATH)));
+
+	memcpy(state->name, backupidstr, strlen(backupidstr));
 
 	/*
 	 * Mark backup active in shared memory.  We must do full-page WAL writes
@@ -8213,9 +8385,9 @@ do_pg_backup_start(const char *backupidstr, bool fast, TimeLineID *starttli_p,
 			 * pointer.
 			 */
 			LWLockAcquire(ControlFileLock, LW_SHARED);
-			checkpointloc = ControlFile->checkPoint;
-			startpoint = ControlFile->checkPointCopy.redo;
-			starttli = ControlFile->checkPointCopy.ThisTimeLineID;
+			state->checkpointloc = ControlFile->checkPoint;
+			state->startpoint = ControlFile->checkPointCopy.redo;
+			state->starttli = ControlFile->checkPointCopy.ThisTimeLineID;
 			checkpointfpw = ControlFile->checkPointCopy.fullPageWrites;
 			LWLockRelease(ControlFileLock);
 
@@ -8232,7 +8404,7 @@ do_pg_backup_start(const char *backupidstr, bool fast, TimeLineID *starttli_p,
 				recptr = XLogCtl->lastFpwDisableRecPtr;
 				SpinLockRelease(&XLogCtl->info_lck);
 
-				if (!checkpointfpw || startpoint <= recptr)
+				if (!checkpointfpw || state->startpoint <= recptr)
 					ereport(ERROR,
 							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							 errmsg("WAL generated with full_page_writes=off was replayed "
@@ -8264,16 +8436,13 @@ do_pg_backup_start(const char *backupidstr, bool fast, TimeLineID *starttli_p,
 			 * either because only few buffers have been dirtied yet.
 			 */
 			WALInsertLockAcquireExclusive();
-			if (XLogCtl->Insert.lastBackupStart < startpoint)
+			if (XLogCtl->Insert.lastBackupStart < state->startpoint)
 			{
-				XLogCtl->Insert.lastBackupStart = startpoint;
+				XLogCtl->Insert.lastBackupStart = state->startpoint;
 				gotUniqueStartpoint = true;
 			}
 			WALInsertLockRelease();
 		} while (!gotUniqueStartpoint);
-
-		XLByteToSeg(startpoint, _logSegNo, wal_segment_size);
-		XLogFileName(xlogfilename, starttli, _logSegNo, wal_segment_size);
 
 		/*
 		 * Construct tablespace_map file.
@@ -8302,15 +8471,9 @@ do_pg_backup_start(const char *backupidstr, bool fast, TimeLineID *starttli_p,
 			 * we sometimes use allow_in_place_tablespaces to create
 			 * directories directly under pg_tblspc, which would fail below.
 			 */
-#ifdef WIN32
-			if (!pgwin32_is_junction(fullpath))
-				continue;
-#else
 			if (get_dirent_type(fullpath, de, false, ERROR) != PGFILETYPE_LNK)
 				continue;
-#endif
 
-#if defined(HAVE_READLINK) || defined(WIN32)
 			rllen = readlink(fullpath, linkpath, sizeof(linkpath));
 			if (rllen < 0)
 			{
@@ -8363,53 +8526,19 @@ do_pg_backup_start(const char *backupidstr, bool fast, TimeLineID *starttli_p,
 							 ti->oid, escapedpath.data);
 
 			pfree(escapedpath.data);
-#else
-
-			/*
-			 * If the platform does not have symbolic links, it should not be
-			 * possible to have tablespaces - clearly somebody else created
-			 * them. Warn about it and ignore.
-			 */
-			ereport(WARNING,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("tablespaces are not supported on this platform")));
-#endif
 		}
 		FreeDir(tblspcdir);
 
-		/*
-		 * Construct backup label file.
-		 */
-
-		/* Use the log timezone here, not the session timezone */
-		stamp_time = (pg_time_t) time(NULL);
-		pg_strftime(strfbuf, sizeof(strfbuf),
-					"%Y-%m-%d %H:%M:%S %Z",
-					pg_localtime(&stamp_time, log_timezone));
-		appendStringInfo(labelfile, "START WAL LOCATION: %X/%X (file %s)\n",
-						 LSN_FORMAT_ARGS(startpoint), xlogfilename);
-		appendStringInfo(labelfile, "CHECKPOINT LOCATION: %X/%X\n",
-						 LSN_FORMAT_ARGS(checkpointloc));
-		appendStringInfo(labelfile, "BACKUP METHOD: streamed\n");
-		appendStringInfo(labelfile, "BACKUP FROM: %s\n",
-						 backup_started_in_recovery ? "standby" : "primary");
-		appendStringInfo(labelfile, "START TIME: %s\n", strfbuf);
-		appendStringInfo(labelfile, "LABEL: %s\n", backupidstr);
-		appendStringInfo(labelfile, "START TIMELINE: %u\n", starttli);
+		state->starttime = (pg_time_t) time(NULL);
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(pg_backup_start_callback, (Datum) 0);
+
+	state->started_in_recovery = backup_started_in_recovery;
 
 	/*
 	 * Mark that the start phase has correctly finished for the backup.
 	 */
 	sessionBackupState = SESSION_BACKUP_RUNNING;
-
-	/*
-	 * We're done.  As a convenience, return the starting WAL location.
-	 */
-	if (starttli_p)
-		*starttli_p = starttli;
-	return startpoint;
 }
 
 /* Error cleanup callback for pg_backup_start */
@@ -8441,48 +8570,38 @@ get_backup_status(void)
 /*
  * do_pg_backup_stop
  *
- * Utility function called at the end of an online backup. It cleans up the
- * backup state and can optionally wait for WAL segments to be archived.
+ * Utility function called at the end of an online backup.  It creates history
+ * file (if required), resets sessionBackupState and so on.  It can optionally
+ * wait for WAL segments to be archived.
  *
- * Returns the last WAL location that must be present to restore from this
- * backup, and the corresponding timeline ID in *stoptli_p.
+ * "state" is filled with the information necessary to restore from this
+ * backup with its stop LSN (stoppoint), its timeline ID (stoptli), etc.
  *
  * It is the responsibility of the caller of this function to verify the
  * permissions of the calling user!
  */
-XLogRecPtr
-do_pg_backup_stop(char *labelfile, bool waitforarchive, TimeLineID *stoptli_p)
+void
+do_pg_backup_stop(BackupState *state, bool waitforarchive)
 {
-	bool		backup_started_in_recovery = false;
-	XLogRecPtr	startpoint;
-	XLogRecPtr	stoppoint;
-	TimeLineID	stoptli;
-	pg_time_t	stamp_time;
-	char		strfbuf[128];
+	bool		backup_stopped_in_recovery = false;
 	char		histfilepath[MAXPGPATH];
-	char		startxlogfilename[MAXFNAMELEN];
-	char		stopxlogfilename[MAXFNAMELEN];
 	char		lastxlogfilename[MAXFNAMELEN];
 	char		histfilename[MAXFNAMELEN];
-	char		backupfrom[20];
 	XLogSegNo	_logSegNo;
 	FILE	   *fp;
-	char		ch;
 	int			seconds_before_warning;
 	int			waits = 0;
 	bool		reported_waiting = false;
-	char	   *remaining;
-	char	   *ptr;
-	uint32		hi,
-				lo;
 
-	backup_started_in_recovery = RecoveryInProgress();
+	Assert(state != NULL);
+
+	backup_stopped_in_recovery = RecoveryInProgress();
 
 	/*
 	 * During recovery, we don't need to check WAL level. Because, if WAL
 	 * level is not sufficient, it's impossible to get here during recovery.
 	 */
-	if (!backup_started_in_recovery && !XLogIsNeeded())
+	if (!backup_stopped_in_recovery && !XLogIsNeeded())
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("WAL level not sufficient for making an online backup"),
@@ -8523,29 +8642,10 @@ do_pg_backup_stop(char *labelfile, bool waitforarchive, TimeLineID *stoptli_p)
 	WALInsertLockRelease();
 
 	/*
-	 * Read and parse the START WAL LOCATION line (this code is pretty crude,
-	 * but we are not expecting any variability in the file format).
+	 * If we are taking an online backup from the standby, we confirm that the
+	 * standby has not been promoted during the backup.
 	 */
-	if (sscanf(labelfile, "START WAL LOCATION: %X/%X (file %24s)%c",
-			   &hi, &lo, startxlogfilename,
-			   &ch) != 4 || ch != '\n')
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("invalid data in file \"%s\"", BACKUP_LABEL_FILE)));
-	startpoint = ((uint64) hi) << 32 | lo;
-	remaining = strchr(labelfile, '\n') + 1;	/* %n is not portable enough */
-
-	/*
-	 * Parse the BACKUP FROM line. If we are taking an online backup from the
-	 * standby, we confirm that the standby has not been promoted during the
-	 * backup.
-	 */
-	ptr = strstr(remaining, "BACKUP FROM:");
-	if (!ptr || sscanf(ptr, "BACKUP FROM: %19s\n", backupfrom) != 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("invalid data in file \"%s\"", BACKUP_LABEL_FILE)));
-	if (strcmp(backupfrom, "standby") == 0 && !backup_started_in_recovery)
+	if (state->started_in_recovery && !backup_stopped_in_recovery)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("the standby was promoted during online backup"),
@@ -8581,7 +8681,7 @@ do_pg_backup_stop(char *labelfile, bool waitforarchive, TimeLineID *stoptli_p)
 	 * an archiver is not invoked. So it doesn't seem worthwhile to write a
 	 * backup history file during recovery.
 	 */
-	if (backup_started_in_recovery)
+	if (backup_stopped_in_recovery)
 	{
 		XLogRecPtr	recptr;
 
@@ -8593,7 +8693,7 @@ do_pg_backup_stop(char *labelfile, bool waitforarchive, TimeLineID *stoptli_p)
 		recptr = XLogCtl->lastFpwDisableRecPtr;
 		SpinLockRelease(&XLogCtl->info_lck);
 
-		if (startpoint <= recptr)
+		if (state->startpoint <= recptr)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("WAL generated with full_page_writes=off was replayed "
@@ -8605,24 +8705,27 @@ do_pg_backup_stop(char *labelfile, bool waitforarchive, TimeLineID *stoptli_p)
 
 
 		LWLockAcquire(ControlFileLock, LW_SHARED);
-		stoppoint = ControlFile->minRecoveryPoint;
-		stoptli = ControlFile->minRecoveryPointTLI;
+		state->stoppoint = ControlFile->minRecoveryPoint;
+		state->stoptli = ControlFile->minRecoveryPointTLI;
 		LWLockRelease(ControlFileLock);
 	}
 	else
 	{
+		char	   *history_file;
+
 		/*
 		 * Write the backup-end xlog record
 		 */
 		XLogBeginInsert();
-		XLogRegisterData((char *) (&startpoint), sizeof(startpoint));
-		stoppoint = XLogInsert(RM_XLOG_ID, XLOG_BACKUP_END);
+		XLogRegisterData((char *) (&state->startpoint),
+						 sizeof(state->startpoint));
+		state->stoppoint = XLogInsert(RM_XLOG_ID, XLOG_BACKUP_END);
 
 		/*
 		 * Given that we're not in recovery, InsertTimeLineID is set and can't
 		 * change, so we can read it without a lock.
 		 */
-		stoptli = XLogCtl->InsertTimeLineID;
+		state->stoptli = XLogCtl->InsertTimeLineID;
 
 		/*
 		 * Force a switch to a new xlog segment file, so that the backup is
@@ -8630,39 +8733,26 @@ do_pg_backup_stop(char *labelfile, bool waitforarchive, TimeLineID *stoptli_p)
 		 */
 		RequestXLogSwitch(false);
 
-		XLByteToPrevSeg(stoppoint, _logSegNo, wal_segment_size);
-		XLogFileName(stopxlogfilename, stoptli, _logSegNo, wal_segment_size);
-
-		/* Use the log timezone here, not the session timezone */
-		stamp_time = (pg_time_t) time(NULL);
-		pg_strftime(strfbuf, sizeof(strfbuf),
-					"%Y-%m-%d %H:%M:%S %Z",
-					pg_localtime(&stamp_time, log_timezone));
+		state->stoptime = (pg_time_t) time(NULL);
 
 		/*
 		 * Write the backup history file
 		 */
-		XLByteToSeg(startpoint, _logSegNo, wal_segment_size);
-		BackupHistoryFilePath(histfilepath, stoptli, _logSegNo,
-							  startpoint, wal_segment_size);
+		XLByteToSeg(state->startpoint, _logSegNo, wal_segment_size);
+		BackupHistoryFilePath(histfilepath, state->stoptli, _logSegNo,
+							  state->startpoint, wal_segment_size);
 		fp = AllocateFile(histfilepath, "w");
 		if (!fp)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not create file \"%s\": %m",
 							histfilepath)));
-		fprintf(fp, "START WAL LOCATION: %X/%X (file %s)\n",
-				LSN_FORMAT_ARGS(startpoint), startxlogfilename);
-		fprintf(fp, "STOP WAL LOCATION: %X/%X (file %s)\n",
-				LSN_FORMAT_ARGS(stoppoint), stopxlogfilename);
 
-		/*
-		 * Transfer remaining lines including label and start timeline to
-		 * history file.
-		 */
-		fprintf(fp, "%s", remaining);
-		fprintf(fp, "STOP TIME: %s\n", strfbuf);
-		fprintf(fp, "STOP TIMELINE: %u\n", stoptli);
+		/* Build and save the contents of the backup history file */
+		history_file = build_backup_content(state, true);
+		fprintf(fp, "%s", history_file);
+		pfree(history_file);
+
 		if (fflush(fp) || ferror(fp) || FreeFile(fp))
 			ereport(ERROR,
 					(errcode_for_file_access(),
@@ -8700,15 +8790,16 @@ do_pg_backup_stop(char *labelfile, bool waitforarchive, TimeLineID *stoptli_p)
 	 */
 
 	if (waitforarchive &&
-		((!backup_started_in_recovery && XLogArchivingActive()) ||
-		 (backup_started_in_recovery && XLogArchivingAlways())))
+		((!backup_stopped_in_recovery && XLogArchivingActive()) ||
+		 (backup_stopped_in_recovery && XLogArchivingAlways())))
 	{
-		XLByteToPrevSeg(stoppoint, _logSegNo, wal_segment_size);
-		XLogFileName(lastxlogfilename, stoptli, _logSegNo, wal_segment_size);
+		XLByteToPrevSeg(state->stoppoint, _logSegNo, wal_segment_size);
+		XLogFileName(lastxlogfilename, state->stoptli, _logSegNo,
+					 wal_segment_size);
 
-		XLByteToSeg(startpoint, _logSegNo, wal_segment_size);
-		BackupHistoryFileName(histfilename, stoptli, _logSegNo,
-							  startpoint, wal_segment_size);
+		XLByteToSeg(state->startpoint, _logSegNo, wal_segment_size);
+		BackupHistoryFileName(histfilename, state->stoptli, _logSegNo,
+							  state->startpoint, wal_segment_size);
 
 		seconds_before_warning = 60;
 		waits = 0;
@@ -8749,13 +8840,6 @@ do_pg_backup_stop(char *labelfile, bool waitforarchive, TimeLineID *stoptli_p)
 	else if (waitforarchive)
 		ereport(NOTICE,
 				(errmsg("WAL archiving is not enabled; you must ensure that all required WAL segments are copied through other means to complete the backup")));
-
-	/*
-	 * We're done.  As a convenience, return the ending WAL location.
-	 */
-	if (stoptli_p)
-		*stoptli_p = stoptli;
-	return stoppoint;
 }
 
 

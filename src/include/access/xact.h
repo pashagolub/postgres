@@ -108,6 +108,12 @@ extern PGDLLIMPORT int MyXactFlags;
 #define XACT_FLAGS_ACQUIREDACCESSEXCLUSIVELOCK	(1U << 1)
 
 /*
+ * XACT_FLAGS_NEEDIMMEDIATECOMMIT - records whether the top level statement
+ * is one that requires immediate commit, such as CREATE DATABASE.
+ */
+#define XACT_FLAGS_NEEDIMMEDIATECOMMIT			(1U << 2)
+
+/*
  *	start- and end-of-transaction callbacks for dynamically loaded modules
  */
 typedef enum
@@ -484,8 +490,8 @@ extern int	xactGetCommittedChildren(TransactionId **ptr);
 extern XLogRecPtr XactLogCommitRecord(TimestampTz commit_time,
 									  int nsubxacts, TransactionId *subxacts,
 									  int nrels, RelFileLocator *rels,
-									  int nstats,
-									  xl_xact_stats_item *stats,
+									  int ndroppedstats,
+									  xl_xact_stats_item *droppedstats,
 									  int nmsgs, SharedInvalidationMessage *msgs,
 									  bool relcacheInval,
 									  int xactflags,
@@ -495,8 +501,8 @@ extern XLogRecPtr XactLogCommitRecord(TimestampTz commit_time,
 extern XLogRecPtr XactLogAbortRecord(TimestampTz abort_time,
 									 int nsubxacts, TransactionId *subxacts,
 									 int nrels, RelFileLocator *rels,
-									 int nstats,
-									 xl_xact_stats_item *stats,
+									 int ndroppedstats,
+									 xl_xact_stats_item *droppedstats,
 									 int xactflags, TransactionId twophase_xid,
 									 const char *twophase_gid);
 extern void xact_redo(XLogReaderState *record);

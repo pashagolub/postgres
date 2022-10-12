@@ -20,7 +20,7 @@
 #include "executor/instrument.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
-#include "utils/guc.h"
+#include "utils/guc_hooks.h"
 #include "utils/memutils.h"
 #include "utils/resowner_private.h"
 
@@ -68,7 +68,7 @@ PrefetchLocalBuffer(SMgrRelation smgr, ForkNumber forkNum,
 	BufferTag	newTag;			/* identity of requested block */
 	LocalBufferLookupEnt *hresult;
 
-	INIT_BUFFERTAG(newTag, smgr->smgr_rlocator.locator, forkNum, blockNum);
+	InitBufferTag(&newTag, &smgr->smgr_rlocator.locator, forkNum, blockNum);
 
 	/* Initialize local buffers if first request in this session */
 	if (LocalBufHash == NULL)
@@ -117,7 +117,7 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 	bool		found;
 	uint32		buf_state;
 
-	INIT_BUFFERTAG(newTag, smgr->smgr_rlocator.locator, forkNum, blockNum);
+	InitBufferTag(&newTag, &smgr->smgr_rlocator.locator, forkNum, blockNum);
 
 	/* Initialize local buffers if first request in this session */
 	if (LocalBufHash == NULL)
@@ -131,7 +131,7 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 	{
 		b = hresult->id;
 		bufHdr = GetLocalBufferDescriptor(b);
-		Assert(BUFFERTAGS_EQUAL(bufHdr->tag, newTag));
+		Assert(BufferTagsEqual(&bufHdr->tag, &newTag));
 #ifdef LBDEBUG
 		fprintf(stderr, "LB ALLOC (%u,%d,%d) %d\n",
 				smgr->smgr_rlocator.locator.relNumber, forkNum, blockNum, -b - 1);
@@ -215,13 +215,13 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 		Page		localpage = (char *) LocalBufHdrGetBlock(bufHdr);
 
 		/* Find smgr relation for buffer */
-		oreln = smgropen(bufHdr->tag.rlocator, MyBackendId);
+		oreln = smgropen(BufTagGetRelFileLocator(&bufHdr->tag), MyBackendId);
 
 		PageSetChecksumInplace(localpage, bufHdr->tag.blockNum);
 
 		/* And write... */
 		smgrwrite(oreln,
-				  bufHdr->tag.forkNum,
+				  BufTagGetForkNum(&bufHdr->tag),
 				  bufHdr->tag.blockNum,
 				  localpage,
 				  false);
@@ -253,7 +253,7 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 		if (!hresult)			/* shouldn't happen */
 			elog(ERROR, "local buffer hash table corrupted");
 		/* mark buffer invalid just in case hash insert fails */
-		CLEAR_BUFFERTAG(bufHdr->tag);
+		ClearBufferTag(&bufHdr->tag);
 		buf_state &= ~(BM_VALID | BM_TAG_VALID);
 		pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
 	}
@@ -337,16 +337,18 @@ DropRelationLocalBuffers(RelFileLocator rlocator, ForkNumber forkNum,
 		buf_state = pg_atomic_read_u32(&bufHdr->state);
 
 		if ((buf_state & BM_TAG_VALID) &&
-			RelFileLocatorEquals(bufHdr->tag.rlocator, rlocator) &&
-			bufHdr->tag.forkNum == forkNum &&
+			BufTagMatchesRelFileLocator(&bufHdr->tag, &rlocator) &&
+			BufTagGetForkNum(&bufHdr->tag) == forkNum &&
 			bufHdr->tag.blockNum >= firstDelBlock)
 		{
 			if (LocalRefCount[i] != 0)
 				elog(ERROR, "block %u of %s is still referenced (local %u)",
 					 bufHdr->tag.blockNum,
-					 relpathbackend(bufHdr->tag.rlocator, MyBackendId,
-									bufHdr->tag.forkNum),
+					 relpathbackend(BufTagGetRelFileLocator(&bufHdr->tag),
+									MyBackendId,
+									BufTagGetForkNum(&bufHdr->tag)),
 					 LocalRefCount[i]);
+
 			/* Remove entry from hashtable */
 			hresult = (LocalBufferLookupEnt *)
 				hash_search(LocalBufHash, (void *) &bufHdr->tag,
@@ -354,7 +356,7 @@ DropRelationLocalBuffers(RelFileLocator rlocator, ForkNumber forkNum,
 			if (!hresult)		/* shouldn't happen */
 				elog(ERROR, "local buffer hash table corrupted");
 			/* Mark buffer invalid */
-			CLEAR_BUFFERTAG(bufHdr->tag);
+			ClearBufferTag(&bufHdr->tag);
 			buf_state &= ~BUF_FLAG_MASK;
 			buf_state &= ~BUF_USAGECOUNT_MASK;
 			pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
@@ -383,13 +385,14 @@ DropRelationAllLocalBuffers(RelFileLocator rlocator)
 		buf_state = pg_atomic_read_u32(&bufHdr->state);
 
 		if ((buf_state & BM_TAG_VALID) &&
-			RelFileLocatorEquals(bufHdr->tag.rlocator, rlocator))
+			BufTagMatchesRelFileLocator(&bufHdr->tag, &rlocator))
 		{
 			if (LocalRefCount[i] != 0)
 				elog(ERROR, "block %u of %s is still referenced (local %u)",
 					 bufHdr->tag.blockNum,
-					 relpathbackend(bufHdr->tag.rlocator, MyBackendId,
-									bufHdr->tag.forkNum),
+					 relpathbackend(BufTagGetRelFileLocator(&bufHdr->tag),
+									MyBackendId,
+									BufTagGetForkNum(&bufHdr->tag)),
 					 LocalRefCount[i]);
 			/* Remove entry from hashtable */
 			hresult = (LocalBufferLookupEnt *)
@@ -398,7 +401,7 @@ DropRelationAllLocalBuffers(RelFileLocator rlocator)
 			if (!hresult)		/* shouldn't happen */
 				elog(ERROR, "local buffer hash table corrupted");
 			/* Mark buffer invalid */
-			CLEAR_BUFFERTAG(bufHdr->tag);
+			ClearBufferTag(&bufHdr->tag);
 			buf_state &= ~BUF_FLAG_MASK;
 			buf_state &= ~BUF_USAGECOUNT_MASK;
 			pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
@@ -478,6 +481,24 @@ InitLocalBuffers(void)
 
 	/* Initialization done, mark buffers allocated */
 	NLocBuffer = nbufs;
+}
+
+/*
+ * GUC check_hook for temp_buffers
+ */
+bool
+check_temp_buffers(int *newval, void **extra, GucSource source)
+{
+	/*
+	 * Once local buffers have been initialized, it's too late to change this.
+	 * However, if this is only a test call, allow it.
+	 */
+	if (source != PGC_S_TEST && NLocBuffer && NLocBuffer != *newval)
+	{
+		GUC_check_errdetail("\"temp_buffers\" cannot be changed after any temporary tables have been accessed in the session.");
+		return false;
+	}
+	return true;
 }
 
 /*

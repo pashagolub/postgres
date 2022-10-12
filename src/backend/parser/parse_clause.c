@@ -67,7 +67,7 @@ static ParseNamespaceItem *transformRangeSubselect(ParseState *pstate,
 static ParseNamespaceItem *transformRangeFunction(ParseState *pstate,
 												  RangeFunction *r);
 static ParseNamespaceItem *transformRangeTableFunc(ParseState *pstate,
-												   RangeTableFunc *t);
+												   RangeTableFunc *rtf);
 static TableSampleClause *transformRangeTableSample(ParseState *pstate,
 													RangeTableSample *rts);
 static ParseNamespaceItem *getNSItemForSpecialRelationTypes(ParseState *pstate,
@@ -539,11 +539,11 @@ transformRangeFunction(ParseState *pstate, RangeFunction *r)
 				!fc->func_variadic &&
 				coldeflist == NIL)
 			{
-				ListCell   *lc;
+				ListCell   *lc2;
 
-				foreach(lc, fc->args)
+				foreach(lc2, fc->args)
 				{
-					Node	   *arg = (Node *) lfirst(lc);
+					Node	   *arg = (Node *) lfirst(lc2);
 					FuncCall   *newfc;
 
 					last_srf = pstate->p_last_srf;
@@ -690,9 +690,7 @@ transformRangeTableFunc(ParseState *pstate, RangeTableFunc *rtf)
 	char	  **names;
 	int			colno;
 
-	/* Currently only XMLTABLE and JSON_TABLE are supported */
-
-	tf->functype = TFT_XMLTABLE;
+	/* Currently only XMLTABLE is supported */
 	constructName = "XMLTABLE";
 	docType = XMLOID;
 
@@ -1050,6 +1048,9 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 						ParseNamespaceItem **top_nsitem,
 						List **namespace)
 {
+	/* Guard against stack overflow due to overly deep subtree */
+	check_stack_depth();
+
 	if (IsA(n, RangeVar))
 	{
 		/* Plain relation reference, or perhaps a CTE reference */
@@ -1096,17 +1097,13 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 		rtr->rtindex = nsitem->p_rtindex;
 		return (Node *) rtr;
 	}
-	else if (IsA(n, RangeTableFunc) || IsA(n, JsonTable))
+	else if (IsA(n, RangeTableFunc))
 	{
 		/* table function is like a plain relation */
 		RangeTblRef *rtr;
 		ParseNamespaceItem *nsitem;
 
-		if (IsA(n, RangeTableFunc))
-			nsitem = transformRangeTableFunc(pstate, (RangeTableFunc *) n);
-		else
-			nsitem = transformJsonTable(pstate, (JsonTable *) n);
-
+		nsitem = transformRangeTableFunc(pstate, (RangeTableFunc *) n);
 		*top_nsitem = nsitem;
 		*namespace = list_make1(nsitem);
 		rtr = makeNode(RangeTblRef);

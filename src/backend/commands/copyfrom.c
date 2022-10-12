@@ -732,8 +732,8 @@ CopyFrom(CopyFromState cstate)
 		 * For partitioned tables we can't support multi-inserts when there
 		 * are any statement level insert triggers. It might be possible to
 		 * allow partitioned tables with such triggers in the future, but for
-		 * now, CopyMultiInsertInfoFlush expects that any before row insert
-		 * and statement level insert triggers are on the same relation.
+		 * now, CopyMultiInsertInfoFlush expects that any after row insert and
+		 * statement level insert triggers are on the same relation.
 		 */
 		insertMethod = CIM_SINGLE;
 	}
@@ -1202,7 +1202,6 @@ BeginCopyFrom(ParseState *pstate,
 				num_defaults;
 	FmgrInfo   *in_functions;
 	Oid		   *typioparams;
-	int			attnum;
 	Oid			in_func_oid;
 	int		   *defmap;
 	ExprState **defexprs;
@@ -1401,7 +1400,7 @@ BeginCopyFrom(ParseState *pstate,
 	defmap = (int *) palloc(num_phys_attrs * sizeof(int));
 	defexprs = (ExprState **) palloc(num_phys_attrs * sizeof(ExprState *));
 
-	for (attnum = 1; attnum <= num_phys_attrs; attnum++)
+	for (int attnum = 1; attnum <= num_phys_attrs; attnum++)
 	{
 		Form_pg_attribute att = TupleDescAttr(tupDesc, attnum - 1);
 

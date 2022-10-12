@@ -30,7 +30,7 @@
  *		2)		bool, true, false
  *		3)		standard system types
  *		4)		IsValid macros for system types
- *		5)		offsetof, lengthof, alignment
+ *		5)		lengthof, alignment
  *		6)		assertions
  *		7)		widely useful macros
  *		8)		random stuff
@@ -181,6 +181,17 @@
 #define pg_attribute_noreturn() __attribute__((noreturn))
 #define pg_attribute_packed() __attribute__((packed))
 #define HAVE_PG_ATTRIBUTE_NORETURN 1
+#elif defined(_MSC_VER)
+/*
+ * MSVC supports aligned.  noreturn is also possible but in MSVC it is
+ * declared before the definition while pg_attribute_noreturn() macro
+ * is currently used after the definition.
+ *
+ * Packing is also possible but only by wrapping the entire struct definition
+ * which doesn't fit into our current macro declarations.
+ */
+#define pg_attribute_aligned(a) __declspec(align(a))
+#define pg_attribute_noreturn()
 #else
 /*
  * NB: aligned and packed are not given default definitions because they
@@ -334,16 +345,6 @@
 	(N)
 
 /*
- * dummyret is used to set return values in macros that use ?: to make
- * assignments.  gcc wants these to be void, other compilers like char
- */
-#ifdef __GNUC__					/* GNU cc */
-#define dummyret	void
-#else
-#define dummyret	char
-#endif
-
-/*
  * Generic function pointer.  This can be used in the rare cases where it's
  * necessary to cast a function pointer to a seemingly incompatible function
  * pointer type while avoiding gcc's -Wcast-function-type warnings.
@@ -359,17 +360,6 @@ typedef void (*pg_funcptr_t) (void);
  * work with MSVC and with C++ compilers.
  */
 #define FLEXIBLE_ARRAY_MEMBER	/* empty */
-
-/* Which __func__ symbol do we have, if any? */
-#ifdef HAVE_FUNCNAME__FUNC
-#define PG_FUNCNAME_MACRO	__func__
-#else
-#ifdef HAVE_FUNCNAME__FUNCTION
-#define PG_FUNCNAME_MACRO	__FUNCTION__
-#else
-#define PG_FUNCNAME_MACRO	NULL
-#endif
-#endif
 
 
 /* ----------------------------------------------------------------
@@ -724,20 +714,9 @@ typedef NameData *Name;
 
 
 /* ----------------------------------------------------------------
- *				Section 5:	offsetof, lengthof, alignment
+ *				Section 5:	lengthof, alignment
  * ----------------------------------------------------------------
  */
-/*
- * offsetof
- *		Offset of a structure/union field within that structure/union.
- *
- *		XXX This is supposed to be part of stddef.h, but isn't on
- *		some systems (like SunOS 4).
- */
-#ifndef offsetof
-#define offsetof(type, field)	((long) &((type *)0)->field)
-#endif							/* offsetof */
-
 /*
  * lengthof
  *		Number of elements in an array.
@@ -817,8 +796,6 @@ typedef NameData *Name;
 #define AssertArg(condition)	((void)true)
 #define AssertState(condition)	((void)true)
 #define AssertPointerAlignment(ptr, bndr)	((void)true)
-#define Trap(condition, errorType)	((void)true)
-#define TrapMacro(condition, errorType) (true)
 
 #elif defined(FRONTEND)
 
@@ -832,60 +809,38 @@ typedef NameData *Name;
 #else							/* USE_ASSERT_CHECKING && !FRONTEND */
 
 /*
- * Trap
- *		Generates an exception if the given condition is true.
+ * Assert
+ *		Generates a fatal exception if the given condition is false.
  */
-#define Trap(condition, errorType) \
-	do { \
-		if (condition) \
-			ExceptionalCondition(#condition, (errorType), \
-								 __FILE__, __LINE__); \
-	} while (0)
-
-/*
- *	TrapMacro is the same as Trap but it's intended for use in macros:
- *
- *		#define foo(x) (AssertMacro(x != 0), bar(x))
- *
- *	Isn't CPP fun?
- */
-#define TrapMacro(condition, errorType) \
-	((bool) (! (condition) || \
-			 (ExceptionalCondition(#condition, (errorType), \
-								   __FILE__, __LINE__), 0)))
-
 #define Assert(condition) \
 	do { \
 		if (!(condition)) \
-			ExceptionalCondition(#condition, "FailedAssertion", \
-								 __FILE__, __LINE__); \
+			ExceptionalCondition(#condition, __FILE__, __LINE__); \
 	} while (0)
 
+/*
+ * AssertMacro is the same as Assert but it's suitable for use in
+ * expression-like macros, for example:
+ *
+ *		#define foo(x) (AssertMacro(x != 0), bar(x))
+ */
 #define AssertMacro(condition) \
 	((void) ((condition) || \
-			 (ExceptionalCondition(#condition, "FailedAssertion", \
-								   __FILE__, __LINE__), 0)))
+			 (ExceptionalCondition(#condition, __FILE__, __LINE__), 0)))
 
-#define AssertArg(condition) \
-	do { \
-		if (!(condition)) \
-			ExceptionalCondition(#condition, "BadArgument", \
-								 __FILE__, __LINE__); \
-	} while (0)
-
-#define AssertState(condition) \
-	do { \
-		if (!(condition)) \
-			ExceptionalCondition(#condition, "BadState", \
-								 __FILE__, __LINE__); \
-	} while (0)
+/*
+ * AssertArg and AssertState are identical to Assert.  Some places use them
+ * to indicate that the complaint is specifically about a bad argument or
+ * unexpected state, but this usage is largely obsolescent.
+ */
+#define AssertArg(condition) Assert(condition)
+#define AssertState(condition) Assert(condition)
 
 /*
  * Check that `ptr' is `bndr' aligned.
  */
 #define AssertPointerAlignment(ptr, bndr) \
-	Trap(TYPEALIGN(bndr, (uintptr_t)(ptr)) != (uintptr_t)(ptr), \
-		 "UnalignedPointer")
+	Assert(TYPEALIGN(bndr, (uintptr_t)(ptr)) == (uintptr_t)(ptr))
 
 #endif							/* USE_ASSERT_CHECKING && !FRONTEND */
 
@@ -897,7 +852,6 @@ typedef NameData *Name;
  */
 #ifndef FRONTEND
 extern void ExceptionalCondition(const char *conditionName,
-								 const char *errorType,
 								 const char *fileName, int lineNumber) pg_attribute_noreturn();
 #endif
 
@@ -995,12 +949,6 @@ extern void ExceptionalCondition(const char *conditionName,
  *		Return the minimum of two numbers.
  */
 #define Min(x, y)		((x) < (y) ? (x) : (y))
-
-/*
- * Abs
- *		Return the absolute value of the argument.
- */
-#define Abs(x)			((x) >= 0 ? (x) : -(x))
 
 
 /* Get a bit mask of the bits set in non-long aligned addresses */
@@ -1123,10 +1071,6 @@ extern void ExceptionalCondition(const char *conditionName,
  *				Section 8:	random stuff
  * ----------------------------------------------------------------
  */
-
-#ifdef HAVE_STRUCT_SOCKADDR_UN
-#define HAVE_UNIX_SOCKETS 1
-#endif
 
 /*
  * Invert the sign of a qsort-style comparison result, ie, exchange negative
@@ -1294,35 +1238,6 @@ typedef union PGAlignedXLogBlock
 extern int	fdatasync(int fildes);
 #endif
 
-/* Older platforms may provide strto[u]ll functionality under other names */
-#if !defined(HAVE_STRTOLL) && defined(HAVE___STRTOLL)
-#define strtoll __strtoll
-#define HAVE_STRTOLL 1
-#endif
-
-#if !defined(HAVE_STRTOLL) && defined(HAVE_STRTOQ)
-#define strtoll strtoq
-#define HAVE_STRTOLL 1
-#endif
-
-#if !defined(HAVE_STRTOULL) && defined(HAVE___STRTOULL)
-#define strtoull __strtoull
-#define HAVE_STRTOULL 1
-#endif
-
-#if !defined(HAVE_STRTOULL) && defined(HAVE_STRTOUQ)
-#define strtoull strtouq
-#define HAVE_STRTOULL 1
-#endif
-
-#if defined(HAVE_STRTOLL) && !HAVE_DECL_STRTOLL
-extern long long strtoll(const char *str, char **endptr, int base);
-#endif
-
-#if defined(HAVE_STRTOULL) && !HAVE_DECL_STRTOULL
-extern unsigned long long strtoull(const char *str, char **endptr, int base);
-#endif
-
 /*
  * Thin wrappers that convert strings to exactly 64-bit integers, matching our
  * definition of int64.  (For the naming, compare that POSIX has
@@ -1334,6 +1249,15 @@ extern unsigned long long strtoull(const char *str, char **endptr, int base);
 #else
 #define strtoi64(str, endptr, base) ((int64) strtoll(str, endptr, base))
 #define strtou64(str, endptr, base) ((uint64) strtoull(str, endptr, base))
+#endif
+
+/*
+ * Similarly, wrappers around labs()/llabs() matching our int64.
+ */
+#ifdef HAVE_LONG_INT_64
+#define i64abs(i) labs(i)
+#else
+#define i64abs(i) llabs(i)
 #endif
 
 /*
@@ -1391,13 +1315,6 @@ typedef intptr_t sigjmp_buf[5];
 #define siglongjmp longjmp
 #endif							/* __MINGW64__ */
 #endif							/* WIN32 */
-
-/* EXEC_BACKEND defines */
-#ifdef EXEC_BACKEND
-#define NON_EXEC_STATIC
-#else
-#define NON_EXEC_STATIC static
-#endif
 
 /* /port compatibility functions */
 #include "port.h"

@@ -16,18 +16,17 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <limits.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <time.h>
-#ifdef HAVE_SYS_SELECT_H
-#include <sys/select.h>
-#endif
 #ifdef HAVE_LIBZ
 #include <zlib.h>
 #endif
 
 #include "access/xlog_internal.h"
+#include "backup/basebackup.h"
 #include "bbstreamer.h"
 #include "common/compression.h"
 #include "common/file_perm.h"
@@ -37,7 +36,6 @@
 #include "fe_utils/recovery_gen.h"
 #include "getopt_long.h"
 #include "receivelog.h"
-#include "replication/basebackup.h"
 #include "streamutil.h"
 
 #define ERRCODE_DATA_CORRUPTED	"XX001"
@@ -572,7 +570,7 @@ LogStreamerMain(logstreamer_param *param)
 		return 1;
 	}
 
-	if (!stream.walmethod->finish())
+	if (!stream.walmethod->ops->finish(stream.walmethod))
 	{
 		pg_log_error("could not finish writing WAL files: %m");
 #ifdef WIN32
@@ -583,11 +581,7 @@ LogStreamerMain(logstreamer_param *param)
 
 	PQfinish(param->bgconn);
 
-	if (format == 'p')
-		FreeWalDirectoryMethod();
-	else
-		FreeWalTarMethod();
-	pg_free(stream.walmethod);
+	stream.walmethod->ops->free(stream.walmethod);
 
 	return 0;
 }
@@ -1114,8 +1108,9 @@ CreateBackupStreamer(char *archive_name, char *spclocation,
 	 */
 	if (inject_manifest && is_compressed_tar)
 	{
-		pg_log_error("cannot inject manifest into a compressed tarfile");
-		pg_log_info("use client-side compression, send the output to a directory rather than standard output, or use --no-manifest");
+		pg_log_error("cannot inject manifest into a compressed tar file");
+		pg_log_error_hint("Use client-side compression, send the output to a directory rather than standard output, or use %s.",
+						  "--no-manifest");
 		exit(1);
 	}
 
@@ -1130,7 +1125,7 @@ CreateBackupStreamer(char *archive_name, char *spclocation,
 	/* At present, we only know how to parse tar archives. */
 	if (must_parse_archive && !is_tar && !is_compressed_tar)
 	{
-		pg_log_error("unable to parse archive: %s", archive_name);
+		pg_log_error("cannot parse archive \"%s\"", archive_name);
 		pg_log_error_detail("Only tar archives can be parsed.");
 		if (format == 'p')
 			pg_log_error_detail("Plain format requires pg_basebackup to parse the archive.");
@@ -1348,7 +1343,7 @@ ReceiveArchiveStreamChunk(size_t r, char *copybuf, void *callback_data)
 				/* Sanity check. */
 				if (state->manifest_buffer != NULL ||
 					state->manifest_file !=NULL)
-					pg_fatal("archives should precede manifest");
+					pg_fatal("archives must precede manifest");
 
 				/* Parse the rest of the CopyData message. */
 				archive_name = GetCopyDataString(r, copybuf, &cursor);
@@ -1794,7 +1789,7 @@ BaseBackup(char *compression_algorithm, char *compression_detail,
 		 * Error message already written in CheckServerVersionForStreaming(),
 		 * but add a hint about using -X none.
 		 */
-		pg_log_info("HINT: use -X none or -X fetch to disable log streaming");
+		pg_log_error_hint("Use -X none or -X fetch to disable log streaming.");
 		exit(1);
 	}
 
@@ -1906,7 +1901,7 @@ BaseBackup(char *compression_algorithm, char *compression_detail,
 
 	if (showprogress && !verbose)
 	{
-		fprintf(stderr, "waiting for checkpoint");
+		fprintf(stderr, _("waiting for checkpoint"));
 		if (isatty(fileno(stderr)))
 			fprintf(stderr, "\r");
 		else
@@ -2014,9 +2009,7 @@ BaseBackup(char *compression_algorithm, char *compression_detail,
 		if (client_compress->algorithm == PG_COMPRESSION_GZIP)
 		{
 			wal_compress_algorithm = PG_COMPRESSION_GZIP;
-			wal_compress_level =
-				(client_compress->options & PG_COMPRESSION_OPTION_LEVEL)
-				!= 0 ? client_compress->level : 0;
+			wal_compress_level = client_compress->level;
 		}
 		else
 		{
@@ -2025,7 +2018,8 @@ BaseBackup(char *compression_algorithm, char *compression_detail,
 		}
 
 		StartLogStreamer(xlogstart, starttli, sysidentifier,
-						 wal_compress_algorithm, wal_compress_level);
+						 wal_compress_algorithm,
+						 wal_compress_level);
 	}
 
 	if (serverMajor >= 1500)
@@ -2325,7 +2319,7 @@ main(int argc, char **argv)
 
 	atexit(cleanup_directories_atexit);
 
-	while ((c = getopt_long(argc, argv, "CD:F:r:RS:t:T:X:l:nNzZ:d:c:h:p:U:s:wWkvP",
+	while ((c = getopt_long(argc, argv, "CD:F:r:RS:t:T:X:l:nNzZ:d:c:h:p:U:s:wWvP",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -2548,7 +2542,7 @@ main(int argc, char **argv)
 		char	   *error_detail;
 
 		if (!parse_compress_algorithm(compression_algorithm, &alg))
-			pg_fatal("unrecognized compression algorithm \"%s\"",
+			pg_fatal("unrecognized compression algorithm: \"%s\"",
 					 compression_algorithm);
 
 		parse_compress_specification(alg, compression_detail, &client_compress);
@@ -2763,12 +2757,8 @@ main(int argc, char **argv)
 						   PQserverVersion(conn) < MINIMUM_VERSION_FOR_PG_WAL ?
 						   "pg_xlog" : "pg_wal");
 
-#ifdef HAVE_SYMLINK
 		if (symlink(xlog_dir, linkloc) != 0)
 			pg_fatal("could not create symbolic link \"%s\": %m", linkloc);
-#else
-		pg_fatal("symlinks are not supported on this platform");
-#endif
 		free(linkloc);
 	}
 

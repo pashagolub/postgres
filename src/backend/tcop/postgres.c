@@ -23,18 +23,10 @@
 #include <limits.h>
 #include <signal.h>
 #include <unistd.h>
-#include <sys/socket.h>
-#ifdef HAVE_SYS_SELECT_H
-#include <sys/select.h>
-#endif
-#ifdef HAVE_SYS_RESOURCE_H
-#include <sys/time.h>
 #include <sys/resource.h>
-#endif
-
-#ifndef HAVE_GETRUSAGE
-#include "rusagestub.h"
-#endif
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 
 #include "access/parallel.h"
 #include "access/printtup.h"
@@ -75,6 +67,7 @@
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
+#include "utils/guc_hooks.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
@@ -610,10 +603,22 @@ pg_parse_query(const char *query_string)
 #endif
 
 	/*
-	 * Currently, outfuncs/readfuncs support is missing for many raw parse
-	 * tree nodes, so we don't try to implement WRITE_READ_PARSE_PLAN_TREES
-	 * here.
+	 * Optional debugging check: pass raw parsetrees through
+	 * outfuncs/readfuncs
 	 */
+#ifdef WRITE_READ_PARSE_PLAN_TREES
+	{
+		char	   *str = nodeToString(raw_parsetree_list);
+		List	   *new_list = stringToNodeWithLocations(str);
+
+		pfree(str);
+		/* This checks both outfuncs/readfuncs and the equal() routines... */
+		if (!equal(new_list, raw_parsetree_list))
+			elog(WARNING, "outfuncs/readfuncs failed to produce an equal raw parse tree");
+		else
+			raw_parsetree_list = new_list;
+	}
+#endif
 
 	TRACE_POSTGRESQL_QUERY_PARSE_DONE(query_string);
 
@@ -796,7 +801,7 @@ pg_rewrite_query(Query *query)
 		new_list = copyObject(querytree_list);
 		/* This checks both copyObject() and the equal() routines... */
 		if (!equal(new_list, querytree_list))
-			elog(WARNING, "copyObject() failed to produce equal parse tree");
+			elog(WARNING, "copyObject() failed to produce an equal rewritten parse tree");
 		else
 			querytree_list = new_list;
 	}
@@ -808,35 +813,25 @@ pg_rewrite_query(Query *query)
 		List	   *new_list = NIL;
 		ListCell   *lc;
 
-		/*
-		 * We currently lack outfuncs/readfuncs support for most utility
-		 * statement types, so only attempt to write/read non-utility queries.
-		 */
 		foreach(lc, querytree_list)
 		{
-			Query	   *query = lfirst_node(Query, lc);
+			Query	   *curr_query = lfirst_node(Query, lc);
+			char	   *str = nodeToString(curr_query);
+			Query	   *new_query = stringToNodeWithLocations(str);
 
-			if (query->commandType != CMD_UTILITY)
-			{
-				char	   *str = nodeToString(query);
-				Query	   *new_query = stringToNodeWithLocations(str);
+			/*
+			 * queryId is not saved in stored rules, but we must preserve it
+			 * here to avoid breaking pg_stat_statements.
+			 */
+			new_query->queryId = curr_query->queryId;
 
-				/*
-				 * queryId is not saved in stored rules, but we must preserve
-				 * it here to avoid breaking pg_stat_statements.
-				 */
-				new_query->queryId = query->queryId;
-
-				new_list = lappend(new_list, new_query);
-				pfree(str);
-			}
-			else
-				new_list = lappend(new_list, query);
+			new_list = lappend(new_list, new_query);
+			pfree(str);
 		}
 
 		/* This checks both outfuncs/readfuncs and the equal() routines... */
 		if (!equal(new_list, querytree_list))
-			elog(WARNING, "outfuncs/readfuncs failed to produce equal parse tree");
+			elog(WARNING, "outfuncs/readfuncs failed to produce an equal rewritten parse tree");
 		else
 			querytree_list = new_list;
 	}
@@ -1278,6 +1273,13 @@ exec_simple_query(const char *query_string)
 		else
 		{
 			/*
+			 * We had better not see XACT_FLAGS_NEEDIMMEDIATECOMMIT set if
+			 * we're not calling finish_xact_command().  (The implicit
+			 * transaction block should have prevented it from getting set.)
+			 */
+			Assert(!(MyXactFlags & XACT_FLAGS_NEEDIMMEDIATECOMMIT));
+
+			/*
 			 * We need a CommandCounterIncrement after every query, except
 			 * those that start or end a transaction block.
 			 */
@@ -1661,7 +1663,7 @@ exec_bind_message(StringInfo input_message)
 	numPFormats = pq_getmsgint(input_message, 2);
 	if (numPFormats > 0)
 	{
-		pformats = (int16 *) palloc(numPFormats * sizeof(int16));
+		pformats = palloc_array(int16, numPFormats);
 		for (int i = 0; i < numPFormats; i++)
 			pformats[i] = pq_getmsgint(input_message, 2);
 	}
@@ -1849,8 +1851,7 @@ exec_bind_message(StringInfo input_message)
 						oldcxt = MemoryContextSwitchTo(MessageContext);
 
 						if (knownTextValues == NULL)
-							knownTextValues =
-								palloc0(numParams * sizeof(char *));
+							knownTextValues = palloc0_array(char *, numParams);
 
 						if (log_parameter_max_length_on_error < 0)
 							knownTextValues[paramno] = pstrdup(pstring);
@@ -1959,7 +1960,7 @@ exec_bind_message(StringInfo input_message)
 	numRFormats = pq_getmsgint(input_message, 2);
 	if (numRFormats > 0)
 	{
-		rformats = (int16 *) palloc(numRFormats * sizeof(int16));
+		rformats = palloc_array(int16, numRFormats);
 		for (int i = 0; i < numRFormats; i++)
 			rformats[i] = pq_getmsgint(input_message, 2);
 	}
@@ -2092,32 +2093,16 @@ exec_execute_message(const char *portal_name, long max_rows)
 
 	/*
 	 * We must copy the sourceText and prepStmtName into MessageContext in
-	 * case the portal is destroyed during finish_xact_command. Can avoid the
-	 * copy if it's not an xact command, though.
+	 * case the portal is destroyed during finish_xact_command.  We do not
+	 * make a copy of the portalParams though, preferring to just not print
+	 * them in that case.
 	 */
-	if (is_xact_command)
-	{
-		sourceText = pstrdup(portal->sourceText);
-		if (portal->prepStmtName)
-			prepStmtName = pstrdup(portal->prepStmtName);
-		else
-			prepStmtName = "<unnamed>";
-
-		/*
-		 * An xact command shouldn't have any parameters, which is a good
-		 * thing because they wouldn't be around after finish_xact_command.
-		 */
-		portalParams = NULL;
-	}
+	sourceText = pstrdup(portal->sourceText);
+	if (portal->prepStmtName)
+		prepStmtName = pstrdup(portal->prepStmtName);
 	else
-	{
-		sourceText = portal->sourceText;
-		if (portal->prepStmtName)
-			prepStmtName = portal->prepStmtName;
-		else
-			prepStmtName = "<unnamed>";
-		portalParams = portal->portalParams;
-	}
+		prepStmtName = "<unnamed>";
+	portalParams = portal->portalParams;
 
 	/*
 	 * Report query to various monitoring facilities.
@@ -2216,13 +2201,24 @@ exec_execute_message(const char *portal_name, long max_rows)
 
 	if (completed)
 	{
-		if (is_xact_command)
+		if (is_xact_command || (MyXactFlags & XACT_FLAGS_NEEDIMMEDIATECOMMIT))
 		{
 			/*
 			 * If this was a transaction control statement, commit it.  We
 			 * will start a new xact command for the next command (if any).
+			 * Likewise if the statement required immediate commit.  Without
+			 * this provision, we wouldn't force commit until Sync is
+			 * received, which creates a hazard if the client tries to
+			 * pipeline immediate-commit statements.
 			 */
 			finish_xact_command();
+
+			/*
+			 * These commands typically don't have any parameters, and even if
+			 * one did we couldn't print them now because the storage went
+			 * away during finish_xact_command.  So pretend there were none.
+			 */
+			portalParams = NULL;
 		}
 		else
 		{
@@ -3512,6 +3508,58 @@ assign_max_stack_depth(int newval, void *extra)
 	max_stack_depth_bytes = newval_bytes;
 }
 
+/*
+ * GUC check_hook for client_connection_check_interval
+ */
+bool
+check_client_connection_check_interval(int *newval, void **extra, GucSource source)
+{
+	if (!WaitEventSetCanReportClosed() && *newval != 0)
+	{
+		GUC_check_errdetail("client_connection_check_interval must be set to 0 on this platform.");
+		return false;
+	}
+	return true;
+}
+
+/*
+ * GUC check_hook for log_parser_stats, log_planner_stats, log_executor_stats
+ *
+ * This function and check_log_stats interact to prevent their variables from
+ * being set in a disallowed combination.  This is a hack that doesn't really
+ * work right; for example it might fail while applying pg_db_role_setting
+ * values even though the final state would have been acceptable.  However,
+ * since these variables are legacy settings with little production usage,
+ * we tolerate that.
+ */
+bool
+check_stage_log_stats(bool *newval, void **extra, GucSource source)
+{
+	if (*newval && log_statement_stats)
+	{
+		GUC_check_errdetail("Cannot enable parameter when \"log_statement_stats\" is true.");
+		return false;
+	}
+	return true;
+}
+
+/*
+ * GUC check_hook for log_statement_stats
+ */
+bool
+check_log_stats(bool *newval, void **extra, GucSource source)
+{
+	if (*newval &&
+		(log_parser_stats || log_planner_stats || log_executor_stats))
+	{
+		GUC_check_errdetail("Cannot enable \"log_statement_stats\" when "
+							"\"log_parser_stats\", \"log_planner_stats\", "
+							"or \"log_executor_stats\" is true.");
+		return false;
+	}
+	return true;
+}
+
 
 /*
  * set_debug_options --- apply "-d N" command line option
@@ -4076,7 +4124,11 @@ PostgresMain(const char *dbname, const char *username)
 	 * it inside InitPostgres() instead.  In particular, anything that
 	 * involves database access should be there, not here.
 	 */
-	InitPostgres(dbname, InvalidOid, username, InvalidOid, NULL, false);
+	InitPostgres(dbname, InvalidOid,	/* database to connect to */
+				 username, InvalidOid,	/* role to connect as */
+				 !am_walsender, /* honor session_preload_libraries? */
+				 false,			/* don't ignore datallowconn */
+				 NULL);			/* no out_dbname */
 
 	/*
 	 * If the PostmasterContext is still around, recycle the space; we don't
@@ -4111,12 +4163,6 @@ PostgresMain(const char *dbname, const char *username)
 	/* Perform initialization specific to a WAL sender process. */
 	if (am_walsender)
 		InitWalSender();
-
-	/*
-	 * process any libraries that should be preloaded at backend start (this
-	 * likewise can't be done until GUC settings are complete)
-	 */
-	process_session_preload_libraries();
 
 	/*
 	 * Send this backend's cancellation info to the frontend.
@@ -4525,7 +4571,7 @@ PostgresMain(const char *dbname, const char *username)
 					numParams = pq_getmsgint(&input_message, 2);
 					if (numParams > 0)
 					{
-						paramTypes = (Oid *) palloc(numParams * sizeof(Oid));
+						paramTypes = palloc_array(Oid, numParams);
 						for (int i = 0; i < numParams; i++)
 							paramTypes[i] = pq_getmsgint(&input_message, 4);
 					}
@@ -4770,7 +4816,7 @@ forbidden_in_wal_sender(char firstchar)
 long
 get_stack_depth_rlimit(void)
 {
-#if defined(HAVE_GETRLIMIT) && defined(RLIMIT_STACK)
+#if defined(HAVE_GETRLIMIT)
 	static long val = 0;
 
 	/* This won't change after process launch, so check just once */
@@ -4789,13 +4835,9 @@ get_stack_depth_rlimit(void)
 			val = rlim.rlim_cur;
 	}
 	return val;
-#else							/* no getrlimit */
-#if defined(WIN32) || defined(__CYGWIN__)
+#else
 	/* On Windows we set the backend stack size in src/backend/Makefile */
 	return WIN32_STACK_RLIMIT;
-#else							/* not windows ... give up */
-	return -1;
-#endif
 #endif
 }
 
@@ -4860,7 +4902,14 @@ ShowUsage(const char *title)
 					 (long) user.tv_usec,
 					 (long) sys.tv_sec,
 					 (long) sys.tv_usec);
-#if defined(HAVE_GETRUSAGE)
+#ifndef WIN32
+
+	/*
+	 * The following rusage fields are not defined by POSIX, but they're
+	 * present on all current Unix-like systems so we use them without any
+	 * special checks.  Some of these could be provided in our Windows
+	 * emulation in src/port/win32getrusage.c with more work.
+	 */
 	appendStringInfo(&str,
 					 "!\t%ld kB max resident size\n",
 #if defined(__darwin__)
@@ -4896,7 +4945,7 @@ ShowUsage(const char *title)
 					 r.ru_nvcsw - Save_r.ru_nvcsw,
 					 r.ru_nivcsw - Save_r.ru_nivcsw,
 					 r.ru_nvcsw, r.ru_nivcsw);
-#endif							/* HAVE_GETRUSAGE */
+#endif							/* !WIN32 */
 
 	/* remove trailing newline */
 	if (str.data[str.len - 1] == '\n')

@@ -16,6 +16,9 @@ SET enable_indexonlyscan TO off;
 -- not enabled by default, but we want to test it...
 SET track_functions TO 'all';
 
+-- record dboid for later use
+SELECT oid AS dboid from pg_database where datname = current_database() \gset
+
 -- save counters
 BEGIN;
 SET LOCAL stats_fetch_consistency = snapshot;
@@ -294,15 +297,16 @@ DROP TABLE prevstats;
 -- Test that sessions is incremented when a new session is started in pg_stat_database
 SELECT sessions AS db_stat_sessions FROM pg_stat_database WHERE datname = (SELECT current_database()) \gset
 \c
+SELECT pg_stat_force_next_flush();
 SELECT sessions > :db_stat_sessions FROM pg_stat_database WHERE datname = (SELECT current_database());
 
 -- Test pg_stat_bgwriter checkpointer-related stats, together with pg_stat_wal
 SELECT checkpoints_req AS rqst_ckpts_before FROM pg_stat_bgwriter \gset
 
--- Test pg_stat_wal
+-- Test pg_stat_wal (and make a temp table so our temp schema exists)
 SELECT wal_bytes AS wal_bytes_before FROM pg_stat_wal \gset
 
-CREATE TABLE test_stats_temp AS SELECT 17;
+CREATE TEMP TABLE test_stats_temp AS SELECT 17;
 DROP TABLE test_stats_temp;
 
 -- Checkpoint twice: The checkpointer reports stats after reporting completion
@@ -314,6 +318,12 @@ CHECKPOINT;
 SELECT checkpoints_req > :rqst_ckpts_before FROM pg_stat_bgwriter;
 SELECT wal_bytes > :wal_bytes_before FROM pg_stat_wal;
 
+-- Test pg_stat_get_backend_idset() and some allied functions.
+-- In particular, verify that their notion of backend ID matches
+-- our temp schema index.
+SELECT (current_schemas(true))[1] = ('pg_temp_' || beid::text) AS match
+FROM pg_stat_get_backend_idset() beid
+WHERE pg_stat_get_backend_pid(beid) = pg_backend_pid();
 
 -----
 -- Test that resetting stats works for reset timestamp
@@ -387,9 +397,52 @@ SELECT pg_stat_have_stats('bgwriter', 0, 0);
 -- unknown stats kinds error out
 SELECT pg_stat_have_stats('zaphod', 0, 0);
 -- db stats have objoid 0
-SELECT pg_stat_have_stats('database', (SELECT oid FROM pg_database WHERE datname = current_database()), 1);
-SELECT pg_stat_have_stats('database', (SELECT oid FROM pg_database WHERE datname = current_database()), 0);
+SELECT pg_stat_have_stats('database', :dboid, 1);
+SELECT pg_stat_have_stats('database', :dboid, 0);
 
+-- pg_stat_have_stats returns true for committed index creation
+CREATE table stats_test_tab1 as select generate_series(1,10) a;
+CREATE index stats_test_idx1 on stats_test_tab1(a);
+SELECT 'stats_test_idx1'::regclass::oid AS stats_test_idx1_oid \gset
+SET enable_seqscan TO off;
+select a from stats_test_tab1 where a = 3;
+SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+
+-- pg_stat_have_stats returns false for dropped index with stats
+SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+DROP index stats_test_idx1;
+SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+
+-- pg_stat_have_stats returns false for rolled back index creation
+BEGIN;
+CREATE index stats_test_idx1 on stats_test_tab1(a);
+SELECT 'stats_test_idx1'::regclass::oid AS stats_test_idx1_oid \gset
+select a from stats_test_tab1 where a = 3;
+SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+ROLLBACK;
+SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+
+-- pg_stat_have_stats returns true for reindex CONCURRENTLY
+CREATE index stats_test_idx1 on stats_test_tab1(a);
+SELECT 'stats_test_idx1'::regclass::oid AS stats_test_idx1_oid \gset
+select a from stats_test_tab1 where a = 3;
+SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+REINDEX index CONCURRENTLY stats_test_idx1;
+-- false for previous oid
+SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+-- true for new oid
+SELECT 'stats_test_idx1'::regclass::oid AS stats_test_idx1_oid \gset
+SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+
+-- pg_stat_have_stats returns true for a rolled back drop index with stats
+BEGIN;
+SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+DROP index stats_test_idx1;
+ROLLBACK;
+SELECT pg_stat_have_stats('relation', :dboid, :stats_test_idx1_oid);
+
+-- put enable_seqscan back to on
+SET enable_seqscan TO on;
 
 -- ensure that stats accessors handle NULL input correctly
 SELECT pg_stat_get_replication_slot(NULL);

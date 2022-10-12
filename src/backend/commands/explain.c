@@ -111,7 +111,7 @@ static void show_incremental_sort_info(IncrementalSortState *incrsortstate,
 static void show_hash_info(HashState *hashstate, ExplainState *es);
 static void show_memoize_info(MemoizeState *mstate, List *ancestors,
 							  ExplainState *es);
-static void show_hashagg_info(AggState *hashstate, ExplainState *es);
+static void show_hashagg_info(AggState *aggstate, ExplainState *es);
 static void show_tidbitmap_info(BitmapHeapScanState *planstate,
 								ExplainState *es);
 static void show_instrumentation_count(const char *qlabel, int which,
@@ -3284,7 +3284,6 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 
 	if (es->format != EXPLAIN_FORMAT_TEXT)
 	{
-
 		if (es->costs)
 			ExplainPropertyInteger("Planned Partitions", NULL,
 								   aggstate->hash_planned_partitions, es);
@@ -3852,13 +3851,7 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 			break;
 		case T_TableFuncScan:
 			Assert(rte->rtekind == RTE_TABLEFUNC);
-			if (rte->tablefunc)
-				if (rte->tablefunc->functype == TFT_XMLTABLE)
-					objectname = "xmltable";
-				else			/* Must be TFT_JSON_TABLE */
-					objectname = "json_table";
-			else
-				objectname = NULL;
+			objectname = "xmltable";
 			objecttag = "Table Function Name";
 			break;
 		case T_ValuesScan:

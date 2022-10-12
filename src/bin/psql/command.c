@@ -2244,6 +2244,7 @@ exec_command_pset(PsqlScanState scan_state, bool active_branch)
 				"unicode_border_linestyle",
 				"unicode_column_linestyle",
 				"unicode_header_linestyle",
+				"xheader_width",
 				NULL
 			};
 
@@ -2660,6 +2661,7 @@ exec_command_write(PsqlScanState scan_state, bool active_branch,
 				if (fname[0] == '|')
 				{
 					is_pipe = true;
+					fflush(NULL);
 					disable_sigpipe_trap();
 					fd = popen(&fname[1], "w");
 				}
@@ -3550,27 +3552,27 @@ do_connect(enum trivalue reuse_previous_specification,
 			param_is_newly_set(PQhost(o_conn), PQhost(pset.db)) ||
 			param_is_newly_set(PQport(o_conn), PQport(pset.db)))
 		{
-			char	   *host = PQhost(pset.db);
+			char	   *connhost = PQhost(pset.db);
 			char	   *hostaddr = PQhostaddr(pset.db);
 
-			if (is_unixsock_path(host))
+			if (is_unixsock_path(connhost))
 			{
-				/* hostaddr overrides host */
+				/* hostaddr overrides connhost */
 				if (hostaddr && *hostaddr)
 					printf(_("You are now connected to database \"%s\" as user \"%s\" on address \"%s\" at port \"%s\".\n"),
 						   PQdb(pset.db), PQuser(pset.db), hostaddr, PQport(pset.db));
 				else
 					printf(_("You are now connected to database \"%s\" as user \"%s\" via socket in \"%s\" at port \"%s\".\n"),
-						   PQdb(pset.db), PQuser(pset.db), host, PQport(pset.db));
+						   PQdb(pset.db), PQuser(pset.db), connhost, PQport(pset.db));
 			}
 			else
 			{
-				if (hostaddr && *hostaddr && strcmp(host, hostaddr) != 0)
+				if (hostaddr && *hostaddr && strcmp(connhost, hostaddr) != 0)
 					printf(_("You are now connected to database \"%s\" as user \"%s\" on host \"%s\" (address \"%s\") at port \"%s\".\n"),
-						   PQdb(pset.db), PQuser(pset.db), host, hostaddr, PQport(pset.db));
+						   PQdb(pset.db), PQuser(pset.db), connhost, hostaddr, PQport(pset.db));
 				else
 					printf(_("You are now connected to database \"%s\" as user \"%s\" on host \"%s\" at port \"%s\".\n"),
-						   PQdb(pset.db), PQuser(pset.db), host, PQport(pset.db));
+						   PQdb(pset.db), PQuser(pset.db), connhost, PQport(pset.db));
 			}
 		}
 		else
@@ -3833,6 +3835,7 @@ editFile(const char *fname, int lineno)
 		sys = psprintf("\"%s\" \"%s\"",
 					   editorName, fname);
 #endif
+	fflush(NULL);
 	result = system(sys);
 	if (result == -1)
 		pg_log_error("could not start editor \"%s\"", editorName);
@@ -4369,6 +4372,29 @@ do_pset(const char *param, const char *value, printQueryOpt *popt, bool quiet)
 			popt->topt.expanded = !popt->topt.expanded;
 	}
 
+	/* header line width in expanded mode */
+	else if (strcmp(param, "xheader_width") == 0)
+	{
+		if (! value)
+			;
+		else if (pg_strcasecmp(value, "full") == 0)
+			popt->topt.expanded_header_width_type = PRINT_XHEADER_FULL;
+		else if (pg_strcasecmp(value, "column") == 0)
+			popt->topt.expanded_header_width_type = PRINT_XHEADER_COLUMN;
+		else if (pg_strcasecmp(value, "page") == 0)
+			popt->topt.expanded_header_width_type = PRINT_XHEADER_PAGE;
+		else
+		{
+			popt->topt.expanded_header_width_type = PRINT_XHEADER_EXACT_WIDTH;
+			popt->topt.expanded_header_exact_width = atoi(value);
+			if (popt->topt.expanded_header_exact_width == 0)
+			{
+				pg_log_error("\\pset: allowed xheader_width values are full (default), column, page, or a number specifying the exact width.");
+				return false;
+			}
+		}
+	}
+
 	/* field separator for CSV format */
 	else if (strcmp(param, "csv_fieldsep") == 0)
 	{
@@ -4559,6 +4585,19 @@ printPsetInfo(const char *param, printQueryOpt *popt)
 			printf(_("Expanded display is used automatically.\n"));
 		else
 			printf(_("Expanded display is off.\n"));
+	}
+
+	/* show xheader width value */
+	else if (strcmp(param, "xheader_width") == 0)
+	{
+		if (popt->topt.expanded_header_width_type == PRINT_XHEADER_FULL)
+			printf(_("Expanded header width is 'full'.\n"));
+		else if (popt->topt.expanded_header_width_type == PRINT_XHEADER_COLUMN)
+			printf(_("Expanded header width is 'column'.\n"));
+		else if (popt->topt.expanded_header_width_type == PRINT_XHEADER_PAGE)
+			printf(_("Expanded header width is 'page'.\n"));
+		else if (popt->topt.expanded_header_width_type == PRINT_XHEADER_EXACT_WIDTH)
+			printf(_("Expanded header width is %d.\n"), popt->topt.expanded_header_exact_width);
 	}
 
 	/* show field separator for CSV format */
@@ -4850,9 +4889,9 @@ pset_value_string(const char *param, printQueryOpt *popt)
 	else if (strcmp(param, "footer") == 0)
 		return pstrdup(pset_bool_string(popt->topt.default_footer));
 	else if (strcmp(param, "format") == 0)
-		return psprintf("%s", _align2string(popt->topt.format));
+		return pstrdup(_align2string(popt->topt.format));
 	else if (strcmp(param, "linestyle") == 0)
-		return psprintf("%s", get_line_style(&popt->topt)->name);
+		return pstrdup(get_line_style(&popt->topt)->name);
 	else if (strcmp(param, "null") == 0)
 		return pset_quoted_string(popt->nullPrint
 								  ? popt->nullPrint
@@ -4881,6 +4920,23 @@ pset_value_string(const char *param, printQueryOpt *popt)
 		return pstrdup(_unicode_linestyle2string(popt->topt.unicode_column_linestyle));
 	else if (strcmp(param, "unicode_header_linestyle") == 0)
 		return pstrdup(_unicode_linestyle2string(popt->topt.unicode_header_linestyle));
+	else if (strcmp(param, "xheader_width") == 0)
+	{
+		if (popt->topt.expanded_header_width_type == PRINT_XHEADER_FULL)
+			return(pstrdup("full"));
+		else if (popt->topt.expanded_header_width_type == PRINT_XHEADER_COLUMN)
+			return(pstrdup("column"));
+		else if (popt->topt.expanded_header_width_type == PRINT_XHEADER_PAGE)
+			return(pstrdup("page"));
+		else
+		{
+			/* must be PRINT_XHEADER_EXACT_WIDTH */
+			char wbuff[32];
+			snprintf(wbuff, sizeof(wbuff), "%d",
+					 popt->topt.expanded_header_exact_width);
+			return pstrdup(wbuff);
+		}
+	}
 	else
 		return pstrdup("ERROR");
 }
@@ -4902,6 +4958,7 @@ do_shell(const char *command)
 {
 	int			result;
 
+	fflush(NULL);
 	if (!command)
 	{
 		char	   *sys;
@@ -4953,7 +5010,7 @@ do_watch(PQExpBuffer query_buf, double sleep)
 	FILE	   *pagerpipe = NULL;
 	int			title_len;
 	int			res = 0;
-#ifdef HAVE_POSIX_DECL_SIGWAIT
+#ifndef WIN32
 	sigset_t	sigalrm_sigchld_sigint;
 	sigset_t	sigalrm_sigchld;
 	sigset_t	sigint;
@@ -4967,7 +5024,7 @@ do_watch(PQExpBuffer query_buf, double sleep)
 		return false;
 	}
 
-#ifdef HAVE_POSIX_DECL_SIGWAIT
+#ifndef WIN32
 	sigemptyset(&sigalrm_sigchld_sigint);
 	sigaddset(&sigalrm_sigchld_sigint, SIGCHLD);
 	sigaddset(&sigalrm_sigchld_sigint, SIGALRM);
@@ -5006,11 +5063,12 @@ do_watch(PQExpBuffer query_buf, double sleep)
 	 * PAGER environment variables, because traditional pagers probably won't
 	 * be very useful for showing a stream of results.
 	 */
-#ifdef HAVE_POSIX_DECL_SIGWAIT
+#ifndef WIN32
 	pagerprog = getenv("PSQL_WATCH_PAGER");
 #endif
 	if (pagerprog && myopt.topt.pager)
 	{
+		fflush(NULL);
 		disable_sigpipe_trap();
 		pagerpipe = popen(pagerprog, "w");
 
@@ -5077,7 +5135,7 @@ do_watch(PQExpBuffer query_buf, double sleep)
 		if (pagerpipe && ferror(pagerpipe))
 			break;
 
-#ifndef HAVE_POSIX_DECL_SIGWAIT
+#ifdef WIN32
 
 		/*
 		 * Set up cancellation of 'watch' via SIGINT.  We redo this each time
@@ -5158,7 +5216,7 @@ do_watch(PQExpBuffer query_buf, double sleep)
 		fflush(stdout);
 	}
 
-#ifdef HAVE_POSIX_DECL_SIGWAIT
+#ifndef WIN32
 	/* Disable the interval timer. */
 	memset(&interval, 0, sizeof(interval));
 	setitimer(ITIMER_REAL, &interval, NULL);
