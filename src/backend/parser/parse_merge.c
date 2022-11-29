@@ -163,7 +163,11 @@ transformMergeStmt(ParseState *pstate, MergeStmt *stmt)
 					 errmsg("unreachable WHEN clause specified after unconditional WHEN clause")));
 	}
 
-	/* Set up the MERGE target table. */
+	/*
+	 * Set up the MERGE target table.  The target table is added to the
+	 * namespace below and to joinlist in transform_MERGE_to_join, so don't
+	 * do it here.
+	 */
 	qry->resultRelation = setTargetTable(pstate, stmt->relation,
 										 stmt->relation->inh,
 										 false, targetPerms);
@@ -178,7 +182,8 @@ transformMergeStmt(ParseState *pstate, MergeStmt *stmt)
 				 errmsg("cannot execute MERGE on relation \"%s\"",
 						RelationGetRelationName(pstate->p_target_relation)),
 				 errdetail_relkind_not_supported(pstate->p_target_relation->rd_rel->relkind)));
-	if (pstate->p_target_relation->rd_rel->relhasrules)
+	if (pstate->p_target_relation->rd_rules != NULL &&
+		pstate->p_target_relation->rd_rules->numLocks > 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot execute MERGE on relation \"%s\"",

@@ -379,7 +379,7 @@ AlterEventTrigger(AlterEventTrigStmt *stmt)
 	evtForm = (Form_pg_event_trigger) GETSTRUCT(tup);
 	trigoid = evtForm->oid;
 
-	if (!pg_event_trigger_ownercheck(trigoid, GetUserId()))
+	if (!object_ownercheck(EventTriggerRelationId, trigoid, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_EVENT_TRIGGER,
 					   stmt->trigname);
 
@@ -471,7 +471,7 @@ AlterEventTriggerOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 	if (form->evtowner == newOwnerId)
 		return;
 
-	if (!pg_event_trigger_ownercheck(form->oid, GetUserId()))
+	if (!object_ownercheck(EventTriggerRelationId, form->oid, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_EVENT_TRIGGER,
 					   NameStr(form->evtname));
 
@@ -1305,7 +1305,7 @@ pg_event_trigger_dropped_objects(PG_FUNCTION_ARGS)
 						"pg_event_trigger_dropped_objects()")));
 
 	/* Build tuplestore to hold the result rows */
-	SetSingleFuncCall(fcinfo, 0);
+	InitMaterializedSRF(fcinfo, 0);
 
 	slist_foreach(iter, &(currentEventTriggerState->SQLDropList))
 	{
@@ -1832,7 +1832,7 @@ pg_event_trigger_ddl_commands(PG_FUNCTION_ARGS)
 						"pg_event_trigger_ddl_commands()")));
 
 	/* Build tuplestore to hold the result rows */
-	SetSingleFuncCall(fcinfo, 0);
+	InitMaterializedSRF(fcinfo, 0);
 
 	foreach(lc, currentEventTriggerState->commandList)
 	{

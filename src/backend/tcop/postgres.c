@@ -3871,8 +3871,8 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
 											optarg)));
 					}
 					SetConfigOption(name, value, ctx, gucsource);
-					free(name);
-					free(value);
+					pfree(name);
+					pfree(value);
 					break;
 				}
 
@@ -4050,8 +4050,8 @@ PostgresMain(const char *dbname, const char *username)
 	bool		idle_in_transaction_timeout_enabled = false;
 	bool		idle_session_timeout_enabled = false;
 
-	AssertArg(dbname != NULL);
-	AssertArg(username != NULL);
+	Assert(dbname != NULL);
+	Assert(username != NULL);
 
 	SetProcessingMode(InitProcessing);
 

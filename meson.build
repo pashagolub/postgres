@@ -228,6 +228,10 @@ elif host_system == 'darwin'
   message('darwin sysroot: @0@'.format(pg_sysroot))
   cflags += ['-isysroot', pg_sysroot]
   ldflags += ['-isysroot', pg_sysroot]
+  # meson defaults to -Wl,-undefined,dynamic_lookup for modules, which we
+  # don't want because a) it's different from what we do for autoconf, b) it
+  # causes warnings starting in macOS Ventura
+  ldflags_mod += ['-Wl,-undefined,error']
 
 elif host_system == 'freebsd'
   sema_kind = 'unnamed_posix'
@@ -316,14 +320,15 @@ endif
 # External programs
 perl = find_program(get_option('PERL'), required: true, native: true)
 python = find_program(get_option('PYTHON'), required: true, native: true)
-flex = find_program(get_option('FLEX'), native: true, version: '>= 2.5.31')
-bison = find_program(get_option('BISON'), native: true, version: '>= 1.875')
+flex = find_program(get_option('FLEX'), native: true, version: '>= 2.5.35')
+bison = find_program(get_option('BISON'), native: true, version: '>= 2.3')
 sed = find_program(get_option('SED'), 'sed', native: true)
-prove = find_program(get_option('PROVE'), native: true)
+prove = find_program(get_option('PROVE'), native: true, required: false)
 tar = find_program(get_option('TAR'), native: true)
 gzip = find_program(get_option('GZIP'), native: true)
 program_lz4 = find_program(get_option('LZ4'), native: true, required: false)
 touch = find_program('touch', native: true)
+openssl = find_program(get_option('OPENSSL'), native: true, required: false)
 program_zstd = find_program(get_option('ZSTD'), native: true, required: false)
 dtrace = find_program(get_option('DTRACE'), native: true, required: get_option('dtrace'))
 missing = find_program('config/missing', native: true)
@@ -864,7 +869,10 @@ if not perlopt.disabled()
 
     perl_inc_dir = '@0@/CORE'.format(archlibexp)
 
-    if useshrplib != 'true'
+    if perlversion.version_compare('< 5.14')
+      perl_may_work = false
+      perl_msg = 'Perl version 5.14 or later is required, but this is @0@'.format(perlversion)
+    elif useshrplib != 'true'
       perl_may_work = false
       perl_msg = 'need a shared perl'
     endif
@@ -901,6 +909,12 @@ if not perlopt.disabled()
 
     if host_system == 'windows'
       perl_ccflags += ['-DPLPERL_HAVE_UID_GID']
+
+      if cc.get_id() == 'msvc'
+        # prevent binary mismatch between MSVC built plperl and Strawberry or
+        # msys ucrt perl libraries
+        perl_ccflags += ['-DNO_THREAD_SAFE_LOCALE']
+      endif
     endif
 
     message('CCFLAGS recommended by perl: @0@'.format(perl_ccflags_r))
@@ -1458,6 +1472,8 @@ if cc.links('''
     /* This must match the corresponding code in c.h: */
     #if defined(__GNUC__) || defined(__SUNPRO_C) || defined(__IBMC__)
     #define pg_attribute_aligned(a) __attribute__((aligned(a)))
+    #elif defined(_MSC_VER)
+    #define pg_attribute_aligned(a) __declspec(align(a))
     #endif
     typedef __int128 int128a
     #if defined(pg_attribute_aligned)
@@ -2183,12 +2199,15 @@ endif
 
 # Check for the locale_t type and find the right header file.  macOS
 # needs xlocale.h; standard is locale.h, but glibc also has an
-# xlocale.h file that we should not use.
+# xlocale.h file that we should not use.  MSVC has a replacement
+# defined in src/include/port/win32_port.h.
 if cc.has_type('locale_t', prefix: '#include <locale.h>')
   cdata.set('HAVE_LOCALE_T', 1)
 elif cc.has_type('locale_t', prefix: '#include <xlocale.h>')
   cdata.set('HAVE_LOCALE_T', 1)
   cdata.set('LOCALE_T_IN_XLOCALE', 1)
+elif cc.get_id() == 'msvc'
+  cdata.set('HAVE_LOCALE_T', 1)
 endif
 
 # Check if the C compiler understands typeof or a variant.  Define
@@ -2398,6 +2417,13 @@ endforeach
 if cc.has_function('syslog', args: test_c_args) and \
     cc.check_header('syslog.h', args: test_c_args)
   cdata.set('HAVE_SYSLOG', 1)
+endif
+
+
+# MSVC has replacements defined in src/include/port/win32_port.h.
+if cc.get_id() == 'msvc'
+  cdata.set('HAVE_WCSTOMBS_L', 1)
+  cdata.set('HAVE_MBSTOWCS_L', 1)
 endif
 
 

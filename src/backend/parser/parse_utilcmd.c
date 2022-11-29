@@ -996,7 +996,7 @@ transformTableLikeClause(CreateStmtContext *cxt, TableLikeClause *table_like_cla
 	 */
 	if (relation->rd_rel->relkind == RELKIND_COMPOSITE_TYPE)
 	{
-		aclresult = pg_type_aclcheck(relation->rd_rel->reltype, GetUserId(),
+		aclresult = object_aclcheck(TypeRelationId, relation->rd_rel->reltype, GetUserId(),
 									 ACL_USAGE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_TYPE,
@@ -1232,7 +1232,8 @@ expandTableLikeClause(RangeVar *heapRel, TableLikeClause *table_like_clause)
 	 * have a failure since both tables are locked.
 	 */
 	attmap = build_attrmap_by_name(RelationGetDescr(childrel),
-								   tupleDesc);
+								   tupleDesc,
+								   false);
 
 	/*
 	 * Process defaults, if required.
@@ -1463,7 +1464,7 @@ transformOfType(CreateStmtContext *cxt, TypeName *ofTypename)
 	int			i;
 	Oid			ofTypeId;
 
-	AssertArg(ofTypename);
+	Assert(ofTypename);
 
 	tuple = typenameType(NULL, ofTypename, NULL);
 	check_of_type(tuple);

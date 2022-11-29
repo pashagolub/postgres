@@ -226,7 +226,8 @@ pg_drop_replication_slot(PG_FUNCTION_ARGS)
 }
 
 /*
- * pg_get_replication_slots - SQL SRF showing active replication slots.
+ * pg_get_replication_slots - SQL SRF showing all replication slots
+ * that currently exist on the database cluster.
  */
 Datum
 pg_get_replication_slots(PG_FUNCTION_ARGS)
@@ -242,7 +243,7 @@ pg_get_replication_slots(PG_FUNCTION_ARGS)
 	 * name, which shouldn't contain anything particularly sensitive.
 	 */
 
-	SetSingleFuncCall(fcinfo, 0);
+	InitMaterializedSRF(fcinfo, 0);
 
 	currlsn = GetXLogWriteRecPtr();
 

@@ -2207,6 +2207,10 @@ select tableoid::regclass, * FROM remp2;
 
 delete from itrtest;
 
+-- MERGE ought to fail cleanly
+merge into itrtest using (select 1, 'foo') as source on (true)
+  when matched then do nothing;
+
 create unique index loct1_idx on loct1 (a);
 
 -- DO NOTHING without an inference specification is supported
@@ -2373,6 +2377,28 @@ copy remp1 from stdin;
 
 select tableoid::regclass, * FROM remp1;
 
+delete from ctrtest;
+
+-- Test copy tuple routing with the batch_size option enabled
+alter server loopback options (add batch_size '2');
+
+copy ctrtest from stdin;
+1	foo
+1	bar
+2	baz
+2	qux
+1	test1
+2	test2
+\.
+
+select tableoid::regclass, * FROM ctrtest;
+select tableoid::regclass, * FROM remp1;
+select tableoid::regclass, * FROM remp2;
+
+delete from ctrtest;
+
+alter server loopback options (drop batch_size);
+
 drop table ctrtest;
 drop table loct1;
 drop table loct2;
@@ -2526,6 +2552,86 @@ commit;
 select * from rem3;
 drop foreign table rem3;
 drop table loc3;
+
+-- Test COPY FROM with the batch_size option enabled
+alter server loopback options (add batch_size '2');
+
+-- Test basic functionality
+copy rem2 from stdin;
+1	foo
+2	bar
+3	baz
+\.
+select * from rem2;
+
+delete from rem2;
+
+-- Test check constraints
+alter table loc2 add constraint loc2_f1positive check (f1 >= 0);
+alter foreign table rem2 add constraint rem2_f1positive check (f1 >= 0);
+
+-- check constraint is enforced on the remote side, not locally
+copy rem2 from stdin;
+1	foo
+2	bar
+3	baz
+\.
+copy rem2 from stdin; -- ERROR
+-1	xyzzy
+\.
+select * from rem2;
+
+alter foreign table rem2 drop constraint rem2_f1positive;
+alter table loc2 drop constraint loc2_f1positive;
+
+delete from rem2;
+
+-- Test remote triggers
+create trigger trig_row_before_insert before insert on loc2
+	for each row execute procedure trig_row_before_insupdate();
+
+-- The new values are concatenated with ' triggered !'
+copy rem2 from stdin;
+1	foo
+2	bar
+3	baz
+\.
+select * from rem2;
+
+drop trigger trig_row_before_insert on loc2;
+
+delete from rem2;
+
+create trigger trig_null before insert on loc2
+	for each row execute procedure trig_null();
+
+-- Nothing happens
+copy rem2 from stdin;
+1	foo
+2	bar
+3	baz
+\.
+select * from rem2;
+
+drop trigger trig_null on loc2;
+
+delete from rem2;
+
+-- Check with zero-column foreign table; batch insert will be disabled
+alter table loc2 drop column f1;
+alter table loc2 drop column f2;
+alter table rem2 drop column f1;
+alter table rem2 drop column f2;
+copy rem2 from stdin;
+
+
+
+\.
+select * from rem2;
+
+delete from rem2;
+
+alter server loopback options (drop batch_size);
 
 -- ===================================================================
 -- test for TRUNCATE
@@ -3266,7 +3372,93 @@ INSERT INTO batch_table SELECT i, 'test'||i, 'test'|| i FROM generate_series(1, 
 SELECT COUNT(*) FROM batch_table;
 SELECT * FROM batch_table ORDER BY x;
 
+-- Clean up
+DROP TABLE batch_table;
+DROP TABLE batch_table_p0;
+DROP TABLE batch_table_p1;
+
 ALTER SERVER loopback OPTIONS (DROP batch_size);
+
+-- Test that pending inserts are handled properly when needed
+CREATE TABLE batch_table (a text, b int);
+CREATE FOREIGN TABLE ftable (a text, b int)
+	SERVER loopback
+	OPTIONS (table_name 'batch_table', batch_size '2');
+CREATE TABLE ltable (a text, b int);
+CREATE FUNCTION ftable_rowcount_trigf() RETURNS trigger LANGUAGE plpgsql AS
+$$
+begin
+	raise notice '%: there are % rows in ftable',
+		TG_NAME, (SELECT count(*) FROM ftable);
+	if TG_OP = 'DELETE' then
+		return OLD;
+	else
+		return NEW;
+	end if;
+end;
+$$;
+CREATE TRIGGER ftable_rowcount_trigger
+BEFORE INSERT OR UPDATE OR DELETE ON ltable
+FOR EACH ROW EXECUTE PROCEDURE ftable_rowcount_trigf();
+
+WITH t AS (
+	INSERT INTO ltable VALUES ('AAA', 42), ('BBB', 42) RETURNING *
+)
+INSERT INTO ftable SELECT * FROM t;
+
+SELECT * FROM ltable;
+SELECT * FROM ftable;
+DELETE FROM ftable;
+
+WITH t AS (
+	UPDATE ltable SET b = b + 100 RETURNING *
+)
+INSERT INTO ftable SELECT * FROM t;
+
+SELECT * FROM ltable;
+SELECT * FROM ftable;
+DELETE FROM ftable;
+
+WITH t AS (
+	DELETE FROM ltable RETURNING *
+)
+INSERT INTO ftable SELECT * FROM t;
+
+SELECT * FROM ltable;
+SELECT * FROM ftable;
+DELETE FROM ftable;
+
+-- Clean up
+DROP FOREIGN TABLE ftable;
+DROP TABLE batch_table;
+DROP TRIGGER ftable_rowcount_trigger ON ltable;
+DROP TABLE ltable;
+
+CREATE TABLE parent (a text, b int) PARTITION BY LIST (a);
+CREATE TABLE batch_table (a text, b int);
+CREATE FOREIGN TABLE ftable
+	PARTITION OF parent
+	FOR VALUES IN ('AAA')
+	SERVER loopback
+	OPTIONS (table_name 'batch_table', batch_size '2');
+CREATE TABLE ltable
+	PARTITION OF parent
+	FOR VALUES IN ('BBB');
+CREATE TRIGGER ftable_rowcount_trigger
+BEFORE INSERT ON ltable
+FOR EACH ROW EXECUTE PROCEDURE ftable_rowcount_trigf();
+
+INSERT INTO parent VALUES ('AAA', 42), ('BBB', 42), ('AAA', 42), ('BBB', 42);
+
+SELECT tableoid::regclass, * FROM parent;
+
+-- Clean up
+DROP FOREIGN TABLE ftable;
+DROP TABLE batch_table;
+DROP TRIGGER ftable_rowcount_trigger ON ltable;
+DROP TABLE ltable;
+DROP TABLE parent;
+DROP FUNCTION ftable_rowcount_trigf;
 
 -- ===================================================================
 -- test asynchronous execution

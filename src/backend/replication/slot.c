@@ -97,8 +97,8 @@ ReplicationSlotCtlData *ReplicationSlotCtl = NULL;
 /* My backend's replication slot in the shared memory array */
 ReplicationSlot *MyReplicationSlot = NULL;
 
-/* GUCs */
-int			max_replication_slots = 0;	/* the maximum number of replication
+/* GUC variable */
+int			max_replication_slots = 10; /* the maximum number of replication
 										 * slots */
 
 static void ReplicationSlotShmemExit(int code, Datum arg);
@@ -452,7 +452,7 @@ ReplicationSlotAcquire(const char *name, bool nowait)
 	ReplicationSlot *s;
 	int			active_pid;
 
-	AssertArg(name != NULL);
+	Assert(name != NULL);
 
 retry:
 	Assert(MyReplicationSlot == NULL);
@@ -847,6 +847,7 @@ ReplicationSlotsComputeRequiredXmin(bool already_locked)
 		ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
 		TransactionId effective_xmin;
 		TransactionId effective_catalog_xmin;
+		bool		invalidated;
 
 		if (!s->in_use)
 			continue;
@@ -854,7 +855,13 @@ ReplicationSlotsComputeRequiredXmin(bool already_locked)
 		SpinLockAcquire(&s->mutex);
 		effective_xmin = s->effective_xmin;
 		effective_catalog_xmin = s->effective_catalog_xmin;
+		invalidated = (!XLogRecPtrIsInvalid(s->data.invalidated_at) &&
+					   XLogRecPtrIsInvalid(s->data.restart_lsn));
 		SpinLockRelease(&s->mutex);
+
+		/* invalidated slots need not apply */
+		if (invalidated)
+			continue;
 
 		/* check the data xmin */
 		if (TransactionIdIsValid(effective_xmin) &&

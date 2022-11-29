@@ -1933,7 +1933,7 @@ dblink_get_notify(PG_FUNCTION_ARGS)
 	else
 		conn = pconn->conn;
 
-	SetSingleFuncCall(fcinfo, 0);
+	InitMaterializedSRF(fcinfo, 0);
 
 	PQconsumeInput(conn);
 	while ((notify = PQnotifies(conn)) != NULL)
@@ -2838,7 +2838,7 @@ get_connect_string(const char *servername)
 		fdw = GetForeignDataWrapper(fdwid);
 
 		/* Check permissions, user must have usage on the server. */
-		aclresult = pg_foreign_server_aclcheck(serverid, userid, ACL_USAGE);
+		aclresult = object_aclcheck(ForeignServerRelationId, serverid, userid, ACL_USAGE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_FOREIGN_SERVER, foreign_server->servername);
 

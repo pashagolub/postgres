@@ -879,7 +879,7 @@ process_ordered_aggregate_single(AggState *aggstate,
 	 */
 
 	while (tuplesort_getdatum(pertrans->sortstates[aggstate->current_set],
-							  true, newVal, isNull, &newAbbrevVal))
+							  true, false, newVal, isNull, &newAbbrevVal))
 	{
 		/*
 		 * Clear and select the working context for evaluation of the equality
@@ -900,24 +900,33 @@ process_ordered_aggregate_single(AggState *aggstate,
 											 pertrans->aggCollation,
 											 oldVal, *newVal)))))
 		{
-			/* equal to prior, so forget this one */
-			if (!pertrans->inputtypeByVal && !*isNull)
-				pfree(DatumGetPointer(*newVal));
+			MemoryContextSwitchTo(oldContext);
+			continue;
 		}
 		else
 		{
 			advance_transition_function(aggstate, pertrans, pergroupstate);
-			/* forget the old value, if any */
-			if (!oldIsNull && !pertrans->inputtypeByVal)
-				pfree(DatumGetPointer(oldVal));
-			/* and remember the new one for subsequent equality checks */
-			oldVal = *newVal;
+
+			MemoryContextSwitchTo(oldContext);
+
+			/*
+			 * Forget the old value, if any, and remember the new one for
+			 * subsequent equality checks.
+			 */
+			if (!pertrans->inputtypeByVal)
+			{
+				if (!oldIsNull)
+					pfree(DatumGetPointer(oldVal));
+				if (!*isNull)
+					oldVal = datumCopy(*newVal, pertrans->inputtypeByVal,
+									   pertrans->inputtypeLen);
+			}
+			else
+				oldVal = *newVal;
 			oldAbbrevVal = newAbbrevVal;
 			oldIsNull = *isNull;
 			haveOldVal = true;
 		}
-
-		MemoryContextSwitchTo(oldContext);
 	}
 
 	if (!oldIsNull && !pertrans->inputtypeByVal)
@@ -3667,7 +3676,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 		aggform = (Form_pg_aggregate) GETSTRUCT(aggTuple);
 
 		/* Check permission to call aggregate function */
-		aclresult = pg_proc_aclcheck(aggref->aggfnoid, GetUserId(),
+		aclresult = object_aclcheck(ProcedureRelationId, aggref->aggfnoid, GetUserId(),
 									 ACL_EXECUTE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_AGGREGATE,
@@ -3734,7 +3743,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 
 			if (OidIsValid(finalfn_oid))
 			{
-				aclresult = pg_proc_aclcheck(finalfn_oid, aggOwner,
+				aclresult = object_aclcheck(ProcedureRelationId, finalfn_oid, aggOwner,
 											 ACL_EXECUTE);
 				if (aclresult != ACLCHECK_OK)
 					aclcheck_error(aclresult, OBJECT_FUNCTION,
@@ -3743,7 +3752,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 			}
 			if (OidIsValid(serialfn_oid))
 			{
-				aclresult = pg_proc_aclcheck(serialfn_oid, aggOwner,
+				aclresult = object_aclcheck(ProcedureRelationId, serialfn_oid, aggOwner,
 											 ACL_EXECUTE);
 				if (aclresult != ACLCHECK_OK)
 					aclcheck_error(aclresult, OBJECT_FUNCTION,
@@ -3752,7 +3761,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 			}
 			if (OidIsValid(deserialfn_oid))
 			{
-				aclresult = pg_proc_aclcheck(deserialfn_oid, aggOwner,
+				aclresult = object_aclcheck(ProcedureRelationId, deserialfn_oid, aggOwner,
 											 ACL_EXECUTE);
 				if (aclresult != ACLCHECK_OK)
 					aclcheck_error(aclresult, OBJECT_FUNCTION,
@@ -3832,7 +3841,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 			else
 				transfn_oid = aggform->aggtransfn;
 
-			aclresult = pg_proc_aclcheck(transfn_oid, aggOwner, ACL_EXECUTE);
+			aclresult = object_aclcheck(ProcedureRelationId, transfn_oid, aggOwner, ACL_EXECUTE);
 			if (aclresult != ACLCHECK_OK)
 				aclcheck_error(aclresult, OBJECT_FUNCTION,
 							   get_func_name(transfn_oid));

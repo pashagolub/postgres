@@ -15149,6 +15149,12 @@ table2-mapping
    <type>jsonb</type>, though not for <type>json</type>.  The comparison
    operators follow the ordering rules for B-tree operations outlined in
    <xref linkend="json-indexing"/>.
+   See also <xref linkend="functions-aggregate"/> for the aggregate
+   function <function>json_agg</function> which aggregates record
+   values as JSON, the aggregate function
+   <function>json_object_agg</function> which aggregates pairs of values
+   into a JSON object, and their <type>jsonb</type> equivalents,
+   <function>jsonb_agg</function> and <function>jsonb_object_agg</function>.
   </para>
 
   <table id="functions-json-op-table">
@@ -16604,15 +16610,6 @@ table2-mapping
      </tbody>
     </tgroup>
    </table>
-
-  <para>
-    See also <xref linkend="functions-aggregate"/> for the aggregate
-    function <function>json_agg</function> which aggregates record
-    values as JSON, the aggregate function
-    <function>json_object_agg</function> which aggregates pairs of values
-    into a JSON object, and their <type>jsonb</type> equivalents,
-    <function>jsonb_agg</function> and <function>jsonb_object_agg</function>.
-  </para>
  </sect2>
 
  <sect2 id="functions-sqljson-path">
@@ -22981,7 +22978,8 @@ SELECT has_function_privilege('joeuser', 'myfunc(int, text)', 'execute');
         are <literal>SELECT</literal>, <literal>INSERT</literal>,
         <literal>UPDATE</literal>, <literal>DELETE</literal>,
         <literal>TRUNCATE</literal>, <literal>REFERENCES</literal>,
-        and <literal>TRIGGER</literal>.
+        <literal>TRIGGER</literal>, <literal>VACUUM</literal> and
+        <literal>ANALYZE</literal>.
        </para></entry>
       </row>
 
@@ -23036,11 +23034,14 @@ SELECT has_function_privilege('joeuser', 'myfunc(int, text)', 'execute');
        <para>
         Does user have privilege for role?
         Allowable privilege types are
-        <literal>MEMBER</literal> and <literal>USAGE</literal>.
+        <literal>MEMBER</literal>, <literal>USAGE</literal>,
+        and <literal>SET</literal>.
         <literal>MEMBER</literal> denotes direct or indirect membership in
-        the role (that is, the right to do <command>SET ROLE</command>), while
+        the role without regard to what specific privileges may be conferred.
         <literal>USAGE</literal> denotes whether the privileges of the role
-        are immediately available without doing <command>SET ROLE</command>.
+        are immediately available without doing <command>SET ROLE</command>,
+        while <literal>SET</literal> denotes whether it is possible to change
+        to the role using the <literal>SET ROLE</literal> command.
         This function does not allow the special case of
         setting <parameter>user</parameter> to <literal>public</literal>,
         because the PUBLIC pseudo-role can never be a member of real roles.

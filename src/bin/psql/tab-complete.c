@@ -1143,6 +1143,12 @@ static const SchemaQuery Query_for_trigger_of_table = {
 "  FROM pg_catalog.pg_timezone_names() "\
 " WHERE pg_catalog.quote_literal(pg_catalog.lower(name)) LIKE pg_catalog.lower('%s')"
 
+/* Privilege options shared between GRANT and REVOKE */
+#define Privilege_options_of_grant_and_revoke \
+"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", \
+"CREATE", "CONNECT", "TEMPORARY", "EXECUTE", "USAGE", "SET", "ALTER SYSTEM", \
+"VACUUM", "ANALYZE", "ALL"
+
 /*
  * These object types were introduced later than our support cutoff of
  * server version 9.2.  We use the VersionedQuery infrastructure so that
@@ -1680,6 +1686,7 @@ psql_completion(const char *text, int start, int end)
 	/* psql's backslash commands. */
 	static const char *const backslash_commands[] = {
 		"\\a",
+		"\\bind",
 		"\\connect", "\\conninfo", "\\C", "\\cd", "\\copy",
 		"\\copyright", "\\crosstabview",
 		"\\d", "\\da", "\\dA", "\\dAc", "\\dAf", "\\dAo", "\\dAp",
@@ -2104,7 +2111,7 @@ psql_completion(const char *text, int start, int end)
 	/* ALTER SEQUENCE <name> */
 	else if (Matches("ALTER", "SEQUENCE", MatchAny))
 		COMPLETE_WITH("AS", "INCREMENT", "MINVALUE", "MAXVALUE", "RESTART",
-					  "NO", "CACHE", "CYCLE", "SET", "OWNED BY",
+					  "START", "NO", "CACHE", "CYCLE", "SET", "OWNED BY",
 					  "OWNER TO", "RENAME TO");
 	/* ALTER SEQUENCE <name> AS */
 	else if (TailMatches("ALTER", "SEQUENCE", MatchAny, "AS"))
@@ -2216,6 +2223,9 @@ psql_completion(const char *text, int start, int end)
 	/* ALTER STATISTICS <name> */
 	else if (Matches("ALTER", "STATISTICS", MatchAny))
 		COMPLETE_WITH("OWNER TO", "RENAME TO", "SET SCHEMA", "SET STATISTICS");
+	/* ALTER STATISTICS <name> SET */
+	else if (Matches("ALTER", "STATISTICS", MatchAny, "SET"))
+		COMPLETE_WITH("SCHEMA", "STATISTICS");
 
 	/* ALTER TRIGGER <name>, add ON */
 	else if (Matches("ALTER", "TRIGGER", MatchAny))
@@ -2378,10 +2388,26 @@ psql_completion(const char *text, int start, int end)
 	else if (Matches("ALTER", "TABLE", MatchAny, "ALTER", "COLUMN", MatchAny) ||
 			 Matches("ALTER", "TABLE", MatchAny, "ALTER", MatchAny))
 		COMPLETE_WITH("TYPE", "SET", "RESET", "RESTART", "ADD", "DROP");
+	/* ALTER TABLE ALTER [COLUMN] <foo> ADD */
+	else if (Matches("ALTER", "TABLE", MatchAny, "ALTER", "COLUMN", MatchAny, "ADD") ||
+			 Matches("ALTER", "TABLE", MatchAny, "ALTER", MatchAny, "ADD"))
+		COMPLETE_WITH("GENERATED");
+	/* ALTER TABLE ALTER [COLUMN] <foo> ADD GENERATED */
+	else if (Matches("ALTER", "TABLE", MatchAny, "ALTER", "COLUMN", MatchAny, "ADD", "GENERATED") ||
+			 Matches("ALTER", "TABLE", MatchAny, "ALTER", MatchAny, "ADD", "GENERATED"))
+		COMPLETE_WITH("ALWAYS", "BY DEFAULT");
+	/* ALTER TABLE ALTER [COLUMN] <foo> ADD GENERATED */
+	else if (Matches("ALTER", "TABLE", MatchAny, "ALTER", "COLUMN", MatchAny, "ADD", "GENERATED", "ALWAYS") ||
+			 Matches("ALTER", "TABLE", MatchAny, "ALTER", MatchAny, "ADD", "GENERATED", "ALWAYS") ||
+			 Matches("ALTER", "TABLE", MatchAny, "ALTER", "COLUMN", MatchAny, "ADD", "GENERATED", "BY", "DEFAULT") ||
+			 Matches("ALTER", "TABLE", MatchAny, "ALTER", MatchAny, "ADD", "GENERATED", "BY", "DEFAULT"))
+		COMPLETE_WITH("AS IDENTITY");
 	/* ALTER TABLE ALTER [COLUMN] <foo> SET */
 	else if (Matches("ALTER", "TABLE", MatchAny, "ALTER", "COLUMN", MatchAny, "SET") ||
 			 Matches("ALTER", "TABLE", MatchAny, "ALTER", MatchAny, "SET"))
-		COMPLETE_WITH("(", "COMPRESSION", "DEFAULT", "NOT NULL", "STATISTICS", "STORAGE");
+		COMPLETE_WITH("(", "COMPRESSION", "DEFAULT", "GENERATED", "NOT NULL", "STATISTICS", "STORAGE",
+		/* a subset of ALTER SEQUENCE options */
+					  "INCREMENT", "MINVALUE", "MAXVALUE", "START", "NO", "CACHE", "CYCLE");
 	/* ALTER TABLE ALTER [COLUMN] <foo> SET ( */
 	else if (Matches("ALTER", "TABLE", MatchAny, "ALTER", "COLUMN", MatchAny, "SET", "(") ||
 			 Matches("ALTER", "TABLE", MatchAny, "ALTER", MatchAny, "SET", "("))
@@ -2390,10 +2416,18 @@ psql_completion(const char *text, int start, int end)
 	else if (Matches("ALTER", "TABLE", MatchAny, "ALTER", "COLUMN", MatchAny, "SET", "COMPRESSION") ||
 			 Matches("ALTER", "TABLE", MatchAny, "ALTER", MatchAny, "SET", "COMPRESSION"))
 		COMPLETE_WITH("DEFAULT", "PGLZ", "LZ4");
+	/* ALTER TABLE ALTER [COLUMN] <foo> SET GENERATED */
+	else if (Matches("ALTER", "TABLE", MatchAny, "ALTER", "COLUMN", MatchAny, "SET", "GENERATED") ||
+			 Matches("ALTER", "TABLE", MatchAny, "ALTER", MatchAny, "SET", "GENERATED"))
+		COMPLETE_WITH("ALWAYS", "BY DEFAULT");
+	/* ALTER TABLE ALTER [COLUMN] <foo> SET NO */
+	else if (Matches("ALTER", "TABLE", MatchAny, "ALTER", "COLUMN", MatchAny, "SET", "NO") ||
+			 Matches("ALTER", "TABLE", MatchAny, "ALTER", MatchAny, "SET", "NO"))
+		COMPLETE_WITH("MINVALUE", "MAXVALUE", "CYCLE");
 	/* ALTER TABLE ALTER [COLUMN] <foo> SET STORAGE */
 	else if (Matches("ALTER", "TABLE", MatchAny, "ALTER", "COLUMN", MatchAny, "SET", "STORAGE") ||
 			 Matches("ALTER", "TABLE", MatchAny, "ALTER", MatchAny, "SET", "STORAGE"))
-		COMPLETE_WITH("PLAIN", "EXTERNAL", "EXTENDED", "MAIN");
+		COMPLETE_WITH("DEFAULT", "PLAIN", "EXTERNAL", "EXTENDED", "MAIN");
 	/* ALTER TABLE ALTER [COLUMN] <foo> SET STATISTICS */
 	else if (Matches("ALTER", "TABLE", MatchAny, "ALTER", "COLUMN", MatchAny, "SET", "STATISTICS") ||
 			 Matches("ALTER", "TABLE", MatchAny, "ALTER", MatchAny, "SET", "STATISTICS"))
@@ -3739,7 +3773,7 @@ psql_completion(const char *text, int start, int end)
  */
 	/* Complete GRANT/REVOKE with a list of roles and privileges */
 	else if (TailMatches("GRANT|REVOKE") ||
-			 TailMatches("REVOKE", "GRANT", "OPTION", "FOR"))
+			 TailMatches("REVOKE", "ADMIN|GRANT|INHERIT", "OPTION", "FOR"))
 	{
 		/*
 		 * With ALTER DEFAULT PRIVILEGES, restrict completion to grantable
@@ -3748,31 +3782,22 @@ psql_completion(const char *text, int start, int end)
 		if (HeadMatches("ALTER", "DEFAULT", "PRIVILEGES"))
 			COMPLETE_WITH("SELECT", "INSERT", "UPDATE",
 						  "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER",
-						  "EXECUTE", "USAGE", "ALL");
-		else
+						  "CREATE", "EXECUTE", "USAGE", "VACUUM", "ANALYZE",
+						  "ALL");
+		else if (TailMatches("GRANT"))
 			COMPLETE_WITH_QUERY_PLUS(Query_for_list_of_roles,
-									 "GRANT",
-									 "SELECT",
-									 "INSERT",
-									 "UPDATE",
-									 "DELETE",
-									 "TRUNCATE",
-									 "REFERENCES",
-									 "TRIGGER",
-									 "CREATE",
-									 "CONNECT",
-									 "TEMPORARY",
-									 "EXECUTE",
-									 "USAGE",
-									 "SET",
-									 "ALTER SYSTEM",
-									 "ALL");
+									 Privilege_options_of_grant_and_revoke);
+		else if (TailMatches("REVOKE"))
+			COMPLETE_WITH_QUERY_PLUS(Query_for_list_of_roles,
+									 Privilege_options_of_grant_and_revoke,
+									 "GRANT OPTION FOR",
+									 "ADMIN OPTION FOR",
+									 "INHERIT OPTION FOR");
+		else if (TailMatches("REVOKE", "GRANT", "OPTION", "FOR"))
+			COMPLETE_WITH(Privilege_options_of_grant_and_revoke);
+		else if (TailMatches("REVOKE", "ADMIN|INHERIT", "OPTION", "FOR"))
+			COMPLETE_WITH_QUERY(Query_for_list_of_roles);
 	}
-
-	else if (TailMatches("REVOKE", "GRANT"))
-		COMPLETE_WITH("OPTION FOR");
-	else if (TailMatches("REVOKE", "GRANT", "OPTION"))
-		COMPLETE_WITH("FOR");
 
 	else if (TailMatches("GRANT|REVOKE", "ALTER") ||
 			 TailMatches("REVOKE", "GRANT", "OPTION", "FOR", "ALTER"))
@@ -3915,12 +3940,17 @@ psql_completion(const char *text, int start, int end)
 	 * Offer grant options after that.
 	 */
 	else if (HeadMatches("GRANT") && TailMatches("TO", MatchAny))
-		COMPLETE_WITH("WITH ADMIN OPTION",
+		COMPLETE_WITH("WITH ADMIN",
+					  "WITH INHERIT",
 					  "WITH GRANT OPTION",
 					  "GRANTED BY");
 	else if (HeadMatches("GRANT") && TailMatches("TO", MatchAny, "WITH"))
-		COMPLETE_WITH("ADMIN OPTION",
+		COMPLETE_WITH("ADMIN",
+					  "INHERIT",
 					  "GRANT OPTION");
+	else if (HeadMatches("GRANT") &&
+			 (TailMatches("TO", MatchAny, "WITH", "ADMIN|INHERIT")))
+		COMPLETE_WITH("OPTION", "TRUE", "FALSE");
 	else if (HeadMatches("GRANT") && TailMatches("TO", MatchAny, "WITH", MatchAny, "OPTION"))
 		COMPLETE_WITH("GRANTED BY");
 	else if (HeadMatches("GRANT") && TailMatches("TO", MatchAny, "WITH", MatchAny, "OPTION", "GRANTED", "BY"))

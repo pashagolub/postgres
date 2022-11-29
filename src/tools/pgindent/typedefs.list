@@ -1514,8 +1514,8 @@ MemoryContextCallback
 MemoryContextCallbackFunction
 MemoryContextCounters
 MemoryContextData
-MemoryContextMethods
 MemoryContextMethodID
+MemoryContextMethods
 MemoryStatsPrintFunc
 MergeAction
 MergeActionState
@@ -2397,8 +2397,6 @@ SQLFunctionCache
 SQLFunctionCachePtr
 SQLFunctionParseInfo
 SQLFunctionParseInfoPtr
-SQLValueFunction
-SQLValueFunctionOp
 SSL
 SSLExtensionInfoContext
 SSL_CTX
@@ -2927,6 +2925,7 @@ WALInsertLock
 WALInsertLockPadded
 WALOpenSegment
 WALReadError
+WalRcvWakeupReason
 WALSegmentCloseCB
 WALSegmentContext
 WALSegmentOpenCB
@@ -3194,6 +3193,7 @@ datapagemap_t
 dateKEY
 datetkn
 dce_uuid_t
+dclist_head
 decimal
 deparse_columns
 deparse_context
@@ -3514,7 +3514,6 @@ pg_wc_probefunc
 pg_wchar
 pg_wchar_tbl
 pgp_armor_headers_state
-pgpid_t
 pgsocket
 pgsql_thing_t
 pgssEntry
@@ -3722,6 +3721,7 @@ timeout_params
 timerCA
 tlist_vinfo
 toast_compress_header
+tokenize_error_callback_arg
 transferMode
 transfer_thread_arg
 trgm

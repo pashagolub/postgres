@@ -1638,7 +1638,7 @@ SELECT * FROM (J1_TBL JOIN J2_TBL USING (i)) AS x WHERE J1_TBL.t = 'one';  -- er
 ERROR:  invalid reference to FROM-clause entry for table "j1_tbl"
 LINE 1: ... * FROM (J1_TBL JOIN J2_TBL USING (i)) AS x WHERE J1_TBL.t =...
                                                              ^
-HINT:  There is an entry for table "j1_tbl", but it cannot be referenced from this part of the query.
+DETAIL:  There is an entry for table "j1_tbl", but it cannot be referenced from this part of the query.
 SELECT * FROM J1_TBL JOIN J2_TBL USING (i) AS x WHERE x.i = 1;  -- ok
  i | j |  t  | k  
 ---+---+-----+----
@@ -2651,6 +2651,69 @@ WHERE d.f1 IS NULL;
 (3 rows)
 
 --
+-- basic semijoin and antijoin recognition tests
+--
+explain (costs off)
+select a.* from tenk1 a
+where unique1 in (select unique2 from tenk1 b);
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Hash Semi Join
+   Hash Cond: (a.unique1 = b.unique2)
+   ->  Seq Scan on tenk1 a
+   ->  Hash
+         ->  Index Only Scan using tenk1_unique2 on tenk1 b
+(5 rows)
+
+-- sadly, this is not an antijoin
+explain (costs off)
+select a.* from tenk1 a
+where unique1 not in (select unique2 from tenk1 b);
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Seq Scan on tenk1 a
+   Filter: (NOT (hashed SubPlan 1))
+   SubPlan 1
+     ->  Index Only Scan using tenk1_unique2 on tenk1 b
+(4 rows)
+
+explain (costs off)
+select a.* from tenk1 a
+where exists (select 1 from tenk1 b where a.unique1 = b.unique2);
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Hash Semi Join
+   Hash Cond: (a.unique1 = b.unique2)
+   ->  Seq Scan on tenk1 a
+   ->  Hash
+         ->  Index Only Scan using tenk1_unique2 on tenk1 b
+(5 rows)
+
+explain (costs off)
+select a.* from tenk1 a
+where not exists (select 1 from tenk1 b where a.unique1 = b.unique2);
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Hash Anti Join
+   Hash Cond: (a.unique1 = b.unique2)
+   ->  Seq Scan on tenk1 a
+   ->  Hash
+         ->  Index Only Scan using tenk1_unique2 on tenk1 b
+(5 rows)
+
+explain (costs off)
+select a.* from tenk1 a left join tenk1 b on a.unique1 = b.unique2
+where b.unique2 is null;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Hash Anti Join
+   Hash Cond: (a.unique1 = b.unique2)
+   ->  Seq Scan on tenk1 a
+   ->  Hash
+         ->  Index Only Scan using tenk1_unique2 on tenk1 b
+(5 rows)
+
+--
 -- regression test for proper handling of outer joins within antijoins
 --
 create temp table tt4x(c1 int, c2 int, c3 int);
@@ -3149,7 +3212,7 @@ where i41.f1 > 0;
          ->  Seq Scan on int4_tbl i41
                Filter: (f1 > 0)
          ->  Nested Loop
-               Join Filter: (i41.f1 = i42.f1)
+               Join Filter: (i42.f1 = i41.f1)
                ->  Seq Scan on int8_tbl i81
                ->  Materialize
                      ->  Seq Scan on int4_tbl i42
@@ -4588,6 +4651,34 @@ select a.q2, b.q1
 reset enable_hashjoin;
 reset enable_nestloop;
 --
+-- test join strength reduction with a SubPlan providing the proof
+--
+explain (costs off)
+select a.unique1, b.unique2
+  from onek a left join onek b on a.unique1 = b.unique2
+  where b.unique2 = any (select q1 from int8_tbl c where c.q1 < b.unique1);
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Hash Join
+   Hash Cond: (b.unique2 = a.unique1)
+   ->  Seq Scan on onek b
+         Filter: (SubPlan 1)
+         SubPlan 1
+           ->  Seq Scan on int8_tbl c
+                 Filter: (q1 < b.unique1)
+   ->  Hash
+         ->  Index Only Scan using onek_unique1 on onek a
+(9 rows)
+
+select a.unique1, b.unique2
+  from onek a left join onek b on a.unique1 = b.unique2
+  where b.unique2 = any (select q1 from int8_tbl c where c.q1 < b.unique1);
+ unique1 | unique2 
+---------+---------
+     123 |     123
+(1 row)
+
+--
 -- test join removal
 --
 begin;
@@ -4871,7 +4962,7 @@ where ss.stringu2 !~* ss.case1;
                                          QUERY PLAN                                         
 --------------------------------------------------------------------------------------------
  Nested Loop
-   Join Filter: (CASE t1.ten WHEN 0 THEN 'doh!'::text ELSE NULL::text END = t0.f1)
+   Join Filter: (t0.f1 = CASE t1.ten WHEN 0 THEN 'doh!'::text ELSE NULL::text END)
    ->  Nested Loop
          ->  Seq Scan on int4_tbl i4
          ->  Index Scan using tenk1_unique2 on tenk1 t1
@@ -4973,7 +5064,7 @@ select * from
 ERROR:  invalid reference to FROM-clause entry for table "y"
 LINE 2: ...bl x join (int4_tbl x cross join int4_tbl y) j on q1 = y.f1;
                                                                   ^
-HINT:  There is an entry for table "y", but it cannot be referenced from this part of the query.
+DETAIL:  There is an entry for table "y", but it cannot be referenced from this part of the query.
 select * from
   int8_tbl x join (int4_tbl x cross join int4_tbl y(ff)) j on q1 = f1; -- ok
  q1 | q2 | f1 | ff 
@@ -5001,6 +5092,13 @@ ERROR:  column "uunique1" does not exist
 LINE 1: select uunique1 from
                ^
 HINT:  Perhaps you meant to reference the column "t1.unique1" or the column "t2.unique1".
+select ctid from
+  tenk1 t1 join tenk2 t2 on t1.two = t2.two; -- error, need qualification
+ERROR:  column "ctid" does not exist
+LINE 1: select ctid from
+               ^
+DETAIL:  There are columns named "ctid", but they are in tables that cannot be referenced from this part of the query.
+HINT:  Try using a table-qualified name.
 --
 -- Take care to reference the correct RTE
 --
@@ -5983,8 +6081,8 @@ lateral (select * from int8_tbl t1,
                                      where q2 = (select greatest(t1.q1,t2.q2))
                                        and (select v.id=0)) offset 0) ss2) ss
          where t1.q1 = ss.q2) ss0;
-                           QUERY PLAN                            
------------------------------------------------------------------
+                              QUERY PLAN                              
+----------------------------------------------------------------------
  Nested Loop
    Output: "*VALUES*".column1, t1.q1, t1.q2, ss2.q1, ss2.q2
    ->  Seq Scan on public.int8_tbl t1
@@ -6005,10 +6103,10 @@ lateral (select * from int8_tbl t1,
                              One-Time Filter: $4
                              InitPlan 1 (returns $2)
                                ->  Result
-                                     Output: GREATEST($0, t2.q2)
+                                     Output: GREATEST(t1.q1, t2.q2)
                              InitPlan 2 (returns $4)
                                ->  Result
-                                     Output: ($3 = 0)
+                                     Output: ("*VALUES*".column1 = 0)
                              ->  Seq Scan on public.int8_tbl t3
                                    Output: t3.q1, t3.q2
                                    Filter: (t3.q2 = $2)
@@ -6034,22 +6132,26 @@ select f1,g from int4_tbl a, (select f1 as g) ss;
 ERROR:  column "f1" does not exist
 LINE 1: select f1,g from int4_tbl a, (select f1 as g) ss;
                                              ^
-HINT:  There is a column named "f1" in table "a", but it cannot be referenced from this part of the query.
+DETAIL:  There is a column named "f1" in table "a", but it cannot be referenced from this part of the query.
+HINT:  To reference that column, you must mark this subquery with LATERAL.
 select f1,g from int4_tbl a, (select a.f1 as g) ss;
 ERROR:  invalid reference to FROM-clause entry for table "a"
 LINE 1: select f1,g from int4_tbl a, (select a.f1 as g) ss;
                                              ^
-HINT:  There is an entry for table "a", but it cannot be referenced from this part of the query.
+DETAIL:  There is an entry for table "a", but it cannot be referenced from this part of the query.
+HINT:  To reference that table, you must mark this subquery with LATERAL.
 select f1,g from int4_tbl a cross join (select f1 as g) ss;
 ERROR:  column "f1" does not exist
 LINE 1: select f1,g from int4_tbl a cross join (select f1 as g) ss;
                                                        ^
-HINT:  There is a column named "f1" in table "a", but it cannot be referenced from this part of the query.
+DETAIL:  There is a column named "f1" in table "a", but it cannot be referenced from this part of the query.
+HINT:  To reference that column, you must mark this subquery with LATERAL.
 select f1,g from int4_tbl a cross join (select a.f1 as g) ss;
 ERROR:  invalid reference to FROM-clause entry for table "a"
 LINE 1: select f1,g from int4_tbl a cross join (select a.f1 as g) ss...
                                                        ^
-HINT:  There is an entry for table "a", but it cannot be referenced from this part of the query.
+DETAIL:  There is an entry for table "a", but it cannot be referenced from this part of the query.
+HINT:  To reference that table, you must mark this subquery with LATERAL.
 -- SQL:2008 says the left table is in scope but illegal to access here
 select f1,g from int4_tbl a right join lateral generate_series(0, a.f1) g on true;
 ERROR:  invalid reference to FROM-clause entry for table "a"
@@ -6079,12 +6181,12 @@ update xx1 set x2 = f1 from (select * from int4_tbl where f1 = x1) ss;
 ERROR:  column "x1" does not exist
 LINE 1: ... set x2 = f1 from (select * from int4_tbl where f1 = x1) ss;
                                                                 ^
-HINT:  There is a column named "x1" in table "xx1", but it cannot be referenced from this part of the query.
+DETAIL:  There is a column named "x1" in table "xx1", but it cannot be referenced from this part of the query.
 update xx1 set x2 = f1 from (select * from int4_tbl where f1 = xx1.x1) ss;
 ERROR:  invalid reference to FROM-clause entry for table "xx1"
 LINE 1: ...t x2 = f1 from (select * from int4_tbl where f1 = xx1.x1) ss...
                                                              ^
-HINT:  There is an entry for table "xx1", but it cannot be referenced from this part of the query.
+DETAIL:  There is an entry for table "xx1", but it cannot be referenced from this part of the query.
 -- can't do it even with LATERAL:
 update xx1 set x2 = f1 from lateral (select * from int4_tbl where f1 = x1) ss;
 ERROR:  invalid reference to FROM-clause entry for table "xx1"
@@ -6099,12 +6201,12 @@ delete from xx1 using (select * from int4_tbl where f1 = x1) ss;
 ERROR:  column "x1" does not exist
 LINE 1: ...te from xx1 using (select * from int4_tbl where f1 = x1) ss;
                                                                 ^
-HINT:  There is a column named "x1" in table "xx1", but it cannot be referenced from this part of the query.
+DETAIL:  There is a column named "x1" in table "xx1", but it cannot be referenced from this part of the query.
 delete from xx1 using (select * from int4_tbl where f1 = xx1.x1) ss;
 ERROR:  invalid reference to FROM-clause entry for table "xx1"
 LINE 1: ...from xx1 using (select * from int4_tbl where f1 = xx1.x1) ss...
                                                              ^
-HINT:  There is an entry for table "xx1", but it cannot be referenced from this part of the query.
+DETAIL:  There is an entry for table "xx1", but it cannot be referenced from this part of the query.
 delete from xx1 using lateral (select * from int4_tbl where f1 = x1) ss;
 ERROR:  invalid reference to FROM-clause entry for table "xx1"
 LINE 1: ...xx1 using lateral (select * from int4_tbl where f1 = x1) ss;
@@ -6533,7 +6635,7 @@ where j1.id1 % 1000 = 1 and j2.id1 % 1000 = 1;
 -----------------------------------------
  Merge Join
    Merge Cond: (j1.id1 = j2.id1)
-   Join Filter: (j1.id2 = j2.id2)
+   Join Filter: (j2.id2 = j1.id2)
    ->  Index Scan using j1_id1_idx on j1
    ->  Index Scan using j2_id1_idx on j2
 (5 rows)
@@ -6555,7 +6657,7 @@ where j1.id1 % 1000 = 1 and j2.id1 % 1000 = 1 and j2.id1 = any (array[1]);
 ----------------------------------------------------
  Merge Join
    Merge Cond: (j1.id1 = j2.id1)
-   Join Filter: (j1.id2 = j2.id2)
+   Join Filter: (j2.id2 = j1.id2)
    ->  Index Scan using j1_id1_idx on j1
    ->  Index Scan using j2_id1_idx on j2
          Index Cond: (id1 = ANY ('{1}'::integer[]))
@@ -6578,7 +6680,7 @@ where j1.id1 % 1000 = 1 and j2.id1 % 1000 = 1 and j2.id1 >= any (array[1,5]);
 -------------------------------------------------------
  Merge Join
    Merge Cond: (j1.id1 = j2.id1)
-   Join Filter: (j1.id2 = j2.id2)
+   Join Filter: (j2.id2 = j1.id2)
    ->  Index Scan using j1_id1_idx on j1
    ->  Index Only Scan using j2_pkey on j2
          Index Cond: (id1 >= ANY ('{1,5}'::integer[]))

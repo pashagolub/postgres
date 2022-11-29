@@ -198,8 +198,6 @@ static Node *makeAndExpr(Node *lexpr, Node *rexpr, int location);
 static Node *makeOrExpr(Node *lexpr, Node *rexpr, int location);
 static Node *makeNotExpr(Node *expr, int location);
 static Node *makeAArrayExpr(List *elements, int location);
-static Node *makeSQLValueFunction(SQLValueFunctionOp op, int32 typmod,
-								  int location);
 static Node *makeXmlExpr(XmlExprOp op, char *name, List *named_args,
 						 List *args, int location);
 static List *mergeTableFuncParameters(List *func_args, List *columns);
@@ -213,6 +211,7 @@ static void SplitColQualList(List *qualList,
 static void processCASbits(int cas_bits, int location, const char *constrType,
 			   bool *deferrable, bool *initdeferred, bool *not_valid,
 			   bool *no_inherit, core_yyscan_t yyscanner);
+static PartitionStrategy parsePartitionStrategy(char *strategy);
 static void preprocess_pubobj_list(List *pubobjspec_list,
 								   core_yyscan_t yyscanner);
 static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
@@ -734,7 +733,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 	QUOTE
 
-	RANGE READ REAL REASSIGN RECHECK RECURSIVE REF REFERENCES REFERENCING
+	RANGE READ REAL REASSIGN RECHECK RECURSIVE REF_P REFERENCES REFERENCING
 	REFRESH REINDEX RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
 	RESET RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
 	ROUTINE ROUTINES ROW ROWS RULE
@@ -3757,6 +3756,7 @@ opt_column_compression:
 
 column_storage:
 			STORAGE ColId							{ $$ = $2; }
+			| STORAGE DEFAULT						{ $$ = pstrdup("default"); }
 		;
 
 opt_column_storage:
@@ -4357,7 +4357,7 @@ PartitionSpec: PARTITION BY ColId '(' part_params ')'
 				{
 					PartitionSpec *n = makeNode(PartitionSpec);
 
-					n->strategy = $3;
+					n->strategy = parsePartitionStrategy($3);
 					n->partParams = $5;
 					n->location = @1;
 
@@ -7479,6 +7479,13 @@ privilege:	SELECT opt_column_list
 			{
 				AccessPriv *n = makeNode(AccessPriv);
 				n->priv_name = pstrdup("alter system");
+				n->cols = NIL;
+				$$ = n;
+			}
+		| analyze_keyword
+			{
+				AccessPriv *n = makeNode(AccessPriv);
+				n->priv_name = pstrdup("analyze");
 				n->cols = NIL;
 				$$ = n;
 			}
@@ -11104,9 +11111,9 @@ createdb_opt_items:
 		;
 
 createdb_opt_item:
-			createdb_opt_name opt_equal SignedIconst
+			createdb_opt_name opt_equal NumericOnly
 				{
-					$$ = makeDefElem($1, (Node *) makeInteger($3), @1);
+					$$ = makeDefElem($1, $3, @1);
 				}
 			| createdb_opt_name opt_equal opt_boolean_or_string
 				{
@@ -15193,51 +15200,87 @@ func_expr_common_subexpr:
 				}
 			| CURRENT_DATE
 				{
-					$$ = makeSQLValueFunction(SVFOP_CURRENT_DATE, -1, @1);
+					$$ = (Node *) makeFuncCall(SystemFuncName("current_date"),
+											   NIL,
+											   COERCE_SQL_SYNTAX,
+											   @1);
 				}
 			| CURRENT_TIME
 				{
-					$$ = makeSQLValueFunction(SVFOP_CURRENT_TIME, -1, @1);
+					$$ = (Node *) makeFuncCall(SystemFuncName("current_time"),
+											   NIL,
+											   COERCE_SQL_SYNTAX,
+											   @1);
 				}
 			| CURRENT_TIME '(' Iconst ')'
 				{
-					$$ = makeSQLValueFunction(SVFOP_CURRENT_TIME_N, $3, @1);
+					$$ = (Node *) makeFuncCall(SystemFuncName("current_time"),
+											   list_make1(makeIntConst($3, @3)),
+											   COERCE_SQL_SYNTAX,
+											   @1);
 				}
 			| CURRENT_TIMESTAMP
 				{
-					$$ = makeSQLValueFunction(SVFOP_CURRENT_TIMESTAMP, -1, @1);
+					$$ = (Node *) makeFuncCall(SystemFuncName("current_timestamp"),
+											   NIL,
+											   COERCE_SQL_SYNTAX,
+											   @1);
 				}
 			| CURRENT_TIMESTAMP '(' Iconst ')'
 				{
-					$$ = makeSQLValueFunction(SVFOP_CURRENT_TIMESTAMP_N, $3, @1);
+					$$ = (Node *) makeFuncCall(SystemFuncName("current_timestamp"),
+											   list_make1(makeIntConst($3, @3)),
+											   COERCE_SQL_SYNTAX,
+											   @1);
 				}
 			| LOCALTIME
 				{
-					$$ = makeSQLValueFunction(SVFOP_LOCALTIME, -1, @1);
+					$$ = (Node *) makeFuncCall(SystemFuncName("localtime"),
+											   NIL,
+											   COERCE_SQL_SYNTAX,
+											   @1);
 				}
 			| LOCALTIME '(' Iconst ')'
 				{
-					$$ = makeSQLValueFunction(SVFOP_LOCALTIME_N, $3, @1);
+					$$ = (Node *) makeFuncCall(SystemFuncName("localtime"),
+											   list_make1(makeIntConst($3, @3)),
+											   COERCE_SQL_SYNTAX,
+											   @1);
 				}
 			| LOCALTIMESTAMP
 				{
-					$$ = makeSQLValueFunction(SVFOP_LOCALTIMESTAMP, -1, @1);
+					$$ = (Node *) makeFuncCall(SystemFuncName("localtimestamp"),
+											   NIL,
+											   COERCE_SQL_SYNTAX,
+											   @1);
 				}
 			| LOCALTIMESTAMP '(' Iconst ')'
 				{
-					$$ = makeSQLValueFunction(SVFOP_LOCALTIMESTAMP_N, $3, @1);
+					$$ = (Node *) makeFuncCall(SystemFuncName("localtimestamp"),
+											   list_make1(makeIntConst($3, @3)),
+											   COERCE_SQL_SYNTAX,
+											   @1);
 				}
 			| CURRENT_ROLE
 				{
-					$$ = makeSQLValueFunction(SVFOP_CURRENT_ROLE, -1, @1);
+					$$ = (Node *) makeFuncCall(SystemFuncName("current_role"),
+											   NIL,
+											   COERCE_SQL_SYNTAX,
+											   @1);
 				}
 			| CURRENT_USER
 				{
-					$$ = makeSQLValueFunction(SVFOP_CURRENT_USER, -1, @1);
+					$$ = (Node *) makeFuncCall(SystemFuncName("current_user"),
+											   NIL,
+											   COERCE_SQL_SYNTAX,
+											   @1);
 				}
 			| SESSION_USER
 				{
-					$$ = makeSQLValueFunction(SVFOP_SESSION_USER, -1, @1);
+					$$ = (Node *) makeFuncCall(SystemFuncName("session_user"),
+											   NIL,
+											   COERCE_SQL_SYNTAX,
+											   @1);
 				}
 			| SYSTEM_USER
 				{
@@ -15248,15 +15291,24 @@ func_expr_common_subexpr:
 				}
 			| USER
 				{
-					$$ = makeSQLValueFunction(SVFOP_USER, -1, @1);
+					$$ = (Node *) makeFuncCall(SystemFuncName("user"),
+											   NIL,
+											   COERCE_SQL_SYNTAX,
+											   @1);
 				}
 			| CURRENT_CATALOG
 				{
-					$$ = makeSQLValueFunction(SVFOP_CURRENT_CATALOG, -1, @1);
+					$$ = (Node *) makeFuncCall(SystemFuncName("current_catalog"),
+											   NIL,
+											   COERCE_SQL_SYNTAX,
+											   @1);
 				}
 			| CURRENT_SCHEMA
 				{
-					$$ = makeSQLValueFunction(SVFOP_CURRENT_SCHEMA, -1, @1);
+					$$ = (Node *) makeFuncCall(SystemFuncName("current_schema"),
+											   NIL,
+											   COERCE_SQL_SYNTAX,
+											   @1);
 				}
 			| CAST '(' a_expr AS Typename ')'
 				{ $$ = makeTypeCast($3, $5, @1); }
@@ -15553,7 +15605,7 @@ xmlexists_argument:
 		;
 
 xml_passing_mech:
-			BY REF
+			BY REF_P
 			| BY VALUE_P
 		;
 
@@ -16854,7 +16906,7 @@ unreserved_keyword:
 			| REASSIGN
 			| RECHECK
 			| RECURSIVE
-			| REF
+			| REF_P
 			| REFERENCING
 			| REFRESH
 			| REINDEX
@@ -17440,7 +17492,7 @@ bare_label_keyword:
 			| REASSIGN
 			| RECHECK
 			| RECURSIVE
-			| REF
+			| REF_P
 			| REFERENCES
 			| REFERENCING
 			| REFRESH
@@ -18147,18 +18199,6 @@ makeAArrayExpr(List *elements, int location)
 }
 
 static Node *
-makeSQLValueFunction(SQLValueFunctionOp op, int32 typmod, int location)
-{
-	SQLValueFunction *svf = makeNode(SQLValueFunction);
-
-	svf->op = op;
-	/* svf->type will be filled during parse analysis */
-	svf->typmod = typmod;
-	svf->location = location;
-	return (Node *) svf;
-}
-
-static Node *
 makeXmlExpr(XmlExprOp op, char *name, List *named_args, List *args,
 			int location)
 {
@@ -18412,6 +18452,28 @@ processCASbits(int cas_bits, int location, const char *constrType,
 							constrType),
 					 parser_errposition(location)));
 	}
+}
+
+/*
+ * Parse a user-supplied partition strategy string into parse node
+ * PartitionStrategy representation, or die trying.
+ */
+static PartitionStrategy
+parsePartitionStrategy(char *strategy)
+{
+	if (pg_strcasecmp(strategy, "list") == 0)
+		return PARTITION_STRATEGY_LIST;
+	else if (pg_strcasecmp(strategy, "range") == 0)
+		return PARTITION_STRATEGY_RANGE;
+	else if (pg_strcasecmp(strategy, "hash") == 0)
+		return PARTITION_STRATEGY_HASH;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("unrecognized partitioning strategy \"%s\"",
+					strategy)));
+	return PARTITION_STRATEGY_LIST;		/* keep compiler quiet */
+
 }
 
 /*

@@ -118,8 +118,8 @@ bool		am_cascading_walsender = false; /* Am I cascading WAL to another
 											 * standby? */
 bool		am_db_walsender = false;	/* Connected to a database? */
 
-/* User-settable parameters for walsender */
-int			max_wal_senders = 0;	/* the maximum number of concurrent
+/* GUC variables */
+int			max_wal_senders = 10;	/* the maximum number of concurrent
 									 * walsenders */
 int			wal_sender_timeout = 60 * 1000; /* maximum time to send one WAL
 											 * data message */
@@ -1098,6 +1098,11 @@ CreateReplicationSlot(CreateReplicationSlotCmd *cmd)
 				ereport(ERROR,
 				/*- translator: %s is a CREATE_REPLICATION_SLOT statement */
 						(errmsg("%s must be called in REPEATABLE READ isolation mode transaction",
+								"CREATE_REPLICATION_SLOT ... (SNAPSHOT 'use')")));
+			if (!XactReadOnly)
+				ereport(ERROR,
+				/*- translator: %s is a CREATE_REPLICATION_SLOT statement */
+						(errmsg("%s must be called in a read only transaction",
 								"CREATE_REPLICATION_SLOT ... (SNAPSHOT 'use')")));
 
 			if (FirstSnapshotSet)
@@ -3459,7 +3464,7 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 	int			num_standbys;
 	int			i;
 
-	SetSingleFuncCall(fcinfo, 0);
+	InitMaterializedSRF(fcinfo, 0);
 
 	/*
 	 * Get the currently active synchronous standbys.  This could be out of

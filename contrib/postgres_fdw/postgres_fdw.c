@@ -2058,6 +2058,15 @@ postgresGetForeignModifyBatchSize(ResultRelInfo *resultRelInfo)
 		return 1;
 
 	/*
+	 * If the foreign table has no columns, disable batching as the INSERT
+	 * syntax doesn't allow batching multiple empty rows into a zero-column
+	 * table in a single statement.  This is needed for COPY FROM, in which
+	 * case fmstate must be non-NULL.
+	 */
+	if (fmstate && list_length(fmstate->target_attrs) == 0)
+		return 1;
+
+	/*
 	 * Otherwise use the batch size specified for server/table. The number of
 	 * parameters in a batch is limited to 65535 (uint16), so make sure we
 	 * don't exceed this limit by using the maximum batch_size possible.
@@ -3348,7 +3357,7 @@ estimate_path_cost_size(PlannerInfo *root,
 			 * Get the retrieved_rows and rows estimates.  If there are HAVING
 			 * quals, account for their selectivity.
 			 */
-			if (root->parse->havingQual)
+			if (root->hasHavingQual)
 			{
 				/* Factor in the selectivity of the remotely-checked quals */
 				retrieved_rows =
@@ -3396,7 +3405,7 @@ estimate_path_cost_size(PlannerInfo *root,
 			run_cost += cpu_tuple_cost * numGroups;
 
 			/* Account for the eval cost of HAVING quals, if any */
-			if (root->parse->havingQual)
+			if (root->hasHavingQual)
 			{
 				QualCost	remote_cost;
 

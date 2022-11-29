@@ -132,6 +132,15 @@ SET SESSION AUTHORIZATION regress_priv_user8;
 SET ROLE pg_read_all_settings;
 RESET ROLE;
 RESET SESSION AUTHORIZATION;
+REVOKE SET OPTION FOR pg_read_all_settings FROM regress_priv_user8;
+GRANT pg_read_all_stats TO regress_priv_user8 WITH SET FALSE;
+SET SESSION AUTHORIZATION regress_priv_user8;
+SET ROLE pg_read_all_settings;  -- fail, no SET option any more
+ERROR:  permission denied to set role "pg_read_all_settings"
+SET ROLE pg_read_all_stats;     -- fail, granted without SET option
+ERROR:  permission denied to set role "pg_read_all_stats"
+RESET ROLE;
+RESET SESSION AUTHORIZATION;
 REVOKE pg_read_all_settings FROM regress_priv_user8;
 DROP USER regress_priv_user10;
 DROP USER regress_priv_user9;
@@ -2561,39 +2570,39 @@ grant select on dep_priv_test to regress_priv_user4 with grant option;
 set session role regress_priv_user4;
 grant select on dep_priv_test to regress_priv_user5;
 \dp dep_priv_test
-                                               Access privileges
- Schema |     Name      | Type  |               Access privileges               | Column privileges | Policies 
---------+---------------+-------+-----------------------------------------------+-------------------+----------
- public | dep_priv_test | table | regress_priv_user1=arwdDxt/regress_priv_user1+|                   | 
-        |               |       | regress_priv_user2=r*/regress_priv_user1     +|                   | 
-        |               |       | regress_priv_user3=r*/regress_priv_user1     +|                   | 
-        |               |       | regress_priv_user4=r*/regress_priv_user2     +|                   | 
-        |               |       | regress_priv_user4=r*/regress_priv_user3     +|                   | 
-        |               |       | regress_priv_user5=r/regress_priv_user4       |                   | 
+                                                Access privileges
+ Schema |     Name      | Type  |                Access privileges                | Column privileges | Policies 
+--------+---------------+-------+-------------------------------------------------+-------------------+----------
+ public | dep_priv_test | table | regress_priv_user1=arwdDxtvz/regress_priv_user1+|                   | 
+        |               |       | regress_priv_user2=r*/regress_priv_user1       +|                   | 
+        |               |       | regress_priv_user3=r*/regress_priv_user1       +|                   | 
+        |               |       | regress_priv_user4=r*/regress_priv_user2       +|                   | 
+        |               |       | regress_priv_user4=r*/regress_priv_user3       +|                   | 
+        |               |       | regress_priv_user5=r/regress_priv_user4         |                   | 
 (1 row)
 
 set session role regress_priv_user2;
 revoke select on dep_priv_test from regress_priv_user4 cascade;
 \dp dep_priv_test
-                                               Access privileges
- Schema |     Name      | Type  |               Access privileges               | Column privileges | Policies 
---------+---------------+-------+-----------------------------------------------+-------------------+----------
- public | dep_priv_test | table | regress_priv_user1=arwdDxt/regress_priv_user1+|                   | 
-        |               |       | regress_priv_user2=r*/regress_priv_user1     +|                   | 
-        |               |       | regress_priv_user3=r*/regress_priv_user1     +|                   | 
-        |               |       | regress_priv_user4=r*/regress_priv_user3     +|                   | 
-        |               |       | regress_priv_user5=r/regress_priv_user4       |                   | 
+                                                Access privileges
+ Schema |     Name      | Type  |                Access privileges                | Column privileges | Policies 
+--------+---------------+-------+-------------------------------------------------+-------------------+----------
+ public | dep_priv_test | table | regress_priv_user1=arwdDxtvz/regress_priv_user1+|                   | 
+        |               |       | regress_priv_user2=r*/regress_priv_user1       +|                   | 
+        |               |       | regress_priv_user3=r*/regress_priv_user1       +|                   | 
+        |               |       | regress_priv_user4=r*/regress_priv_user3       +|                   | 
+        |               |       | regress_priv_user5=r/regress_priv_user4         |                   | 
 (1 row)
 
 set session role regress_priv_user3;
 revoke select on dep_priv_test from regress_priv_user4 cascade;
 \dp dep_priv_test
-                                               Access privileges
- Schema |     Name      | Type  |               Access privileges               | Column privileges | Policies 
---------+---------------+-------+-----------------------------------------------+-------------------+----------
- public | dep_priv_test | table | regress_priv_user1=arwdDxt/regress_priv_user1+|                   | 
-        |               |       | regress_priv_user2=r*/regress_priv_user1     +|                   | 
-        |               |       | regress_priv_user3=r*/regress_priv_user1      |                   | 
+                                                Access privileges
+ Schema |     Name      | Type  |                Access privileges                | Column privileges | Policies 
+--------+---------------+-------+-------------------------------------------------+-------------------+----------
+ public | dep_priv_test | table | regress_priv_user1=arwdDxtvz/regress_priv_user1+|                   | 
+        |               |       | regress_priv_user2=r*/regress_priv_user1       +|                   | 
+        |               |       | regress_priv_user3=r*/regress_priv_user1        |                   | 
 (1 row)
 
 set session role regress_priv_user1;
@@ -2809,3 +2818,99 @@ DROP ROLE regress_group;
 DROP ROLE regress_group_direct_manager;
 DROP ROLE regress_group_indirect_manager;
 DROP ROLE regress_group_member;
+-- test SET and INHERIT options with object ownership changes
+CREATE ROLE regress_roleoption_protagonist;
+CREATE ROLE regress_roleoption_donor;
+CREATE ROLE regress_roleoption_recipient;
+CREATE SCHEMA regress_roleoption;
+GRANT CREATE, USAGE ON SCHEMA regress_roleoption TO PUBLIC;
+GRANT regress_roleoption_donor TO regress_roleoption_protagonist WITH INHERIT TRUE, SET FALSE;
+GRANT regress_roleoption_recipient TO regress_roleoption_protagonist WITH INHERIT FALSE, SET TRUE;
+SET SESSION AUTHORIZATION regress_roleoption_protagonist;
+CREATE TABLE regress_roleoption.t1 (a int);
+CREATE TABLE regress_roleoption.t2 (a int);
+SET SESSION AUTHORIZATION regress_roleoption_donor;
+CREATE TABLE regress_roleoption.t3 (a int);
+SET SESSION AUTHORIZATION regress_roleoption_recipient;
+CREATE TABLE regress_roleoption.t4 (a int);
+SET SESSION AUTHORIZATION regress_roleoption_protagonist;
+ALTER TABLE regress_roleoption.t1 OWNER TO regress_roleoption_donor; -- fails, can't be come donor
+ERROR:  must be able to SET ROLE "regress_roleoption_donor"
+ALTER TABLE regress_roleoption.t2 OWNER TO regress_roleoption_recipient; -- works
+ALTER TABLE regress_roleoption.t3 OWNER TO regress_roleoption_protagonist; -- works
+ALTER TABLE regress_roleoption.t4 OWNER TO regress_roleoption_protagonist; -- fails, we don't inherit from recipient
+ERROR:  must be owner of table t4
+RESET SESSION AUTHORIZATION;
+DROP TABLE regress_roleoption.t1;
+DROP TABLE regress_roleoption.t2;
+DROP TABLE regress_roleoption.t3;
+DROP TABLE regress_roleoption.t4;
+DROP SCHEMA regress_roleoption;
+DROP ROLE regress_roleoption_protagonist;
+DROP ROLE regress_roleoption_donor;
+DROP ROLE regress_roleoption_recipient;
+-- VACUUM and ANALYZE
+CREATE ROLE regress_no_priv;
+CREATE ROLE regress_only_vacuum;
+CREATE ROLE regress_only_analyze;
+CREATE ROLE regress_both;
+CREATE ROLE regress_only_vacuum_all IN ROLE pg_vacuum_all_tables;
+CREATE ROLE regress_only_analyze_all IN ROLE pg_analyze_all_tables;
+CREATE ROLE regress_both_all IN ROLE pg_vacuum_all_tables, pg_analyze_all_tables;
+CREATE TABLE vacanalyze_test (a INT);
+GRANT VACUUM ON vacanalyze_test TO regress_only_vacuum, regress_both;
+GRANT ANALYZE ON vacanalyze_test TO regress_only_analyze, regress_both;
+SET ROLE regress_no_priv;
+VACUUM vacanalyze_test;
+WARNING:  permission denied to vacuum "vacanalyze_test", skipping it
+ANALYZE vacanalyze_test;
+WARNING:  permission denied to analyze "vacanalyze_test", skipping it
+VACUUM (ANALYZE) vacanalyze_test;
+WARNING:  permission denied to vacuum "vacanalyze_test", skipping it
+RESET ROLE;
+SET ROLE regress_only_vacuum;
+VACUUM vacanalyze_test;
+ANALYZE vacanalyze_test;
+WARNING:  permission denied to analyze "vacanalyze_test", skipping it
+VACUUM (ANALYZE) vacanalyze_test;
+WARNING:  permission denied to analyze "vacanalyze_test", skipping it
+RESET ROLE;
+SET ROLE regress_only_analyze;
+VACUUM vacanalyze_test;
+WARNING:  permission denied to vacuum "vacanalyze_test", skipping it
+ANALYZE vacanalyze_test;
+VACUUM (ANALYZE) vacanalyze_test;
+WARNING:  permission denied to vacuum "vacanalyze_test", skipping it
+RESET ROLE;
+SET ROLE regress_both;
+VACUUM vacanalyze_test;
+ANALYZE vacanalyze_test;
+VACUUM (ANALYZE) vacanalyze_test;
+RESET ROLE;
+SET ROLE regress_only_vacuum_all;
+VACUUM vacanalyze_test;
+ANALYZE vacanalyze_test;
+WARNING:  permission denied to analyze "vacanalyze_test", skipping it
+VACUUM (ANALYZE) vacanalyze_test;
+WARNING:  permission denied to analyze "vacanalyze_test", skipping it
+RESET ROLE;
+SET ROLE regress_only_analyze_all;
+VACUUM vacanalyze_test;
+WARNING:  permission denied to vacuum "vacanalyze_test", skipping it
+ANALYZE vacanalyze_test;
+VACUUM (ANALYZE) vacanalyze_test;
+WARNING:  permission denied to vacuum "vacanalyze_test", skipping it
+RESET ROLE;
+SET ROLE regress_both_all;
+VACUUM vacanalyze_test;
+ANALYZE vacanalyze_test;
+VACUUM (ANALYZE) vacanalyze_test;
+RESET ROLE;
+DROP TABLE vacanalyze_test;
+DROP ROLE regress_no_priv;
+DROP ROLE regress_only_vacuum;
+DROP ROLE regress_only_analyze;
+DROP ROLE regress_both;
+DROP ROLE regress_only_vacuum_all;
+DROP ROLE regress_only_analyze_all;
+DROP ROLE regress_both_all;

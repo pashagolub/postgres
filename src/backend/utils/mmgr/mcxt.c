@@ -258,7 +258,7 @@ BogusGetChunkSpace(void *pointer)
 void
 MemoryContextInit(void)
 {
-	AssertState(TopMemoryContext == NULL);
+	Assert(TopMemoryContext == NULL);
 
 	/*
 	 * First, initialize TopMemoryContext, which is the parent of all others.
@@ -302,7 +302,7 @@ MemoryContextInit(void)
 void
 MemoryContextReset(MemoryContext context)
 {
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 
 	/* save a function call in common case where there are no children */
 	if (context->firstchild != NULL)
@@ -321,7 +321,7 @@ MemoryContextReset(MemoryContext context)
 void
 MemoryContextResetOnly(MemoryContext context)
 {
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 
 	/* Nothing to do if no pallocs since startup or last reset */
 	if (!context->isReset)
@@ -354,7 +354,7 @@ MemoryContextResetChildren(MemoryContext context)
 {
 	MemoryContext child;
 
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 
 	for (child = context->firstchild; child != NULL; child = child->nextchild)
 	{
@@ -375,7 +375,7 @@ MemoryContextResetChildren(MemoryContext context)
 void
 MemoryContextDelete(MemoryContext context)
 {
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 	/* We had better not be deleting TopMemoryContext ... */
 	Assert(context != TopMemoryContext);
 	/* And not CurrentMemoryContext, either */
@@ -420,7 +420,7 @@ MemoryContextDelete(MemoryContext context)
 void
 MemoryContextDeleteChildren(MemoryContext context)
 {
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 
 	/*
 	 * MemoryContextDelete will delink the child from me, so just iterate as
@@ -450,7 +450,7 @@ void
 MemoryContextRegisterResetCallback(MemoryContext context,
 								   MemoryContextCallback *cb)
 {
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 
 	/* Push onto head so this will be called before older registrants. */
 	cb->next = context->reset_cbs;
@@ -493,7 +493,7 @@ MemoryContextCallResetCallbacks(MemoryContext context)
 void
 MemoryContextSetIdentifier(MemoryContext context, const char *id)
 {
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 	context->ident = id;
 }
 
@@ -518,8 +518,8 @@ MemoryContextSetIdentifier(MemoryContext context, const char *id)
 void
 MemoryContextSetParent(MemoryContext context, MemoryContext new_parent)
 {
-	AssertArg(MemoryContextIsValid(context));
-	AssertArg(context != new_parent);
+	Assert(MemoryContextIsValid(context));
+	Assert(context != new_parent);
 
 	/* Fast path if it's got correct parent already */
 	if (new_parent == context->parent)
@@ -545,7 +545,7 @@ MemoryContextSetParent(MemoryContext context, MemoryContext new_parent)
 	/* And relink */
 	if (new_parent)
 	{
-		AssertArg(MemoryContextIsValid(new_parent));
+		Assert(MemoryContextIsValid(new_parent));
 		context->parent = new_parent;
 		context->prevchild = NULL;
 		context->nextchild = new_parent->firstchild;
@@ -575,7 +575,7 @@ MemoryContextSetParent(MemoryContext context, MemoryContext new_parent)
 void
 MemoryContextAllowInCriticalSection(MemoryContext context, bool allow)
 {
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 
 	context->allowInCritSection = allow;
 }
@@ -612,7 +612,7 @@ GetMemoryChunkSpace(void *pointer)
 MemoryContext
 MemoryContextGetParent(MemoryContext context)
 {
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 
 	return context->parent;
 }
@@ -624,7 +624,7 @@ MemoryContextGetParent(MemoryContext context)
 bool
 MemoryContextIsEmpty(MemoryContext context)
 {
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 
 	/*
 	 * For now, we consider a memory context nonempty if it has any children;
@@ -645,7 +645,7 @@ MemoryContextMemAllocated(MemoryContext context, bool recurse)
 {
 	Size		total = context->mem_allocated;
 
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 
 	if (recurse)
 	{
@@ -737,7 +737,7 @@ MemoryContextStatsInternal(MemoryContext context, int level,
 	MemoryContext child;
 	int			ichild;
 
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 
 	/* Examine the context itself */
 	context->methods->stats(context,
@@ -902,7 +902,7 @@ MemoryContextCheck(MemoryContext context)
 {
 	MemoryContext child;
 
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 
 	context->methods->check(context);
 	for (child = context->firstchild; child != NULL; child = child->nextchild)
@@ -995,7 +995,7 @@ MemoryContextAlloc(MemoryContext context, Size size)
 {
 	void	   *ret;
 
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 	AssertNotInCriticalSection(context);
 
 	if (!AllocSizeIsValid(size))
@@ -1038,7 +1038,7 @@ MemoryContextAllocZero(MemoryContext context, Size size)
 {
 	void	   *ret;
 
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 	AssertNotInCriticalSection(context);
 
 	if (!AllocSizeIsValid(size))
@@ -1076,7 +1076,7 @@ MemoryContextAllocZeroAligned(MemoryContext context, Size size)
 {
 	void	   *ret;
 
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 	AssertNotInCriticalSection(context);
 
 	if (!AllocSizeIsValid(size))
@@ -1111,11 +1111,11 @@ MemoryContextAllocExtended(MemoryContext context, Size size, int flags)
 {
 	void	   *ret;
 
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 	AssertNotInCriticalSection(context);
 
-	if (((flags & MCXT_ALLOC_HUGE) != 0 && !AllocHugeSizeIsValid(size)) ||
-		((flags & MCXT_ALLOC_HUGE) == 0 && !AllocSizeIsValid(size)))
+	if (!((flags & MCXT_ALLOC_HUGE) != 0 ? AllocHugeSizeIsValid(size) :
+		  AllocSizeIsValid(size)))
 		elog(ERROR, "invalid memory alloc request size %zu", size);
 
 	context->isReset = false;
@@ -1202,7 +1202,7 @@ palloc(Size size)
 	void	   *ret;
 	MemoryContext context = CurrentMemoryContext;
 
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 	AssertNotInCriticalSection(context);
 
 	if (!AllocSizeIsValid(size))
@@ -1233,7 +1233,7 @@ palloc0(Size size)
 	void	   *ret;
 	MemoryContext context = CurrentMemoryContext;
 
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 	AssertNotInCriticalSection(context);
 
 	if (!AllocSizeIsValid(size))
@@ -1266,11 +1266,11 @@ palloc_extended(Size size, int flags)
 	void	   *ret;
 	MemoryContext context = CurrentMemoryContext;
 
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 	AssertNotInCriticalSection(context);
 
-	if (((flags & MCXT_ALLOC_HUGE) != 0 && !AllocHugeSizeIsValid(size)) ||
-		((flags & MCXT_ALLOC_HUGE) == 0 && !AllocSizeIsValid(size)))
+	if (!((flags & MCXT_ALLOC_HUGE) != 0 ? AllocHugeSizeIsValid(size) :
+		  AllocSizeIsValid(size)))
 		elog(ERROR, "invalid memory alloc request size %zu", size);
 
 	context->isReset = false;
@@ -1352,6 +1352,70 @@ repalloc(void *pointer, Size size)
 }
 
 /*
+ * repalloc_extended
+ *		Adjust the size of a previously allocated chunk,
+ *		with HUGE and NO_OOM options.
+ */
+void *
+repalloc_extended(void *pointer, Size size, int flags)
+{
+#if defined(USE_ASSERT_CHECKING) || defined(USE_VALGRIND)
+	MemoryContext context = GetMemoryChunkContext(pointer);
+#endif
+	void	   *ret;
+
+	if (!((flags & MCXT_ALLOC_HUGE) != 0 ? AllocHugeSizeIsValid(size) :
+		  AllocSizeIsValid(size)))
+		elog(ERROR, "invalid memory alloc request size %zu", size);
+
+	AssertNotInCriticalSection(context);
+
+	/* isReset must be false already */
+	Assert(!context->isReset);
+
+	ret = MCXT_METHOD(pointer, realloc) (pointer, size);
+	if (unlikely(ret == NULL))
+	{
+		if ((flags & MCXT_ALLOC_NO_OOM) == 0)
+		{
+			MemoryContext cxt = GetMemoryChunkContext(pointer);
+
+			MemoryContextStats(TopMemoryContext);
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory"),
+					 errdetail("Failed on request of size %zu in memory context \"%s\".",
+							   size, cxt->name)));
+		}
+		return NULL;
+	}
+
+	VALGRIND_MEMPOOL_CHANGE(context, pointer, ret, size);
+
+	return ret;
+}
+
+/*
+ * repalloc0
+ *		Adjust the size of a previously allocated chunk and zero out the added
+ *		space.
+ */
+void *
+repalloc0(void *pointer, Size oldsize, Size size)
+{
+	void	   *ret;
+
+	/* catch wrong argument order */
+	if (unlikely(oldsize > size))
+		elog(ERROR, "invalid repalloc0 call: oldsize %zu, new size %zu",
+			 oldsize, size);
+
+	ret = repalloc(pointer, size);
+	memset((char *) ret + oldsize, 0, (size - oldsize));
+	return ret;
+}
+
+/*
  * MemoryContextAllocHuge
  *		Allocate (possibly-expansive) space within the specified context.
  *
@@ -1362,7 +1426,7 @@ MemoryContextAllocHuge(MemoryContext context, Size size)
 {
 	void	   *ret;
 
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 	AssertNotInCriticalSection(context);
 
 	if (!AllocHugeSizeIsValid(size))
@@ -1394,35 +1458,8 @@ MemoryContextAllocHuge(MemoryContext context, Size size)
 void *
 repalloc_huge(void *pointer, Size size)
 {
-#if defined(USE_ASSERT_CHECKING) || defined(USE_VALGRIND)
-	MemoryContext context = GetMemoryChunkContext(pointer);
-#endif
-	void	   *ret;
-
-	if (!AllocHugeSizeIsValid(size))
-		elog(ERROR, "invalid memory alloc request size %zu", size);
-
-	AssertNotInCriticalSection(context);
-
-	/* isReset must be false already */
-	Assert(!context->isReset);
-
-	ret = MCXT_METHOD(pointer, realloc) (pointer, size);
-	if (unlikely(ret == NULL))
-	{
-		MemoryContext cxt = GetMemoryChunkContext(pointer);
-
-		MemoryContextStats(TopMemoryContext);
-		ereport(ERROR,
-				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("out of memory"),
-				 errdetail("Failed on request of size %zu in memory context \"%s\".",
-						   size, cxt->name)));
-	}
-
-	VALGRIND_MEMPOOL_CHANGE(context, pointer, ret, size);
-
-	return ret;
+	/* this one seems not worth its own implementation */
+	return repalloc_extended(pointer, size, MCXT_ALLOC_HUGE);
 }
 
 /*

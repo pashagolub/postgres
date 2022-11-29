@@ -53,6 +53,25 @@ pg_stat_get_numscans(PG_FUNCTION_ARGS)
 
 
 Datum
+pg_stat_get_lastscan(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	TimestampTz result;
+	PgStat_StatTabEntry *tabentry;
+
+	if ((tabentry = pgstat_fetch_stat_tabentry(relid)) == NULL)
+		result = 0;
+	else
+		result = tabentry->lastscan;
+
+	if (result == 0)
+		PG_RETURN_NULL();
+	else
+		PG_RETURN_TIMESTAMPTZ(result);
+}
+
+
+Datum
 pg_stat_get_tuples_returned(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
@@ -489,7 +508,7 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid command name: \"%s\"", cmd)));
 
-	SetSingleFuncCall(fcinfo, 0);
+	InitMaterializedSRF(fcinfo, 0);
 
 	/* 1-based index */
 	for (curr_backend = 1; curr_backend <= num_backends; curr_backend++)
@@ -546,7 +565,7 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 	int			pid = PG_ARGISNULL(0) ? -1 : PG_GETARG_INT32(0);
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 
-	SetSingleFuncCall(fcinfo, 0);
+	InitMaterializedSRF(fcinfo, 0);
 
 	/* 1-based index */
 	for (curr_backend = 1; curr_backend <= num_backends; curr_backend++)
@@ -1787,7 +1806,7 @@ pg_stat_get_slru(PG_FUNCTION_ARGS)
 	int			i;
 	PgStat_SLRUStats *stats;
 
-	SetSingleFuncCall(fcinfo, 0);
+	InitMaterializedSRF(fcinfo, 0);
 
 	/* request SLRU stats from the cumulative stats system */
 	stats = pgstat_fetch_slru();

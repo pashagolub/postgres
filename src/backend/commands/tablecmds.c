@@ -605,9 +605,10 @@ static void RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid,
 											Oid oldRelOid, void *arg);
 static void RangeVarCallbackForAlterRelation(const RangeVar *rv, Oid relid,
 											 Oid oldrelid, void *arg);
-static PartitionSpec *transformPartitionSpec(Relation rel, PartitionSpec *partspec, char *strategy);
+static PartitionSpec *transformPartitionSpec(Relation rel, PartitionSpec *partspec);
 static void ComputePartitionAttrs(ParseState *pstate, Relation rel, List *partParams, AttrNumber *partattrs,
-								  List **partexprs, Oid *partopclass, Oid *partcollation, char strategy);
+								  List **partexprs, Oid *partopclass, Oid *partcollation,
+								  PartitionStrategy strategy);
 static void CreateInheritance(Relation child_rel, Relation parent_rel);
 static void RemoveInheritance(Relation child_rel, Relation parent_rel,
 							  bool expect_detached);
@@ -803,7 +804,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	{
 		AclResult	aclresult;
 
-		aclresult = pg_tablespace_aclcheck(tablespaceId, GetUserId(),
+		aclresult = object_aclcheck(TableSpaceRelationId, tablespaceId, GetUserId(),
 										   ACL_CREATE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_TABLESPACE,
@@ -844,7 +845,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 
 		ofTypeId = typenameTypeId(NULL, stmt->ofTypename);
 
-		aclresult = pg_type_aclcheck(ofTypeId, GetUserId(), ACL_USAGE);
+		aclresult = object_aclcheck(TypeRelationId, ofTypeId, GetUserId(), ACL_USAGE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error_type(aclresult, ofTypeId);
 	}
@@ -1122,7 +1123,6 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	if (partitioned)
 	{
 		ParseState *pstate;
-		char		strategy;
 		int			partnatts;
 		AttrNumber	partattrs[PARTITION_MAX_KEYS];
 		Oid			partopclass[PARTITION_MAX_KEYS];
@@ -1147,14 +1147,14 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		 * and CHECK constraints, we could not have done the transformation
 		 * earlier.
 		 */
-		stmt->partspec = transformPartitionSpec(rel, stmt->partspec,
-												&strategy);
+		stmt->partspec = transformPartitionSpec(rel, stmt->partspec);
 
 		ComputePartitionAttrs(pstate, rel, stmt->partspec->partParams,
 							  partattrs, &partexprs, partopclass,
-							  partcollation, strategy);
+							  partcollation, stmt->partspec->strategy);
 
-		StorePartitionKey(rel, strategy, partnatts, partattrs, partexprs,
+		StorePartitionKey(rel, stmt->partspec->strategy, partnatts, partattrs,
+						  partexprs,
 						  partopclass, partcollation);
 
 		/* make it all visible */
@@ -1206,7 +1206,8 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			}
 
 			attmap = build_attrmap_by_name(RelationGetDescr(rel),
-										   RelationGetDescr(parent));
+										   RelationGetDescr(parent),
+										   false);
 			idxstmt =
 				generateClonedIndexStmt(NULL, idxRel,
 										attmap, &constraintOid);
@@ -1572,8 +1573,8 @@ RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid, Oid oldRelOid,
 							  state->expected_relkind);
 
 	/* Allow DROP to either table owner or schema owner */
-	if (!pg_class_ownercheck(relOid, GetUserId()) &&
-		!pg_namespace_ownercheck(classform->relnamespace, GetUserId()))
+	if (!object_ownercheck(RelationRelationId, relOid, GetUserId()) &&
+		!object_ownercheck(NamespaceRelationId, classform->relnamespace, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER,
 					   get_relkind_objtype(classform->relkind),
 					   rel->relname);
@@ -1877,7 +1878,7 @@ ExecuteTruncateGuts(List *explicit_rels,
 				seq_rel = relation_open(seq_relid, AccessExclusiveLock);
 
 				/* This check must match AlterSequence! */
-				if (!pg_class_ownercheck(seq_relid, GetUserId()))
+				if (!object_ownercheck(RelationRelationId, seq_relid, GetUserId()))
 					aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SEQUENCE,
 								   RelationGetRelationName(seq_rel));
 
@@ -2514,7 +2515,7 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 		 * We should have an UNDER permission flag for this, but for now,
 		 * demand that creator of a child table own the parent.
 		 */
-		if (!pg_class_ownercheck(RelationGetRelid(relation), GetUserId()))
+		if (!object_ownercheck(RelationRelationId, RelationGetRelid(relation), GetUserId()))
 			aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(relation->rd_rel->relkind),
 						   RelationGetRelationName(relation));
 
@@ -3134,7 +3135,7 @@ StoreCatalogInheritance(Oid relationId, List *supers,
 	/*
 	 * sanity checks
 	 */
-	AssertArg(OidIsValid(relationId));
+	Assert(OidIsValid(relationId));
 
 	if (supers == NIL)
 		return;
@@ -3418,7 +3419,7 @@ renameatt_check(Oid myrelid, Form_pg_class classform, bool recursing)
 	/*
 	 * permissions checking.  only the owner of a class can change its schema.
 	 */
-	if (!pg_class_ownercheck(myrelid, GetUserId()))
+	if (!object_ownercheck(RelationRelationId, myrelid, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(myrelid)),
 					   NameStr(classform->relname));
 	if (!allowSystemTableMods && IsSystemClass(myrelid, classform))
@@ -3651,7 +3652,7 @@ rename_constraint_internal(Oid myrelid,
 	Form_pg_constraint con;
 	ObjectAddress address;
 
-	AssertArg(!myrelid || !mytypid);
+	Assert(!myrelid || !mytypid);
 
 	if (mytypid)
 	{
@@ -6307,7 +6308,7 @@ ATSimplePermissions(AlterTableType cmdtype, Relation rel, int allowed_targets)
 	}
 
 	/* Permissions checks */
-	if (!pg_class_ownercheck(RelationGetRelid(rel), GetUserId()))
+	if (!object_ownercheck(RelationRelationId, RelationGetRelid(rel), GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(rel->rd_rel->relkind),
 					   RelationGetRelationName(rel));
 
@@ -6830,7 +6831,7 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	tform = (Form_pg_type) GETSTRUCT(typeTuple);
 	typeOid = tform->oid;
 
-	aclresult = pg_type_aclcheck(typeOid, GetUserId(), ACL_USAGE);
+	aclresult = object_aclcheck(TypeRelationId, typeOid, GetUserId(), ACL_USAGE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error_type(aclresult, typeOid);
 
@@ -9647,7 +9648,8 @@ addFkRecurseReferenced(List **wqueue, Constraint *fkconstraint, Relation rel,
 			 * definition to match the partition's column layout.
 			 */
 			map = build_attrmap_by_name_if_req(RelationGetDescr(partRel),
-											   RelationGetDescr(pkrel));
+											   RelationGetDescr(pkrel),
+											   false);
 			if (map)
 			{
 				mapped_pkattnum = palloc(sizeof(AttrNumber) * numfks);
@@ -9731,7 +9733,7 @@ addFkRecurseReferencing(List **wqueue, Constraint *fkconstraint, Relation rel,
 	Oid			insertTriggerOid,
 				updateTriggerOid;
 
-	AssertArg(OidIsValid(parentConstr));
+	Assert(OidIsValid(parentConstr));
 
 	if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
 		ereport(ERROR,
@@ -9814,7 +9816,8 @@ addFkRecurseReferencing(List **wqueue, Constraint *fkconstraint, Relation rel,
 			CheckTableNotInUse(partition, "ALTER TABLE");
 
 			attmap = build_attrmap_by_name(RelationGetDescr(partition),
-										   RelationGetDescr(rel));
+										   RelationGetDescr(rel),
+										   false);
 			for (int j = 0; j < numfks; j++)
 				mapped_fkattnum[j] = attmap->attnums[fkattnum[j] - 1];
 
@@ -10022,7 +10025,8 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 	trigrel = table_open(TriggerRelationId, RowExclusiveLock);
 
 	attmap = build_attrmap_by_name(RelationGetDescr(partitionRel),
-								   RelationGetDescr(parentRel));
+								   RelationGetDescr(parentRel),
+								   false);
 	foreach(cell, clone)
 	{
 		Oid			constrOid = lfirst_oid(cell);
@@ -10092,14 +10096,22 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 			mapped_confkey[i] = attmap->attnums[confkey[i] - 1];
 
 		fkconstraint = makeNode(Constraint);
-		/* for now this is all we need */
+		fkconstraint->contype = CONSTRAINT_FOREIGN;
 		fkconstraint->conname = NameStr(constrForm->conname);
-		fkconstraint->fk_upd_action = constrForm->confupdtype;
-		fkconstraint->fk_del_action = constrForm->confdeltype;
 		fkconstraint->deferrable = constrForm->condeferrable;
 		fkconstraint->initdeferred = constrForm->condeferred;
-		fkconstraint->initially_valid = true;
+		fkconstraint->location = -1;
+		fkconstraint->pktable = NULL;
+		/* ->fk_attrs determined below */
+		fkconstraint->pk_attrs = NIL;
 		fkconstraint->fk_matchtype = constrForm->confmatchtype;
+		fkconstraint->fk_upd_action = constrForm->confupdtype;
+		fkconstraint->fk_del_action = constrForm->confdeltype;
+		fkconstraint->fk_del_set_cols = NIL;
+		fkconstraint->old_conpfeqop = NIL;
+		fkconstraint->old_pktable_oid = InvalidOid;
+		fkconstraint->skip_validation = false;
+		fkconstraint->initially_valid = true;
 
 		/* set up colnames that are used to generate the constraint name */
 		for (int i = 0; i < numfks; i++)
@@ -10211,7 +10223,8 @@ CloneFkReferencing(List **wqueue, Relation parentRel, Relation partRel)
 	 * different.  This map is used to convert them.
 	 */
 	attmap = build_attrmap_by_name(RelationGetDescr(partRel),
-								   RelationGetDescr(parentRel));
+								   RelationGetDescr(parentRel),
+								   false);
 
 	partFKs = copyObject(RelationGetFKeyList(partRel));
 
@@ -10317,11 +10330,22 @@ CloneFkReferencing(List **wqueue, Relation parentRel, Relation partRel)
 
 		/* No dice.  Set up to create our own constraint */
 		fkconstraint = makeNode(Constraint);
-		fkconstraint->fk_upd_action = constrForm->confupdtype;
-		fkconstraint->fk_del_action = constrForm->confdeltype;
+		fkconstraint->contype = CONSTRAINT_FOREIGN;
+		/* ->conname determined below */
 		fkconstraint->deferrable = constrForm->condeferrable;
 		fkconstraint->initdeferred = constrForm->condeferred;
+		fkconstraint->location = -1;
+		fkconstraint->pktable = NULL;
+		/* ->fk_attrs determined below */
+		fkconstraint->pk_attrs = NIL;
 		fkconstraint->fk_matchtype = constrForm->confmatchtype;
+		fkconstraint->fk_upd_action = constrForm->confupdtype;
+		fkconstraint->fk_del_action = constrForm->confdeltype;
+		fkconstraint->fk_del_set_cols = NIL;
+		fkconstraint->old_conpfeqop = NIL;
+		fkconstraint->old_pktable_oid = InvalidOid;
+		fkconstraint->skip_validation = false;
+		fkconstraint->initially_valid = true;
 		for (int i = 0; i < numfks; i++)
 		{
 			Form_pg_attribute att;
@@ -12145,7 +12169,7 @@ ATPrepAlterColumnType(List **wqueue,
 	/* Look up the target type */
 	typenameTypeIdAndMod(NULL, typeName, &targettype, &targettypmod);
 
-	aclresult = pg_type_aclcheck(targettype, GetUserId(), ACL_USAGE);
+	aclresult = object_aclcheck(TypeRelationId, targettype, GetUserId(), ACL_USAGE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error_type(aclresult, targettype);
 
@@ -12316,7 +12340,8 @@ ATPrepAlterColumnType(List **wqueue,
 				cmd = copyObject(cmd);
 
 				attmap = build_attrmap_by_name(RelationGetDescr(childrel),
-											   RelationGetDescr(rel));
+											   RelationGetDescr(rel),
+											   false);
 				((ColumnDef *) cmd->def)->cooked_default =
 					map_variable_attnos(def->cooked_default,
 										1, 0,
@@ -13809,15 +13834,15 @@ ATExecChangeOwner(Oid relationOid, Oid newOwnerId, bool recursing, LOCKMODE lock
 				AclResult	aclresult;
 
 				/* Otherwise, must be owner of the existing object */
-				if (!pg_class_ownercheck(relationOid, GetUserId()))
+				if (!object_ownercheck(RelationRelationId, relationOid, GetUserId()))
 					aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relationOid)),
 								   RelationGetRelationName(target_rel));
 
 				/* Must be able to become new owner */
-				check_is_member_of_role(GetUserId(), newOwnerId);
+				check_can_set_role(GetUserId(), newOwnerId);
 
 				/* New owner must have CREATE privilege on namespace */
-				aclresult = pg_namespace_aclcheck(namespaceOid, newOwnerId,
+				aclresult = object_aclcheck(NamespaceRelationId, namespaceOid, newOwnerId,
 												  ACL_CREATE);
 				if (aclresult != ACLCHECK_OK)
 					aclcheck_error(aclresult, OBJECT_SCHEMA,
@@ -14133,7 +14158,7 @@ ATPrepSetTableSpace(AlteredTableInfo *tab, Relation rel, const char *tablespacen
 	{
 		AclResult	aclresult;
 
-		aclresult = pg_tablespace_aclcheck(tablespaceId, GetUserId(), ACL_CREATE);
+		aclresult = object_aclcheck(TableSpaceRelationId, tablespaceId, GetUserId(), ACL_CREATE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_TABLESPACE, tablespacename);
 	}
@@ -14526,7 +14551,7 @@ AlterTableMoveAll(AlterTableMoveAllStmt *stmt)
 	{
 		AclResult	aclresult;
 
-		aclresult = pg_tablespace_aclcheck(new_tablespaceoid, GetUserId(),
+		aclresult = object_aclcheck(TableSpaceRelationId, new_tablespaceoid, GetUserId(),
 										   ACL_CREATE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_TABLESPACE,
@@ -14599,7 +14624,7 @@ AlterTableMoveAll(AlterTableMoveAllStmt *stmt)
 		 *
 		 * Caller must be considered an owner on the table to move it.
 		 */
-		if (!pg_class_ownercheck(relOid, GetUserId()))
+		if (!object_ownercheck(RelationRelationId, relOid, GetUserId()))
 			aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relOid)),
 						   NameStr(relForm->relname));
 
@@ -16934,7 +16959,7 @@ RangeVarCallbackOwnsTable(const RangeVar *relation,
 				 errmsg("\"%s\" is not a table or materialized view", relation->relname)));
 
 	/* Check permissions */
-	if (!pg_class_ownercheck(relId, GetUserId()))
+	if (!object_ownercheck(RelationRelationId, relId, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relId)), relation->relname);
 }
 
@@ -16979,7 +17004,7 @@ RangeVarCallbackOwnsRelation(const RangeVar *relation,
 	if (!HeapTupleIsValid(tuple))	/* should not happen */
 		elog(ERROR, "cache lookup failed for relation %u", relId);
 
-	if (!pg_class_ownercheck(relId, GetUserId()))
+	if (!object_ownercheck(RelationRelationId, relId, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relId)),
 					   relation->relname);
 
@@ -17015,7 +17040,7 @@ RangeVarCallbackForAlterRelation(const RangeVar *rv, Oid relid, Oid oldrelid,
 	relkind = classform->relkind;
 
 	/* Must own relation. */
-	if (!pg_class_ownercheck(relid, GetUserId()))
+	if (!object_ownercheck(RelationRelationId, relid, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relid)), rv->relname);
 
 	/* No system table modifications unless explicitly allowed. */
@@ -17033,7 +17058,7 @@ RangeVarCallbackForAlterRelation(const RangeVar *rv, Oid relid, Oid oldrelid,
 	 */
 	if (IsA(stmt, RenameStmt))
 	{
-		aclresult = pg_namespace_aclcheck(classform->relnamespace,
+		aclresult = object_aclcheck(NamespaceRelationId, classform->relnamespace,
 										  GetUserId(), ACL_CREATE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_SCHEMA,
@@ -17132,10 +17157,10 @@ RangeVarCallbackForAlterRelation(const RangeVar *rv, Oid relid, Oid oldrelid,
 /*
  * Transform any expressions present in the partition key
  *
- * Returns a transformed PartitionSpec, as well as the strategy code
+ * Returns a transformed PartitionSpec.
  */
 static PartitionSpec *
-transformPartitionSpec(Relation rel, PartitionSpec *partspec, char *strategy)
+transformPartitionSpec(Relation rel, PartitionSpec *partspec)
 {
 	PartitionSpec *newspec;
 	ParseState *pstate;
@@ -17148,21 +17173,8 @@ transformPartitionSpec(Relation rel, PartitionSpec *partspec, char *strategy)
 	newspec->partParams = NIL;
 	newspec->location = partspec->location;
 
-	/* Parse partitioning strategy name */
-	if (pg_strcasecmp(partspec->strategy, "hash") == 0)
-		*strategy = PARTITION_STRATEGY_HASH;
-	else if (pg_strcasecmp(partspec->strategy, "list") == 0)
-		*strategy = PARTITION_STRATEGY_LIST;
-	else if (pg_strcasecmp(partspec->strategy, "range") == 0)
-		*strategy = PARTITION_STRATEGY_RANGE;
-	else
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("unrecognized partitioning strategy \"%s\"",
-						partspec->strategy)));
-
 	/* Check valid number of columns for strategy */
-	if (*strategy == PARTITION_STRATEGY_LIST &&
+	if (partspec->strategy == PARTITION_STRATEGY_LIST &&
 		list_length(partspec->partParams) != 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
@@ -17208,7 +17220,7 @@ transformPartitionSpec(Relation rel, PartitionSpec *partspec, char *strategy)
 static void
 ComputePartitionAttrs(ParseState *pstate, Relation rel, List *partParams, AttrNumber *partattrs,
 					  List **partexprs, Oid *partopclass, Oid *partcollation,
-					  char strategy)
+					  PartitionStrategy strategy)
 {
 	int			attn;
 	ListCell   *lc;
@@ -18037,7 +18049,8 @@ AttachPartitionEnsureIndexes(Relation rel, Relation attachrel)
 		/* construct an indexinfo to compare existing indexes against */
 		info = BuildIndexInfo(idxRel);
 		attmap = build_attrmap_by_name(RelationGetDescr(attachrel),
-									   RelationGetDescr(rel));
+									   RelationGetDescr(rel),
+									   false);
 		constraintOid = get_relation_idx_constraint_oid(RelationGetRelid(rel), idx);
 
 		/*
@@ -18530,11 +18543,22 @@ DetachPartitionFinalize(Relation rel, Relation partRel, bool concurrent,
 		 * still do), but now we need separate ones of our own.
 		 */
 		fkconstraint = makeNode(Constraint);
+		fkconstraint->contype = CONSTRAINT_FOREIGN;
 		fkconstraint->conname = pstrdup(NameStr(conform->conname));
-		fkconstraint->fk_upd_action = conform->confupdtype;
-		fkconstraint->fk_del_action = conform->confdeltype;
 		fkconstraint->deferrable = conform->condeferrable;
 		fkconstraint->initdeferred = conform->condeferred;
+		fkconstraint->location = -1;
+		fkconstraint->pktable = NULL;
+		fkconstraint->fk_attrs = NIL;
+		fkconstraint->pk_attrs = NIL;
+		fkconstraint->fk_matchtype = conform->confmatchtype;
+		fkconstraint->fk_upd_action = conform->confupdtype;
+		fkconstraint->fk_del_action = conform->confdeltype;
+		fkconstraint->fk_del_set_cols = NIL;
+		fkconstraint->old_conpfeqop = NIL;
+		fkconstraint->old_pktable_oid = InvalidOid;
+		fkconstraint->skip_validation = false;
+		fkconstraint->initially_valid = true;
 
 		createForeignKeyActionTriggers(partRel, conform->confrelid,
 									   fkconstraint, fk->conoid,
@@ -18964,7 +18988,8 @@ ATExecAttachPartitionIdx(List **wqueue, Relation parentIdx, RangeVar *name)
 		childInfo = BuildIndexInfo(partIdx);
 		parentInfo = BuildIndexInfo(parentIdx);
 		attmap = build_attrmap_by_name(RelationGetDescr(partTbl),
-									   RelationGetDescr(parentTbl));
+									   RelationGetDescr(parentTbl),
+									   false);
 		if (!CompareIndexInfo(childInfo, parentInfo,
 							  partIdx->rd_indcollation,
 							  parentIdx->rd_indcollation,
@@ -19294,6 +19319,8 @@ GetAttributeStorage(Oid atttypid, const char *storagemode)
 		cstorage = TYPSTORAGE_EXTENDED;
 	else if (pg_strcasecmp(storagemode, "main") == 0)
 		cstorage = TYPSTORAGE_MAIN;
+	else if (pg_strcasecmp(storagemode, "default") == 0)
+		cstorage = get_typstorage(atttypid);
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),

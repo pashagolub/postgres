@@ -349,8 +349,6 @@ ReorderBufferAllocate(void)
 	buffer->by_txn_last_xid = InvalidTransactionId;
 	buffer->by_txn_last_txn = NULL;
 
-	buffer->catchange_ntxns = 0;
-
 	buffer->outbuf = NULL;
 	buffer->outbufsize = 0;
 	buffer->size = 0;
@@ -368,7 +366,7 @@ ReorderBufferAllocate(void)
 
 	dlist_init(&buffer->toplevel_by_lsn);
 	dlist_init(&buffer->txns_by_base_snapshot_lsn);
-	dlist_init(&buffer->catchange_txns);
+	dclist_init(&buffer->catchange_txns);
 
 	/*
 	 * Ensure there's no stale data from prior uses of this slot, in case some
@@ -881,9 +879,23 @@ static void
 AssertTXNLsnOrder(ReorderBuffer *rb)
 {
 #ifdef USE_ASSERT_CHECKING
+	LogicalDecodingContext *ctx = rb->private_data;
 	dlist_iter	iter;
 	XLogRecPtr	prev_first_lsn = InvalidXLogRecPtr;
 	XLogRecPtr	prev_base_snap_lsn = InvalidXLogRecPtr;
+
+	/*
+	 * Skip the verification if we don't reach the LSN at which we start
+	 * decoding the contents of transactions yet because until we reach the
+	 * LSN, we could have transactions that don't have the association between
+	 * the top-level transaction and subtransaction yet and consequently have
+	 * the same LSN.  We don't guarantee this association until we try to
+	 * decode the actual contents of transaction. The ordering of the records
+	 * prior to the start_decoding_at LSN should have been checked before the
+	 * restart.
+	 */
+	if (SnapBuildXactNeedsSkip(ctx->snapshot_builder, ctx->reader->EndRecPtr))
+		return;
 
 	dlist_foreach(iter, &rb->toplevel_by_lsn)
 	{
@@ -1539,12 +1551,7 @@ ReorderBufferCleanupTXN(ReorderBuffer *rb, ReorderBufferTXN *txn)
 	 */
 	dlist_delete(&txn->node);
 	if (rbtxn_has_catalog_changes(txn))
-	{
-		dlist_delete(&txn->catchange_node);
-		rb->catchange_ntxns--;
-
-		Assert(rb->catchange_ntxns >= 0);
-	}
+		dclist_delete_from(&rb->catchange_txns, &txn->catchange_node);
 
 	/* now remove reference from buffer */
 	hash_search(rb->by_txn,
@@ -3070,7 +3077,7 @@ ReorderBufferSetBaseSnapshot(ReorderBuffer *rb, TransactionId xid,
 	ReorderBufferTXN *txn;
 	bool		is_new;
 
-	AssertArg(snap != NULL);
+	Assert(snap != NULL);
 
 	/*
 	 * Fetch the transaction to operate on.  If we know it's a subtransaction,
@@ -3201,16 +3208,17 @@ ReorderBufferAddNewTupleCids(ReorderBuffer *rb, TransactionId xid,
 }
 
 /*
- * Setup the invalidation of the toplevel transaction.
+ * Accumulate the invalidations for executing them later.
  *
  * This needs to be called for each XLOG_XACT_INVALIDATIONS message and
- * accumulates all the invalidation messages in the toplevel transaction as
- * well as in the form of change in reorder buffer.  We require to record it in
- * form of the change so that we can execute only the required invalidations
- * instead of executing all the invalidations on each CommandId increment.  We
- * also need to accumulate these in the toplevel transaction because in some
- * cases we skip processing the transaction (see ReorderBufferForget), we need
- * to execute all the invalidations together.
+ * accumulates all the invalidation messages in the toplevel transaction, if
+ * available, otherwise in the current transaction, as well as in the form of
+ * change in reorder buffer.  We require to record it in form of the change
+ * so that we can execute only the required invalidations instead of executing
+ * all the invalidations on each CommandId increment.  We also need to
+ * accumulate these in the txn buffer because in some cases where we skip
+ * processing the transaction (see ReorderBufferForget), we need to execute
+ * all the invalidations together.
  */
 void
 ReorderBufferAddInvalidations(ReorderBuffer *rb, TransactionId xid,
@@ -3226,8 +3234,9 @@ ReorderBufferAddInvalidations(ReorderBuffer *rb, TransactionId xid,
 	oldcontext = MemoryContextSwitchTo(rb->context);
 
 	/*
-	 * Collect all the invalidations under the top transaction so that we can
-	 * execute them all together.  See comment atop this function
+	 * Collect all the invalidations under the top transaction, if available,
+	 * so that we can execute them all together.  See comments atop this
+	 * function.
 	 */
 	if (txn->toptxn)
 		txn = txn->toptxn;
@@ -3295,8 +3304,7 @@ ReorderBufferXidSetCatalogChanges(ReorderBuffer *rb, TransactionId xid,
 	if (!rbtxn_has_catalog_changes(txn))
 	{
 		txn->txn_flags |= RBTXN_HAS_CATALOG_CHANGES;
-		dlist_push_tail(&rb->catchange_txns, &txn->catchange_node);
-		rb->catchange_ntxns++;
+		dclist_push_tail(&rb->catchange_txns, &txn->catchange_node);
 	}
 
 	/*
@@ -3309,8 +3317,7 @@ ReorderBufferXidSetCatalogChanges(ReorderBuffer *rb, TransactionId xid,
 	if (toptxn != NULL && !rbtxn_has_catalog_changes(toptxn))
 	{
 		toptxn->txn_flags |= RBTXN_HAS_CATALOG_CHANGES;
-		dlist_push_tail(&rb->catchange_txns, &toptxn->catchange_node);
-		rb->catchange_ntxns++;
+		dclist_push_tail(&rb->catchange_txns, &toptxn->catchange_node);
 	}
 }
 
@@ -3328,19 +3335,17 @@ ReorderBufferGetCatalogChangesXacts(ReorderBuffer *rb)
 	size_t		xcnt = 0;
 
 	/* Quick return if the list is empty */
-	if (rb->catchange_ntxns == 0)
-	{
-		Assert(dlist_is_empty(&rb->catchange_txns));
+	if (dclist_count(&rb->catchange_txns) == 0)
 		return NULL;
-	}
 
 	/* Initialize XID array */
-	xids = (TransactionId *) palloc(sizeof(TransactionId) * rb->catchange_ntxns);
-	dlist_foreach(iter, &rb->catchange_txns)
+	xids = (TransactionId *) palloc(sizeof(TransactionId) *
+									dclist_count(&rb->catchange_txns));
+	dclist_foreach(iter, &rb->catchange_txns)
 	{
-		ReorderBufferTXN *txn = dlist_container(ReorderBufferTXN,
-												catchange_node,
-												iter.cur);
+		ReorderBufferTXN *txn = dclist_container(ReorderBufferTXN,
+												 catchange_node,
+												 iter.cur);
 
 		Assert(rbtxn_has_catalog_changes(txn));
 
@@ -3349,7 +3354,7 @@ ReorderBufferGetCatalogChangesXacts(ReorderBuffer *rb)
 
 	qsort(xids, xcnt, sizeof(TransactionId), xidComparator);
 
-	Assert(xcnt == rb->catchange_ntxns);
+	Assert(xcnt == dclist_count(&rb->catchange_txns));
 	return xids;
 }
 
@@ -4156,6 +4161,8 @@ ReorderBufferRestoreChanges(ReorderBuffer *rb, ReorderBufferTXN *txn,
 	{
 		int			readBytes;
 		ReorderBufferDiskChange *ondisk;
+
+		CHECK_FOR_INTERRUPTS();
 
 		if (*fd == -1)
 		{

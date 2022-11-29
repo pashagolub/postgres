@@ -41,6 +41,7 @@
 #include "storage/fd.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/conffiles.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -65,9 +66,22 @@ typedef struct check_network_data
 	bool		result;			/* set to true if match */
 } check_network_data;
 
+typedef struct
+{
+	const char *filename;
+	int			linenum;
+} tokenize_error_callback_arg;
 
+#define token_has_regexp(t)	(t->regex != NULL)
 #define token_is_keyword(t, k)	(!t->quoted && strcmp(t->string, k) == 0)
 #define token_matches(t, k)  (strcmp(t->string, k) == 0)
+
+/*
+ * Memory context holding the list of TokenizedAuthLines when parsing
+ * HBA or ident configuration files.  This is created when opening the first
+ * file (depth of CONF_FILE_START_DEPTH).
+ */
+static MemoryContext tokenize_context = NULL;
 
 /*
  * pre-parsed content of HBA config file: list of HbaLine structs.
@@ -80,9 +94,10 @@ static MemoryContext parsed_hba_context = NULL;
  * pre-parsed content of ident mapping file: list of IdentLine structs.
  * parsed_ident_context is the memory context where it lives.
  *
- * NOTE: the IdentLine structs can contain pre-compiled regular expressions
- * that live outside the memory context. Before destroying or resetting the
- * memory context, they need to be explicitly free'd.
+ * NOTE: the IdentLine structs can contain AuthTokens with pre-compiled
+ * regular expressions that live outside the memory context. Before
+ * destroying or resetting the memory context, they need to be explicitly
+ * free'd.
  */
 static List *parsed_ident_lines = NIL;
 static MemoryContext parsed_ident_context = NULL;
@@ -113,10 +128,16 @@ static const char *const UserAuthName[] =
 };
 
 
-static List *tokenize_inc_file(List *tokens, const char *outer_filename,
-							   const char *inc_filename, int elevel, char **err_msg);
+static List *tokenize_expand_file(List *tokens, const char *outer_filename,
+								  const char *inc_filename, int elevel,
+								  int depth, char **err_msg);
 static bool parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 							   int elevel, char **err_msg);
+static int	regcomp_auth_token(AuthToken *token, char *filename, int line_num,
+							   char **err_msg, int elevel);
+static int	regexec_auth_token(const char *match, AuthToken *token,
+							   size_t nmatch, regmatch_t pmatch[]);
+static void tokenize_error_callback(void *arg);
 
 
 /*
@@ -267,12 +288,48 @@ make_auth_token(const char *token, bool quoted)
 
 	toklen = strlen(token);
 	/* we copy string into same palloc block as the struct */
-	authtoken = (AuthToken *) palloc(sizeof(AuthToken) + toklen + 1);
+	authtoken = (AuthToken *) palloc0(sizeof(AuthToken) + toklen + 1);
 	authtoken->string = (char *) authtoken + sizeof(AuthToken);
 	authtoken->quoted = quoted;
+	authtoken->regex = NULL;
 	memcpy(authtoken->string, token, toklen + 1);
 
 	return authtoken;
+}
+
+/*
+ * Free an AuthToken, that may include a regular expression that needs
+ * to be cleaned up explicitly.
+ */
+static void
+free_auth_token(AuthToken *token)
+{
+	if (token_has_regexp(token))
+		pg_regfree(token->regex);
+}
+
+/*
+ * Free a HbaLine.  Its list of AuthTokens for databases and roles may include
+ * regular expressions that need to be cleaned up explicitly.
+ */
+static void
+free_hba_line(HbaLine *line)
+{
+	ListCell   *cell;
+
+	foreach(cell, line->roles)
+	{
+		AuthToken  *tok = lfirst(cell);
+
+		free_auth_token(tok);
+	}
+
+	foreach(cell, line->databases)
+	{
+		AuthToken  *tok = lfirst(cell);
+
+		free_auth_token(tok);
+	}
 }
 
 /*
@@ -286,6 +343,74 @@ copy_auth_token(AuthToken *in)
 	return out;
 }
 
+/*
+ * Compile the regular expression and store it in the AuthToken given in
+ * input.  Returns the result of pg_regcomp().  On error, the details are
+ * stored in "err_msg".
+ */
+static int
+regcomp_auth_token(AuthToken *token, char *filename, int line_num,
+				   char **err_msg, int elevel)
+{
+	pg_wchar   *wstr;
+	int			wlen;
+	int			rc;
+
+	Assert(token->regex == NULL);
+
+	if (token->string[0] != '/')
+		return 0;				/* nothing to compile */
+
+	token->regex = (regex_t *) palloc0(sizeof(regex_t));
+	wstr = palloc((strlen(token->string + 1) + 1) * sizeof(pg_wchar));
+	wlen = pg_mb2wchar_with_len(token->string + 1,
+								wstr, strlen(token->string + 1));
+
+	rc = pg_regcomp(token->regex, wstr, wlen, REG_ADVANCED, C_COLLATION_OID);
+
+	if (rc)
+	{
+		char		errstr[100];
+
+		pg_regerror(rc, token->regex, errstr, sizeof(errstr));
+		ereport(elevel,
+				(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
+				 errmsg("invalid regular expression \"%s\": %s",
+						token->string + 1, errstr),
+				 errcontext("line %d of configuration file \"%s\"",
+							line_num, filename)));
+
+		*err_msg = psprintf("invalid regular expression \"%s\": %s",
+							token->string + 1, errstr);
+	}
+
+	pfree(wstr);
+	return rc;
+}
+
+/*
+ * Execute a regular expression computed in an AuthToken, checking for a match
+ * with the string specified in "match".  The caller may optionally give an
+ * array to store the matches.  Returns the result of pg_regexec().
+ */
+static int
+regexec_auth_token(const char *match, AuthToken *token, size_t nmatch,
+				   regmatch_t pmatch[])
+{
+	pg_wchar   *wmatchstr;
+	int			wmatchlen;
+	int			r;
+
+	Assert(token->string[0] == '/' && token->regex);
+
+	wmatchstr = palloc((strlen(match) + 1) * sizeof(pg_wchar));
+	wmatchlen = pg_mb2wchar_with_len(match, wmatchstr, strlen(match));
+
+	r = pg_regexec(token->regex, wmatchstr, wmatchlen, 0, NULL, nmatch, pmatch, 0);
+
+	pfree(wmatchstr);
+	return r;
+}
 
 /*
  * Tokenize one HBA field from a line, handling file inclusion and comma lists.
@@ -303,7 +428,7 @@ copy_auth_token(AuthToken *in)
  */
 static List *
 next_field_expand(const char *filename, char **lineptr,
-				  int elevel, char **err_msg)
+				  int elevel, int depth, char **err_msg)
 {
 	char		buf[MAX_TOKEN];
 	bool		trailing_comma;
@@ -319,24 +444,93 @@ next_field_expand(const char *filename, char **lineptr,
 
 		/* Is this referencing a file? */
 		if (!initial_quote && buf[0] == '@' && buf[1] != '\0')
-			tokens = tokenize_inc_file(tokens, filename, buf + 1,
-									   elevel, err_msg);
+			tokens = tokenize_expand_file(tokens, filename, buf + 1,
+										  elevel, depth + 1, err_msg);
 		else
+		{
+			MemoryContext oldcxt;
+
+			/*
+			 * lappend() may do its own allocations, so move to the context
+			 * for the list of tokens.
+			 */
+			oldcxt = MemoryContextSwitchTo(tokenize_context);
 			tokens = lappend(tokens, make_auth_token(buf, initial_quote));
+			MemoryContextSwitchTo(oldcxt);
+		}
 	} while (trailing_comma && (*err_msg == NULL));
 
 	return tokens;
 }
 
 /*
- * tokenize_inc_file
+ * tokenize_include_file
+ *		Include a file from another file into an hba "field".
+ *
+ * Opens and tokenises a file included from another authentication file
+ * with one of the include records ("include", "include_if_exists" or
+ * "include_dir"), and assign all values found to an existing list of
+ * list of AuthTokens.
+ *
+ * All new tokens are allocated in the memory context dedicated to the
+ * tokenization, aka tokenize_context.
+ *
+ * If missing_ok is true, ignore a missing file.
+ *
+ * In event of an error, log a message at ereport level elevel, and also
+ * set *err_msg to a string describing the error.  Note that the result
+ * may be non-NIL anyway, so *err_msg must be tested to determine whether
+ * there was an error.
+ */
+static void
+tokenize_include_file(const char *outer_filename,
+					  const char *inc_filename,
+					  List **tok_lines,
+					  int elevel,
+					  int depth,
+					  bool missing_ok,
+					  char **err_msg)
+{
+	char	   *inc_fullname;
+	FILE	   *inc_file;
+
+	inc_fullname = AbsoluteConfigLocation(inc_filename, outer_filename);
+	inc_file = open_auth_file(inc_fullname, elevel, depth, err_msg);
+
+	if (!inc_file)
+	{
+		if (errno == ENOENT && missing_ok)
+		{
+			ereport(elevel,
+					(errmsg("skipping missing authentication file \"%s\"",
+							inc_fullname)));
+			*err_msg = NULL;
+			pfree(inc_fullname);
+			return;
+		}
+
+		/* error in err_msg, so leave and report */
+		pfree(inc_fullname);
+		Assert(err_msg);
+		return;
+	}
+
+	tokenize_auth_file(inc_fullname, inc_file, tok_lines, elevel,
+					   depth);
+	free_auth_file(inc_file, depth);
+	pfree(inc_fullname);
+}
+
+/*
+ * tokenize_expand_file
  *		Expand a file included from another file into an hba "field"
  *
  * Opens and tokenises a file included from another HBA config file with @,
  * and returns all values found therein as a flat list of AuthTokens.  If a
- * @-token is found, recursively expand it.  The newly read tokens are
- * appended to "tokens" (so that foo,bar,@baz does what you expect).
- * All new tokens are allocated in caller's memory context.
+ * @-token or include record is found, recursively expand it.  The newly
+ * read tokens are appended to "tokens" (so that foo,bar,@baz does what you
+ * expect).  All new tokens are allocated in the memory context dedicated
+ * to the list of TokenizedAuthLines, aka tokenize_context.
  *
  * In event of an error, log a message at ereport level elevel, and also
  * set *err_msg to a string describing the error.  Note that the result
@@ -344,56 +538,41 @@ next_field_expand(const char *filename, char **lineptr,
  * there was an error.
  */
 static List *
-tokenize_inc_file(List *tokens,
-				  const char *outer_filename,
-				  const char *inc_filename,
-				  int elevel,
-				  char **err_msg)
+tokenize_expand_file(List *tokens,
+					 const char *outer_filename,
+					 const char *inc_filename,
+					 int elevel,
+					 int depth,
+					 char **err_msg)
 {
 	char	   *inc_fullname;
 	FILE	   *inc_file;
-	List	   *inc_lines;
+	List	   *inc_lines = NIL;
 	ListCell   *inc_line;
-	MemoryContext linecxt;
 
-	if (is_absolute_path(inc_filename))
-	{
-		/* absolute path is taken as-is */
-		inc_fullname = pstrdup(inc_filename);
-	}
-	else
-	{
-		/* relative path is relative to dir of calling file */
-		inc_fullname = (char *) palloc(strlen(outer_filename) + 1 +
-									   strlen(inc_filename) + 1);
-		strcpy(inc_fullname, outer_filename);
-		get_parent_directory(inc_fullname);
-		join_path_components(inc_fullname, inc_fullname, inc_filename);
-		canonicalize_path(inc_fullname);
-	}
+	inc_fullname = AbsoluteConfigLocation(inc_filename, outer_filename);
+	inc_file = open_auth_file(inc_fullname, elevel, depth, err_msg);
 
-	inc_file = AllocateFile(inc_fullname, "r");
 	if (inc_file == NULL)
 	{
-		int			save_errno = errno;
-
-		ereport(elevel,
-				(errcode_for_file_access(),
-				 errmsg("could not open secondary authentication file \"@%s\" as \"%s\": %m",
-						inc_filename, inc_fullname)));
-		*err_msg = psprintf("could not open secondary authentication file \"@%s\" as \"%s\": %s",
-							inc_filename, inc_fullname, strerror(save_errno));
+		/* error already logged */
 		pfree(inc_fullname);
 		return tokens;
 	}
 
-	/* There is possible recursion here if the file contains @ */
-	linecxt = tokenize_auth_file(inc_fullname, inc_file, &inc_lines, elevel);
+	/*
+	 * There is possible recursion here if the file contains @ or an include
+	 * record.
+	 */
+	tokenize_auth_file(inc_fullname, inc_file, &inc_lines, elevel,
+					   depth);
 
-	FreeFile(inc_file);
 	pfree(inc_fullname);
 
-	/* Copy all tokens found in the file and append to the tokens list */
+	/*
+	 * Move all the tokens found in the file to the tokens list.  These are
+	 * already saved in tokenize_context.
+	 */
 	foreach(inc_line, inc_lines)
 	{
 		TokenizedAuthLine *tok_line = (TokenizedAuthLine *) lfirst(inc_line);
@@ -414,14 +593,121 @@ tokenize_inc_file(List *tokens,
 			foreach(inc_token, inc_tokens)
 			{
 				AuthToken  *token = lfirst(inc_token);
+				MemoryContext oldcxt;
 
-				tokens = lappend(tokens, copy_auth_token(token));
+				/*
+				 * lappend() may do its own allocations, so move to the
+				 * context for the list of tokens.
+				 */
+				oldcxt = MemoryContextSwitchTo(tokenize_context);
+				tokens = lappend(tokens, token);
+				MemoryContextSwitchTo(oldcxt);
 			}
 		}
 	}
 
-	MemoryContextDelete(linecxt);
+	free_auth_file(inc_file, depth);
 	return tokens;
+}
+
+/*
+ * free_auth_file
+ *		Free a file opened by open_auth_file().
+ */
+void
+free_auth_file(FILE *file, int depth)
+{
+	FreeFile(file);
+
+	/* If this is the last cleanup, remove the tokenization context */
+	if (depth == CONF_FILE_START_DEPTH)
+	{
+		MemoryContextDelete(tokenize_context);
+		tokenize_context = NULL;
+	}
+}
+
+/*
+ * open_auth_file
+ *		Open the given file.
+ *
+ * filename: the absolute path to the target file
+ * elevel: message logging level
+ * depth: recursion level when opening the file
+ * err_msg: details about the error
+ *
+ * Return value is the opened file.  On error, returns NULL with details
+ * about the error stored in "err_msg".
+ */
+FILE *
+open_auth_file(const char *filename, int elevel, int depth,
+			   char **err_msg)
+{
+	FILE	   *file;
+
+	/*
+	 * Reject too-deep include nesting depth.  This is just a safety check to
+	 * avoid dumping core due to stack overflow if an include file loops back
+	 * to itself.  The maximum nesting depth is pretty arbitrary.
+	 */
+	if (depth > CONF_FILE_MAX_DEPTH)
+	{
+		ereport(elevel,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": maximum nesting depth exceeded",
+						filename)));
+		if (err_msg)
+			*err_msg = psprintf("could not open file \"%s\": maximum nesting depth exceeded",
+								filename);
+		return NULL;
+	}
+
+	file = AllocateFile(filename, "r");
+	if (file == NULL)
+	{
+		int			save_errno = errno;
+
+		ereport(elevel,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m",
+						filename)));
+		if (err_msg)
+			*err_msg = psprintf("could not open file \"%s\": %s",
+								filename, strerror(save_errno));
+		/* the caller may care about some specific errno */
+		errno = save_errno;
+		return NULL;
+	}
+
+	/*
+	 * When opening the top-level file, create the memory context used for the
+	 * tokenization.  This will be closed with this file when coming back to
+	 * this level of cleanup.
+	 */
+	if (depth == CONF_FILE_START_DEPTH)
+	{
+		/*
+		 * A context may be present, but assume that it has been eliminated
+		 * already.
+		 */
+		tokenize_context = AllocSetContextCreate(CurrentMemoryContext,
+												 "tokenize_context",
+												 ALLOCSET_START_SMALL_SIZES);
+	}
+
+	return file;
+}
+
+/*
+ * error context callback for tokenize_auth_file()
+ */
+static void
+tokenize_error_callback(void *arg)
+{
+	tokenize_error_callback_arg *callback_arg = (tokenize_error_callback_arg *) arg;
+
+	errcontext("line %d of configuration file \"%s\"",
+			   callback_arg->linenum, callback_arg->filename);
 }
 
 /*
@@ -429,40 +715,60 @@ tokenize_inc_file(List *tokens,
  *		Tokenize the given file.
  *
  * The output is a list of TokenizedAuthLine structs; see the struct definition
- * in libpq/hba.h.
+ * in libpq/hba.h.  This is the central piece in charge of parsing the
+ * authentication files.  All the operations of this function happen in its own
+ * local memory context, easing the cleanup of anything allocated here.  This
+ * matters a lot when reloading authentication files in the postmaster.
  *
  * filename: the absolute path to the target file
  * file: the already-opened target file
- * tok_lines: receives output list
+ * tok_lines: receives output list, saved into tokenize_context
  * elevel: message logging level
+ * depth: level of recursion when tokenizing the target file
  *
  * Errors are reported by logging messages at ereport level elevel and by
  * adding TokenizedAuthLine structs containing non-null err_msg fields to the
  * output list.
- *
- * Return value is a memory context which contains all memory allocated by
- * this function (it's a child of caller's context).
  */
-MemoryContext
+void
 tokenize_auth_file(const char *filename, FILE *file, List **tok_lines,
-				   int elevel)
+				   int elevel, int depth)
 {
 	int			line_number = 1;
 	StringInfoData buf;
 	MemoryContext linecxt;
-	MemoryContext oldcxt;
+	MemoryContext funccxt;		/* context of this function's caller */
+	ErrorContextCallback tokenerrcontext;
+	tokenize_error_callback_arg callback_arg;
 
+	Assert(tokenize_context);
+
+	callback_arg.filename = filename;
+	callback_arg.linenum = line_number;
+
+	tokenerrcontext.callback = tokenize_error_callback;
+	tokenerrcontext.arg = (void *) &callback_arg;
+	tokenerrcontext.previous = error_context_stack;
+	error_context_stack = &tokenerrcontext;
+
+	/*
+	 * Do all the local tokenization in its own context, to ease the cleanup
+	 * of any memory allocated while tokenizing.
+	 */
 	linecxt = AllocSetContextCreate(CurrentMemoryContext,
 									"tokenize_auth_file",
 									ALLOCSET_SMALL_SIZES);
-	oldcxt = MemoryContextSwitchTo(linecxt);
+	funccxt = MemoryContextSwitchTo(linecxt);
 
 	initStringInfo(&buf);
 
-	*tok_lines = NIL;
+	if (depth == CONF_FILE_START_DEPTH)
+		*tok_lines = NIL;
 
 	while (!feof(file) && !ferror(file))
 	{
+		TokenizedAuthLine *tok_line;
+		MemoryContext oldcxt;
 		char	   *lineptr;
 		List	   *current_line = NIL;
 		char	   *err_msg = NULL;
@@ -516,33 +822,138 @@ tokenize_auth_file(const char *filename, FILE *file, List **tok_lines,
 			List	   *current_field;
 
 			current_field = next_field_expand(filename, &lineptr,
-											  elevel, &err_msg);
+											  elevel, depth, &err_msg);
 			/* add field to line, unless we are at EOL or comment start */
 			if (current_field != NIL)
+			{
+				/*
+				 * lappend() may do its own allocations, so move to the
+				 * context for the list of tokens.
+				 */
+				oldcxt = MemoryContextSwitchTo(tokenize_context);
 				current_line = lappend(current_line, current_field);
+				MemoryContextSwitchTo(oldcxt);
+			}
 		}
 
 		/*
-		 * Reached EOL; emit line to TokenizedAuthLine list unless it's boring
+		 * Reached EOL; no need to emit line to TokenizedAuthLine list if it's
+		 * boring.
 		 */
-		if (current_line != NIL || err_msg != NULL)
-		{
-			TokenizedAuthLine *tok_line;
+		if (current_line == NIL && err_msg == NULL)
+			goto next_line;
 
-			tok_line = (TokenizedAuthLine *) palloc(sizeof(TokenizedAuthLine));
-			tok_line->fields = current_line;
-			tok_line->line_num = line_number;
-			tok_line->raw_line = pstrdup(buf.data);
-			tok_line->err_msg = err_msg;
-			*tok_lines = lappend(*tok_lines, tok_line);
+		/* If the line is valid, check if that's an include directive */
+		if (err_msg == NULL && list_length(current_line) == 2)
+		{
+			AuthToken  *first,
+					   *second;
+
+			first = linitial(linitial_node(List, current_line));
+			second = linitial(lsecond_node(List, current_line));
+
+			if (strcmp(first->string, "include") == 0)
+			{
+				tokenize_include_file(filename, second->string, tok_lines,
+									  elevel, depth + 1, false, &err_msg);
+
+				if (err_msg)
+					goto process_line;
+
+				/*
+				 * tokenize_auth_file() has taken care of creating the
+				 * TokenizedAuthLines.
+				 */
+				goto next_line;
+			}
+			else if (strcmp(first->string, "include_dir") == 0)
+			{
+				char	  **filenames;
+				char	   *dir_name = second->string;
+				int			num_filenames;
+				StringInfoData err_buf;
+
+				filenames = GetConfFilesInDir(dir_name, filename, elevel,
+											  &num_filenames, &err_msg);
+
+				if (!filenames)
+				{
+					/* the error is in err_msg, so create an entry */
+					goto process_line;
+				}
+
+				initStringInfo(&err_buf);
+				for (int i = 0; i < num_filenames; i++)
+				{
+					tokenize_include_file(filename, filenames[i], tok_lines,
+										  elevel, depth + 1, false, &err_msg);
+					/* cumulate errors if any */
+					if (err_msg)
+					{
+						if (err_buf.len > 0)
+							appendStringInfoChar(&err_buf, '\n');
+						appendStringInfoString(&err_buf, err_msg);
+					}
+				}
+
+				/* clean up things */
+				for (int i = 0; i < num_filenames; i++)
+					pfree(filenames[i]);
+				pfree(filenames);
+
+				/*
+				 * If there were no errors, the line is fully processed,
+				 * bypass the general TokenizedAuthLine processing.
+				 */
+				if (err_buf.len == 0)
+					goto next_line;
+
+				/* Otherwise, process the cumulated errors, if any. */
+				err_msg = err_buf.data;
+				goto process_line;
+			}
+			else if (strcmp(first->string, "include_if_exists") == 0)
+			{
+
+				tokenize_include_file(filename, second->string, tok_lines,
+									  elevel, depth + 1, true, &err_msg);
+				if (err_msg)
+					goto process_line;
+
+				/*
+				 * tokenize_auth_file() has taken care of creating the
+				 * TokenizedAuthLines.
+				 */
+				goto next_line;
+			}
 		}
 
+process_line:
+
+		/*
+		 * General processing: report the error if any and emit line to the
+		 * TokenizedAuthLine.  This is saved in the memory context dedicated
+		 * to this list.
+		 */
+		oldcxt = MemoryContextSwitchTo(tokenize_context);
+		tok_line = (TokenizedAuthLine *) palloc0(sizeof(TokenizedAuthLine));
+		tok_line->fields = current_line;
+		tok_line->file_name = pstrdup(filename);
+		tok_line->line_num = line_number;
+		tok_line->raw_line = pstrdup(buf.data);
+		tok_line->err_msg = err_msg ? pstrdup(err_msg) : NULL;
+		*tok_lines = lappend(*tok_lines, tok_line);
+		MemoryContextSwitchTo(oldcxt);
+
+next_line:
 		line_number += continuations + 1;
+		callback_arg.linenum = line_number;
 	}
 
-	MemoryContextSwitchTo(oldcxt);
+	MemoryContextSwitchTo(funccxt);
+	MemoryContextDelete(linecxt);
 
-	return linecxt;
+	error_context_stack = tokenerrcontext.previous;
 }
 
 
@@ -575,6 +986,10 @@ is_member(Oid userid, const char *role)
 
 /*
  * Check AuthToken list for a match to role, allowing group names.
+ *
+ * Each AuthToken listed is checked one-by-one.  Keywords are processed
+ * first (these cannot have regular expressions), followed by regular
+ * expressions (if any) and the exact match.
  */
 static bool
 check_role(const char *role, Oid roleid, List *tokens)
@@ -590,8 +1005,14 @@ check_role(const char *role, Oid roleid, List *tokens)
 			if (is_member(roleid, tok->string + 1))
 				return true;
 		}
-		else if (token_matches(tok, role) ||
-				 token_is_keyword(tok, "all"))
+		else if (token_is_keyword(tok, "all"))
+			return true;
+		else if (token_has_regexp(tok))
+		{
+			if (regexec_auth_token(role, tok, 0, NULL) == REG_OKAY)
+				return true;
+		}
+		else if (token_matches(tok, role))
 			return true;
 	}
 	return false;
@@ -599,6 +1020,10 @@ check_role(const char *role, Oid roleid, List *tokens)
 
 /*
  * Check to see if db/role combination matches AuthToken list.
+ *
+ * Each AuthToken listed is checked one-by-one.  Keywords are checked
+ * first (these cannot have regular expressions), followed by regular
+ * expressions (if any) and the exact match.
  */
 static bool
 check_db(const char *dbname, const char *role, Oid roleid, List *tokens)
@@ -633,6 +1058,11 @@ check_db(const char *dbname, const char *role, Oid roleid, List *tokens)
 		}
 		else if (token_is_keyword(tok, "replication"))
 			continue;			/* never match this if not walsender */
+		else if (token_has_regexp(tok))
+		{
+			if (regexec_auth_token(dbname, tok, 0, NULL) == REG_OKAY)
+				return true;
+		}
 		else if (token_matches(tok, dbname))
 			return true;
 	}
@@ -855,7 +1285,7 @@ do { \
 			 errmsg("authentication option \"%s\" is only valid for authentication methods %s", \
 					optname, _(validmethods)), \
 			 errcontext("line %d of configuration file \"%s\"", \
-					line_num, HbaFileName))); \
+					line_num, file_name))); \
 	*err_msg = psprintf("authentication option \"%s\" is only valid for authentication methods %s", \
 						optname, validmethods); \
 	return false; \
@@ -875,7 +1305,7 @@ do { \
 				 errmsg("authentication method \"%s\" requires argument \"%s\" to be set", \
 						authname, argname), \
 				 errcontext("line %d of configuration file \"%s\"", \
-						line_num, HbaFileName))); \
+						line_num, file_name))); \
 		*err_msg = psprintf("authentication method \"%s\" requires argument \"%s\" to be set", \
 							authname, argname); \
 		return NULL; \
@@ -898,7 +1328,7 @@ do { \
 				(errcode(ERRCODE_CONFIG_FILE_ERROR), \
 				 errmsg("missing entry at end of line"), \
 				 errcontext("line %d of configuration file \"%s\"", \
-							line_num, IdentFileName))); \
+							line_num, file_name))); \
 		*err_msg = pstrdup("missing entry at end of line"); \
 		return NULL; \
 	} \
@@ -911,7 +1341,7 @@ do { \
 				(errcode(ERRCODE_CONFIG_FILE_ERROR), \
 				 errmsg("multiple values in ident field"), \
 				 errcontext("line %d of configuration file \"%s\"", \
-							line_num, IdentFileName))); \
+							line_num, file_name))); \
 		*err_msg = pstrdup("multiple values in ident field"); \
 		return NULL; \
 	} \
@@ -934,6 +1364,7 @@ HbaLine *
 parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 {
 	int			line_num = tok_line->line_num;
+	char	   *file_name = tok_line->file_name;
 	char	  **err_msg = &tok_line->err_msg;
 	char	   *str;
 	struct addrinfo *gai_result;
@@ -948,6 +1379,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 	HbaLine    *parsedline;
 
 	parsedline = palloc0(sizeof(HbaLine));
+	parsedline->sourcefile = pstrdup(file_name);
 	parsedline->linenumber = line_num;
 	parsedline->rawline = pstrdup(tok_line->raw_line);
 
@@ -962,7 +1394,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 				 errmsg("multiple values specified for connection type"),
 				 errhint("Specify exactly one connection type per line."),
 				 errcontext("line %d of configuration file \"%s\"",
-							line_num, HbaFileName)));
+							line_num, file_name)));
 		*err_msg = "multiple values specified for connection type";
 		return NULL;
 	}
@@ -990,7 +1422,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 						 errmsg("hostssl record cannot match because SSL is disabled"),
 						 errhint("Set ssl = on in postgresql.conf."),
 						 errcontext("line %d of configuration file \"%s\"",
-									line_num, HbaFileName)));
+									line_num, file_name)));
 				*err_msg = "hostssl record cannot match because SSL is disabled";
 			}
 #else
@@ -998,7 +1430,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("hostssl record cannot match because SSL is not supported by this build"),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			*err_msg = "hostssl record cannot match because SSL is not supported by this build";
 #endif
 		}
@@ -1010,7 +1442,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("hostgssenc record cannot match because GSSAPI is not supported by this build"),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			*err_msg = "hostgssenc record cannot match because GSSAPI is not supported by this build";
 #endif
 		}
@@ -1031,7 +1463,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 				 errmsg("invalid connection type \"%s\"",
 						token->string),
 				 errcontext("line %d of configuration file \"%s\"",
-							line_num, HbaFileName)));
+							line_num, file_name)));
 		*err_msg = psprintf("invalid connection type \"%s\"", token->string);
 		return NULL;
 	}
@@ -1044,7 +1476,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 				(errcode(ERRCODE_CONFIG_FILE_ERROR),
 				 errmsg("end-of-line before database specification"),
 				 errcontext("line %d of configuration file \"%s\"",
-							line_num, HbaFileName)));
+							line_num, file_name)));
 		*err_msg = "end-of-line before database specification";
 		return NULL;
 	}
@@ -1052,8 +1484,13 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 	tokens = lfirst(field);
 	foreach(tokencell, tokens)
 	{
-		parsedline->databases = lappend(parsedline->databases,
-										copy_auth_token(lfirst(tokencell)));
+		AuthToken  *tok = copy_auth_token(lfirst(tokencell));
+
+		/* Compile a regexp for the database token, if necessary */
+		if (regcomp_auth_token(tok, file_name, line_num, err_msg, elevel))
+			return NULL;
+
+		parsedline->databases = lappend(parsedline->databases, tok);
 	}
 
 	/* Get the roles. */
@@ -1064,7 +1501,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 				(errcode(ERRCODE_CONFIG_FILE_ERROR),
 				 errmsg("end-of-line before role specification"),
 				 errcontext("line %d of configuration file \"%s\"",
-							line_num, HbaFileName)));
+							line_num, file_name)));
 		*err_msg = "end-of-line before role specification";
 		return NULL;
 	}
@@ -1072,8 +1509,13 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 	tokens = lfirst(field);
 	foreach(tokencell, tokens)
 	{
-		parsedline->roles = lappend(parsedline->roles,
-									copy_auth_token(lfirst(tokencell)));
+		AuthToken  *tok = copy_auth_token(lfirst(tokencell));
+
+		/* Compile a regexp from the role token, if necessary */
+		if (regcomp_auth_token(tok, file_name, line_num, err_msg, elevel))
+			return NULL;
+
+		parsedline->roles = lappend(parsedline->roles, tok);
 	}
 
 	if (parsedline->conntype != ctLocal)
@@ -1086,7 +1528,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("end-of-line before IP address specification"),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			*err_msg = "end-of-line before IP address specification";
 			return NULL;
 		}
@@ -1098,7 +1540,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 					 errmsg("multiple values specified for host address"),
 					 errhint("Specify one address range per line."),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			*err_msg = "multiple values specified for host address";
 			return NULL;
 		}
@@ -1157,7 +1599,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 						 errmsg("invalid IP address \"%s\": %s",
 								str, gai_strerror(ret)),
 						 errcontext("line %d of configuration file \"%s\"",
-									line_num, HbaFileName)));
+									line_num, file_name)));
 				*err_msg = psprintf("invalid IP address \"%s\": %s",
 									str, gai_strerror(ret));
 				if (gai_result)
@@ -1177,7 +1619,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 							 errmsg("specifying both host name and CIDR mask is invalid: \"%s\"",
 									token->string),
 							 errcontext("line %d of configuration file \"%s\"",
-										line_num, HbaFileName)));
+										line_num, file_name)));
 					*err_msg = psprintf("specifying both host name and CIDR mask is invalid: \"%s\"",
 										token->string);
 					return NULL;
@@ -1191,7 +1633,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 							 errmsg("invalid CIDR mask in address \"%s\"",
 									token->string),
 							 errcontext("line %d of configuration file \"%s\"",
-										line_num, HbaFileName)));
+										line_num, file_name)));
 					*err_msg = psprintf("invalid CIDR mask in address \"%s\"",
 										token->string);
 					return NULL;
@@ -1211,7 +1653,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 							 errmsg("end-of-line before netmask specification"),
 							 errhint("Specify an address range in CIDR notation, or provide a separate netmask."),
 							 errcontext("line %d of configuration file \"%s\"",
-										line_num, HbaFileName)));
+										line_num, file_name)));
 					*err_msg = "end-of-line before netmask specification";
 					return NULL;
 				}
@@ -1222,7 +1664,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 							(errcode(ERRCODE_CONFIG_FILE_ERROR),
 							 errmsg("multiple values specified for netmask"),
 							 errcontext("line %d of configuration file \"%s\"",
-										line_num, HbaFileName)));
+										line_num, file_name)));
 					*err_msg = "multiple values specified for netmask";
 					return NULL;
 				}
@@ -1237,7 +1679,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 							 errmsg("invalid IP mask \"%s\": %s",
 									token->string, gai_strerror(ret)),
 							 errcontext("line %d of configuration file \"%s\"",
-										line_num, HbaFileName)));
+										line_num, file_name)));
 					*err_msg = psprintf("invalid IP mask \"%s\": %s",
 										token->string, gai_strerror(ret));
 					if (gai_result)
@@ -1256,7 +1698,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 							(errcode(ERRCODE_CONFIG_FILE_ERROR),
 							 errmsg("IP address and mask do not match"),
 							 errcontext("line %d of configuration file \"%s\"",
-										line_num, HbaFileName)));
+										line_num, file_name)));
 					*err_msg = "IP address and mask do not match";
 					return NULL;
 				}
@@ -1272,7 +1714,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 				(errcode(ERRCODE_CONFIG_FILE_ERROR),
 				 errmsg("end-of-line before authentication method"),
 				 errcontext("line %d of configuration file \"%s\"",
-							line_num, HbaFileName)));
+							line_num, file_name)));
 		*err_msg = "end-of-line before authentication method";
 		return NULL;
 	}
@@ -1284,7 +1726,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 				 errmsg("multiple values specified for authentication type"),
 				 errhint("Specify exactly one authentication type per line."),
 				 errcontext("line %d of configuration file \"%s\"",
-							line_num, HbaFileName)));
+							line_num, file_name)));
 		*err_msg = "multiple values specified for authentication type";
 		return NULL;
 	}
@@ -1321,7 +1763,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("MD5 authentication is not supported when \"db_user_namespace\" is enabled"),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			*err_msg = "MD5 authentication is not supported when \"db_user_namespace\" is enabled";
 			return NULL;
 		}
@@ -1362,7 +1804,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 				 errmsg("invalid authentication method \"%s\"",
 						token->string),
 				 errcontext("line %d of configuration file \"%s\"",
-							line_num, HbaFileName)));
+							line_num, file_name)));
 		*err_msg = psprintf("invalid authentication method \"%s\"",
 							token->string);
 		return NULL;
@@ -1375,7 +1817,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 				 errmsg("invalid authentication method \"%s\": not supported by this build",
 						token->string),
 				 errcontext("line %d of configuration file \"%s\"",
-							line_num, HbaFileName)));
+							line_num, file_name)));
 		*err_msg = psprintf("invalid authentication method \"%s\": not supported by this build",
 							token->string);
 		return NULL;
@@ -1397,7 +1839,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 				(errcode(ERRCODE_CONFIG_FILE_ERROR),
 				 errmsg("gssapi authentication is not supported on local sockets"),
 				 errcontext("line %d of configuration file \"%s\"",
-							line_num, HbaFileName)));
+							line_num, file_name)));
 		*err_msg = "gssapi authentication is not supported on local sockets";
 		return NULL;
 	}
@@ -1409,7 +1851,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 				(errcode(ERRCODE_CONFIG_FILE_ERROR),
 				 errmsg("peer authentication is only supported on local sockets"),
 				 errcontext("line %d of configuration file \"%s\"",
-							line_num, HbaFileName)));
+							line_num, file_name)));
 		*err_msg = "peer authentication is only supported on local sockets";
 		return NULL;
 	}
@@ -1427,7 +1869,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 				(errcode(ERRCODE_CONFIG_FILE_ERROR),
 				 errmsg("cert authentication is only supported on hostssl connections"),
 				 errcontext("line %d of configuration file \"%s\"",
-							line_num, HbaFileName)));
+							line_num, file_name)));
 		*err_msg = "cert authentication is only supported on hostssl connections";
 		return NULL;
 	}
@@ -1477,7 +1919,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 						(errcode(ERRCODE_CONFIG_FILE_ERROR),
 						 errmsg("authentication option not in name=value format: %s", token->string),
 						 errcontext("line %d of configuration file \"%s\"",
-									line_num, HbaFileName)));
+									line_num, file_name)));
 				*err_msg = psprintf("authentication option not in name=value format: %s",
 									token->string);
 				return NULL;
@@ -1521,7 +1963,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 						(errcode(ERRCODE_CONFIG_FILE_ERROR),
 						 errmsg("cannot use ldapbasedn, ldapbinddn, ldapbindpasswd, ldapsearchattribute, ldapsearchfilter, or ldapurl together with ldapprefix"),
 						 errcontext("line %d of configuration file \"%s\"",
-									line_num, HbaFileName)));
+									line_num, file_name)));
 				*err_msg = "cannot use ldapbasedn, ldapbinddn, ldapbindpasswd, ldapsearchattribute, ldapsearchfilter, or ldapurl together with ldapprefix";
 				return NULL;
 			}
@@ -1532,7 +1974,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("authentication method \"ldap\" requires argument \"ldapbasedn\", \"ldapprefix\", or \"ldapsuffix\" to be set"),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			*err_msg = "authentication method \"ldap\" requires argument \"ldapbasedn\", \"ldapprefix\", or \"ldapsuffix\" to be set";
 			return NULL;
 		}
@@ -1548,7 +1990,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("cannot use ldapsearchattribute together with ldapsearchfilter"),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			*err_msg = "cannot use ldapsearchattribute together with ldapsearchfilter";
 			return NULL;
 		}
@@ -1565,7 +2007,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("list of RADIUS servers cannot be empty"),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			*err_msg = "list of RADIUS servers cannot be empty";
 			return NULL;
 		}
@@ -1576,7 +2018,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("list of RADIUS secrets cannot be empty"),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			*err_msg = "list of RADIUS secrets cannot be empty";
 			return NULL;
 		}
@@ -1595,7 +2037,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 							list_length(parsedline->radiussecrets),
 							list_length(parsedline->radiusservers)),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			*err_msg = psprintf("the number of RADIUS secrets (%d) must be 1 or the same as the number of RADIUS servers (%d)",
 								list_length(parsedline->radiussecrets),
 								list_length(parsedline->radiusservers));
@@ -1611,7 +2053,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 							list_length(parsedline->radiusports),
 							list_length(parsedline->radiusservers)),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			*err_msg = psprintf("the number of RADIUS ports (%d) must be 1 or the same as the number of RADIUS servers (%d)",
 								list_length(parsedline->radiusports),
 								list_length(parsedline->radiusservers));
@@ -1627,7 +2069,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 							list_length(parsedline->radiusidentifiers),
 							list_length(parsedline->radiusservers)),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			*err_msg = psprintf("the number of RADIUS identifiers (%d) must be 1 or the same as the number of RADIUS servers (%d)",
 								list_length(parsedline->radiusidentifiers),
 								list_length(parsedline->radiusservers));
@@ -1662,6 +2104,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 				   int elevel, char **err_msg)
 {
 	int			line_num = hbaline->linenumber;
+	char	   *file_name = hbaline->sourcefile;
 
 #ifdef USE_LDAP
 	hbaline->ldapscope = LDAP_SCOPE_SUBTREE;
@@ -1685,7 +2128,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("clientcert can only be configured for \"hostssl\" rows"),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			*err_msg = "clientcert can only be configured for \"hostssl\" rows";
 			return false;
 		}
@@ -1702,7 +2145,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 						(errcode(ERRCODE_CONFIG_FILE_ERROR),
 						 errmsg("clientcert only accepts \"verify-full\" when using \"cert\" authentication"),
 						 errcontext("line %d of configuration file \"%s\"",
-									line_num, HbaFileName)));
+									line_num, file_name)));
 				*err_msg = "clientcert can only be set to \"verify-full\" when using \"cert\" authentication";
 				return false;
 			}
@@ -1715,7 +2158,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("invalid value for clientcert: \"%s\"", val),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			return false;
 		}
 	}
@@ -1727,7 +2170,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("clientname can only be configured for \"hostssl\" rows"),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			*err_msg = "clientname can only be configured for \"hostssl\" rows";
 			return false;
 		}
@@ -1746,7 +2189,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("invalid value for clientname: \"%s\"", val),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			return false;
 		}
 	}
@@ -1832,7 +2275,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("invalid ldapscheme value: \"%s\"", val),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 		hbaline->ldapscheme = pstrdup(val);
 	}
 	else if (strcmp(name, "ldapserver") == 0)
@@ -1850,7 +2293,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("invalid LDAP port number: \"%s\"", val),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			*err_msg = psprintf("invalid LDAP port number: \"%s\"", val);
 			return false;
 		}
@@ -1944,7 +2387,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 					 errmsg("could not parse RADIUS server list \"%s\"",
 							val),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			return false;
 		}
 
@@ -1963,7 +2406,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 						 errmsg("could not translate RADIUS server name \"%s\" to address: %s",
 								(char *) lfirst(l), gai_strerror(ret)),
 						 errcontext("line %d of configuration file \"%s\"",
-									line_num, HbaFileName)));
+									line_num, file_name)));
 				if (gai_result)
 					pg_freeaddrinfo_all(hints.ai_family, gai_result);
 
@@ -1992,7 +2435,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 					 errmsg("could not parse RADIUS port list \"%s\"",
 							val),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			*err_msg = psprintf("invalid RADIUS port number: \"%s\"", val);
 			return false;
 		}
@@ -2005,7 +2448,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 						(errcode(ERRCODE_CONFIG_FILE_ERROR),
 						 errmsg("invalid RADIUS port number: \"%s\"", val),
 						 errcontext("line %d of configuration file \"%s\"",
-									line_num, HbaFileName)));
+									line_num, file_name)));
 
 				return false;
 			}
@@ -2028,7 +2471,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 					 errmsg("could not parse RADIUS secret list \"%s\"",
 							val),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			return false;
 		}
 
@@ -2050,7 +2493,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 					 errmsg("could not parse RADIUS identifiers list \"%s\"",
 							val),
 					 errcontext("line %d of configuration file \"%s\"",
-								line_num, HbaFileName)));
+								line_num, file_name)));
 			return false;
 		}
 
@@ -2064,7 +2507,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 				 errmsg("unrecognized authentication option name: \"%s\"",
 						name),
 				 errcontext("line %d of configuration file \"%s\"",
-							line_num, HbaFileName)));
+							line_num, file_name)));
 		*err_msg = psprintf("unrecognized authentication option name: \"%s\"",
 							name);
 		return false;
@@ -2198,22 +2641,17 @@ load_hba(void)
 	ListCell   *line;
 	List	   *new_parsed_lines = NIL;
 	bool		ok = true;
-	MemoryContext linecxt;
 	MemoryContext oldcxt;
 	MemoryContext hbacxt;
 
-	file = AllocateFile(HbaFileName, "r");
+	file = open_auth_file(HbaFileName, LOG, 0, NULL);
 	if (file == NULL)
 	{
-		ereport(LOG,
-				(errcode_for_file_access(),
-				 errmsg("could not open configuration file \"%s\": %m",
-						HbaFileName)));
+		/* error already logged */
 		return false;
 	}
 
-	linecxt = tokenize_auth_file(HbaFileName, file, &hba_lines, LOG);
-	FreeFile(file);
+	tokenize_auth_file(HbaFileName, file, &hba_lines, LOG, 0);
 
 	/* Now parse all the lines */
 	Assert(PostmasterContext);
@@ -2264,17 +2702,36 @@ load_hba(void)
 	}
 
 	/* Free tokenizer memory */
-	MemoryContextDelete(linecxt);
+	free_auth_file(file, 0);
 	MemoryContextSwitchTo(oldcxt);
 
 	if (!ok)
 	{
-		/* File contained one or more errors, so bail out */
+		/*
+		 * File contained one or more errors, so bail out, first being careful
+		 * to clean up whatever we allocated.  Most stuff will go away via
+		 * MemoryContextDelete, but we have to clean up regexes explicitly.
+		 */
+		foreach(line, new_parsed_lines)
+		{
+			HbaLine    *newline = (HbaLine *) lfirst(line);
+
+			free_hba_line(newline);
+		}
 		MemoryContextDelete(hbacxt);
 		return false;
 	}
 
 	/* Loaded new file successfully, replace the one we use */
+	if (parsed_hba_lines != NIL)
+	{
+		foreach(line, parsed_hba_lines)
+		{
+			HbaLine    *newline = (HbaLine *) lfirst(line);
+
+			free_hba_line(newline);
+		}
+	}
 	if (parsed_hba_context != NULL)
 		MemoryContextDelete(parsed_hba_context);
 	parsed_hba_context = hbacxt;
@@ -2302,6 +2759,7 @@ IdentLine *
 parse_ident_line(TokenizedAuthLine *tok_line, int elevel)
 {
 	int			line_num = tok_line->line_num;
+	char	   *file_name = tok_line->file_name;
 	char	  **err_msg = &tok_line->err_msg;
 	ListCell   *field;
 	List	   *tokens;
@@ -2326,7 +2784,9 @@ parse_ident_line(TokenizedAuthLine *tok_line, int elevel)
 	tokens = lfirst(field);
 	IDENT_MULTI_VALUE(tokens);
 	token = linitial(tokens);
-	parsedline->ident_user = pstrdup(token->string);
+
+	/* Copy the ident user token */
+	parsedline->token = copy_auth_token(token);
 
 	/* Get the PG rolename token */
 	field = lnext(tok_line->fields, field);
@@ -2336,40 +2796,15 @@ parse_ident_line(TokenizedAuthLine *tok_line, int elevel)
 	token = linitial(tokens);
 	parsedline->pg_role = pstrdup(token->string);
 
-	if (parsedline->ident_user[0] == '/')
+	/*
+	 * Now that the field validation is done, compile a regex from the user
+	 * token, if necessary.
+	 */
+	if (regcomp_auth_token(parsedline->token, file_name, line_num,
+						   err_msg, elevel))
 	{
-		/*
-		 * When system username starts with a slash, treat it as a regular
-		 * expression. Pre-compile it.
-		 */
-		int			r;
-		pg_wchar   *wstr;
-		int			wlen;
-
-		wstr = palloc((strlen(parsedline->ident_user + 1) + 1) * sizeof(pg_wchar));
-		wlen = pg_mb2wchar_with_len(parsedline->ident_user + 1,
-									wstr, strlen(parsedline->ident_user + 1));
-
-		r = pg_regcomp(&parsedline->re, wstr, wlen, REG_ADVANCED, C_COLLATION_OID);
-		if (r)
-		{
-			char		errstr[100];
-
-			pg_regerror(r, &parsedline->re, errstr, sizeof(errstr));
-			ereport(elevel,
-					(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
-					 errmsg("invalid regular expression \"%s\": %s",
-							parsedline->ident_user + 1, errstr),
-					 errcontext("line %d of configuration file \"%s\"",
-							line_num, IdentFileName)));
-
-			*err_msg = psprintf("invalid regular expression \"%s\": %s",
-								parsedline->ident_user + 1, errstr);
-
-			pfree(wstr);
-			return NULL;
-		}
-		pfree(wstr);
+		/* err_msg includes the error to report */
+		return NULL;
 	}
 
 	return parsedline;
@@ -2394,25 +2829,19 @@ check_ident_usermap(IdentLine *identLine, const char *usermap_name,
 		return;
 
 	/* Match? */
-	if (identLine->ident_user[0] == '/')
+	if (token_has_regexp(identLine->token))
 	{
 		/*
-		 * When system username starts with a slash, treat it as a regular
-		 * expression. In this case, we process the system username as a
-		 * regular expression that returns exactly one match. This is replaced
-		 * for \1 in the database username string, if present.
+		 * Process the system username as a regular expression that returns
+		 * exactly one match. This is replaced for \1 in the database username
+		 * string, if present.
 		 */
 		int			r;
 		regmatch_t	matches[2];
-		pg_wchar   *wstr;
-		int			wlen;
 		char	   *ofs;
 		char	   *regexp_pgrole;
 
-		wstr = palloc((strlen(ident_user) + 1) * sizeof(pg_wchar));
-		wlen = pg_mb2wchar_with_len(ident_user, wstr, strlen(ident_user));
-
-		r = pg_regexec(&identLine->re, wstr, wlen, 0, NULL, 2, matches, 0);
+		r = regexec_auth_token(ident_user, identLine->token, 2, matches);
 		if (r)
 		{
 			char		errstr[100];
@@ -2420,18 +2849,15 @@ check_ident_usermap(IdentLine *identLine, const char *usermap_name,
 			if (r != REG_NOMATCH)
 			{
 				/* REG_NOMATCH is not an error, everything else is */
-				pg_regerror(r, &identLine->re, errstr, sizeof(errstr));
+				pg_regerror(r, identLine->token->regex, errstr, sizeof(errstr));
 				ereport(LOG,
 						(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
 						 errmsg("regular expression match for \"%s\" failed: %s",
-								identLine->ident_user + 1, errstr)));
+								identLine->token->string + 1, errstr)));
 				*error_p = true;
 			}
-
-			pfree(wstr);
 			return;
 		}
-		pfree(wstr);
 
 		if ((ofs = strstr(identLine->pg_role, "\\1")) != NULL)
 		{
@@ -2443,7 +2869,7 @@ check_ident_usermap(IdentLine *identLine, const char *usermap_name,
 				ereport(LOG,
 						(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
 						 errmsg("regular expression \"%s\" has no subexpressions as requested by backreference in \"%s\"",
-								identLine->ident_user + 1, identLine->pg_role)));
+								identLine->token->string + 1, identLine->pg_role)));
 				*error_p = true;
 				return;
 			}
@@ -2490,13 +2916,13 @@ check_ident_usermap(IdentLine *identLine, const char *usermap_name,
 		if (case_insensitive)
 		{
 			if (pg_strcasecmp(identLine->pg_role, pg_role) == 0 &&
-				pg_strcasecmp(identLine->ident_user, ident_user) == 0)
+				pg_strcasecmp(identLine->token->string, ident_user) == 0)
 				*found_p = true;
 		}
 		else
 		{
 			if (strcmp(identLine->pg_role, pg_role) == 0 &&
-				strcmp(identLine->ident_user, ident_user) == 0)
+				strcmp(identLine->token->string, ident_user) == 0)
 				*found_p = true;
 		}
 	}
@@ -2580,24 +3006,19 @@ load_ident(void)
 			   *parsed_line_cell;
 	List	   *new_parsed_lines = NIL;
 	bool		ok = true;
-	MemoryContext linecxt;
 	MemoryContext oldcxt;
 	MemoryContext ident_context;
 	IdentLine  *newline;
 
-	file = AllocateFile(IdentFileName, "r");
+	/* not FATAL ... we just won't do any special ident maps */
+	file = open_auth_file(IdentFileName, LOG, 0, NULL);
 	if (file == NULL)
 	{
-		/* not fatal ... we just won't do any special ident maps */
-		ereport(LOG,
-				(errcode_for_file_access(),
-				 errmsg("could not open usermap file \"%s\": %m",
-						IdentFileName)));
+		/* error already logged */
 		return false;
 	}
 
-	linecxt = tokenize_auth_file(IdentFileName, file, &ident_lines, LOG);
-	FreeFile(file);
+	tokenize_auth_file(IdentFileName, file, &ident_lines, LOG, 0);
 
 	/* Now parse all the lines */
 	Assert(PostmasterContext);
@@ -2633,7 +3054,7 @@ load_ident(void)
 	}
 
 	/* Free tokenizer memory */
-	MemoryContextDelete(linecxt);
+	free_auth_file(file, 0);
 	MemoryContextSwitchTo(oldcxt);
 
 	if (!ok)
@@ -2646,8 +3067,7 @@ load_ident(void)
 		foreach(parsed_line_cell, new_parsed_lines)
 		{
 			newline = (IdentLine *) lfirst(parsed_line_cell);
-			if (newline->ident_user[0] == '/')
-				pg_regfree(&newline->re);
+			free_auth_token(newline->token);
 		}
 		MemoryContextDelete(ident_context);
 		return false;
@@ -2659,8 +3079,7 @@ load_ident(void)
 		foreach(parsed_line_cell, parsed_ident_lines)
 		{
 			newline = (IdentLine *) lfirst(parsed_line_cell);
-			if (newline->ident_user[0] == '/')
-				pg_regfree(&newline->re);
+			free_auth_token(newline->token);
 		}
 	}
 	if (parsed_ident_context != NULL)

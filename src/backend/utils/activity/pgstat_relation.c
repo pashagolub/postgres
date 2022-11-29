@@ -25,6 +25,7 @@
 #include "utils/pgstat_internal.h"
 #include "utils/rel.h"
 #include "utils/timestamp.h"
+#include "catalog/catalog.h"
 
 
 /* Record that's written to 2PC state file when pgstat state is persisted */
@@ -437,17 +438,7 @@ pgstat_update_heap_dead_tuples(Relation rel, int delta)
 PgStat_StatTabEntry *
 pgstat_fetch_stat_tabentry(Oid relid)
 {
-	PgStat_StatTabEntry *tabentry;
-
-	tabentry = pgstat_fetch_stat_tabentry_ext(false, relid);
-	if (tabentry != NULL)
-		return tabentry;
-
-	/*
-	 * If we didn't find it, maybe it's a shared table.
-	 */
-	tabentry = pgstat_fetch_stat_tabentry_ext(true, relid);
-	return tabentry;
+	return pgstat_fetch_stat_tabentry_ext(IsSharedRelation(relid), relid);
 }
 
 /*
@@ -789,6 +780,12 @@ pgstat_relation_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 	tabentry = &shtabstats->stats;
 
 	tabentry->numscans += lstats->t_counts.t_numscans;
+	if (lstats->t_counts.t_numscans)
+	{
+		TimestampTz t = GetCurrentTransactionStopTimestamp();
+		if (t > tabentry->lastscan)
+			tabentry->lastscan = t;
+	}
 	tabentry->tuples_returned += lstats->t_counts.t_tuples_returned;
 	tabentry->tuples_fetched += lstats->t_counts.t_tuples_fetched;
 	tabentry->tuples_inserted += lstats->t_counts.t_tuples_inserted;

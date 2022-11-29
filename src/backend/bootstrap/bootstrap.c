@@ -287,8 +287,8 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 					}
 
 					SetConfigOption(name, value, PGC_POSTMASTER, PGC_S_ARGV);
-					free(name);
-					free(value);
+					pfree(name);
+					pfree(value);
 					break;
 				}
 			default:
@@ -648,7 +648,7 @@ InsertOneValue(char *value, int i)
 	Oid			typinput;
 	Oid			typoutput;
 
-	AssertArg(i >= 0 && i < MAXATTR);
+	Assert(i >= 0 && i < MAXATTR);
 
 	elog(DEBUG4, "inserting column %d value \"%s\"", i, value);
 

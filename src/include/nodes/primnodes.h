@@ -177,8 +177,8 @@ typedef struct Expr
  * is abused to signify references to columns of a custom scan tuple type.)
  *
  * ROWID_VAR is used in the planner to identify nonce variables that carry
- * row identity information during UPDATE/DELETE.  This value should never
- * be seen outside the planner.
+ * row identity information during UPDATE/DELETE/MERGE.  This value should
+ * never be seen outside the planner.
  *
  * In the parser, varnosyn and varattnosyn are either identical to
  * varno/varattno, or they specify the column's position in an aliased JOIN
@@ -1291,45 +1291,6 @@ typedef struct MinMaxExpr
 	List	   *args;			/* the arguments */
 	int			location;		/* token location, or -1 if unknown */
 } MinMaxExpr;
-
-/*
- * SQLValueFunction - parameterless functions with special grammar productions
- *
- * The SQL standard categorizes some of these as <datetime value function>
- * and others as <general value specification>.  We call 'em SQLValueFunctions
- * for lack of a better term.  We store type and typmod of the result so that
- * some code doesn't need to know each function individually, and because
- * we would need to store typmod anyway for some of the datetime functions.
- * Note that currently, all variants return non-collating datatypes, so we do
- * not need a collation field; also, all these functions are stable.
- */
-typedef enum SQLValueFunctionOp
-{
-	SVFOP_CURRENT_DATE,
-	SVFOP_CURRENT_TIME,
-	SVFOP_CURRENT_TIME_N,
-	SVFOP_CURRENT_TIMESTAMP,
-	SVFOP_CURRENT_TIMESTAMP_N,
-	SVFOP_LOCALTIME,
-	SVFOP_LOCALTIME_N,
-	SVFOP_LOCALTIMESTAMP,
-	SVFOP_LOCALTIMESTAMP_N,
-	SVFOP_CURRENT_ROLE,
-	SVFOP_CURRENT_USER,
-	SVFOP_USER,
-	SVFOP_SESSION_USER,
-	SVFOP_CURRENT_CATALOG,
-	SVFOP_CURRENT_SCHEMA
-} SQLValueFunctionOp;
-
-typedef struct SQLValueFunction
-{
-	Expr		xpr;
-	SQLValueFunctionOp op;		/* which function this is */
-	Oid			type;			/* result type/typmod */
-	int32		typmod;
-	int			location;		/* token location, or -1 if unknown */
-} SQLValueFunction;
 
 /*
  * XmlExpr - various SQL/XML functions requiring special grammar productions
