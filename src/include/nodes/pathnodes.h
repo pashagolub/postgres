@@ -122,6 +122,9 @@ typedef struct PlannerGlobal
 	/* "flat" list of AppendRelInfos */
 	List	   *appendRelations;
 
+	/* List of PartitionPruneInfo contained in the plan */
+	List	   *partPruneInfos;
+
 	/* OIDs of relations the plan depends on */
 	List	   *relationOids;
 
@@ -503,6 +506,9 @@ struct PlannerInfo
 
 	/* Does this query modify any partition key columns? */
 	bool		partColsUpdated;
+
+	/* PartitionPruneInfos added in this query's plan. */
+	List	   *partPruneInfos;
 };
 
 
@@ -901,7 +907,7 @@ typedef struct RelOptInfo
 	 */
 	/* identifies server for the table or join */
 	Oid			serverid;
-	/* identifies user to check access as */
+	/* identifies user to check access as; 0 means to check as current user */
 	Oid			userid;
 	/* join is only valid for current user */
 	bool		useridiscurrent;

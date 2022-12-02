@@ -631,7 +631,7 @@ ExecCheckRTEPerms(RangeTblEntry *rte)
 	 * call it once in ExecCheckRTPerms and pass the userid down from there.
 	 * But for now, no need for the extra clutter.
 	 */
-	userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+	userid = OidIsValid(rte->checkAsUser) ? rte->checkAsUser : GetUserId();
 
 	/*
 	 * We must have *all* the requiredPerms bits, but some of the bits can be
@@ -825,6 +825,7 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	ExecInitRangeTable(estate, rangeTable);
 
 	estate->es_plannedstmt = plannedstmt;
+	estate->es_part_prune_infos = plannedstmt->partPruneInfos;
 
 	/*
 	 * Next, build the ExecRowMark array from the PlanRowMark(s), if any.
@@ -1255,9 +1256,11 @@ InitResultRelInfo(ResultRelInfo *resultRelInfo,
 	 * this field is filled in ExecInitModifyTable().
 	 */
 	resultRelInfo->ri_RootResultRelInfo = partition_root_rri;
-	resultRelInfo->ri_RootToPartitionMap = NULL;	/* set by
-													 * ExecInitRoutingInfo */
-	resultRelInfo->ri_PartitionTupleSlot = NULL;	/* ditto */
+	/* Set by ExecGetRootToChildMap */
+	resultRelInfo->ri_RootToChildMap = NULL;
+	resultRelInfo->ri_RootToChildMapValid = false;
+	/* Set by ExecInitRoutingInfo */
+	resultRelInfo->ri_PartitionTupleSlot = NULL;
 	resultRelInfo->ri_ChildToRootMap = NULL;
 	resultRelInfo->ri_ChildToRootMapValid = false;
 	resultRelInfo->ri_CopyMultiInsertBuffer = NULL;
