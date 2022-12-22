@@ -1646,7 +1646,7 @@ postgresReScanForeignScan(ForeignScanState *node)
 		return;
 
 	/*
-	 * If the node is async-capable, and an asynchronous fetch for it has been
+	 * If the node is async-capable, and an asynchronous fetch for it has
 	 * begun, the asynchronous fetch might not have yet completed.  Check if
 	 * the node is async-capable, and an asynchronous fetch for it is still in
 	 * progress; if so, complete the asynchronous fetch before restarting the
@@ -2017,16 +2017,16 @@ static int
 postgresGetForeignModifyBatchSize(ResultRelInfo *resultRelInfo)
 {
 	int			batch_size;
-	PgFdwModifyState *fmstate = resultRelInfo->ri_FdwState ?
-	(PgFdwModifyState *) resultRelInfo->ri_FdwState :
-	NULL;
+	PgFdwModifyState *fmstate = (PgFdwModifyState *) resultRelInfo->ri_FdwState;
 
 	/* should be called only once */
 	Assert(resultRelInfo->ri_BatchSize == 0);
 
 	/*
-	 * Should never get called when the insert is being performed as part of a
-	 * row movement operation.
+	 * Should never get called when the insert is being performed on a table
+	 * that is also among the target relations of an UPDATE operation,
+	 * because postgresBeginForeignInsert() currently rejects such insert
+	 * attempts.
 	 */
 	Assert(fmstate == NULL || fmstate->aux_fmstate == NULL);
 

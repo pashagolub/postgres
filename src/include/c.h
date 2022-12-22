@@ -324,7 +324,25 @@
  * pretty trivial: VA_ARGS_NARGS_() returns its 64th argument, and we set up
  * the call so that that is the appropriate one of the list of constants.
  * This idea is due to Laurent Deniau.
+ *
+ * MSVC has an implementation of __VA_ARGS__ that doesn't conform to the
+ * standard unless you use the /Zc:preprocessor compiler flag, but that
+ * isn't available before Visual Studio 2019.  For now, use a different
+ * definition that also works on older compilers.
  */
+#ifdef _MSC_VER
+#define EXPAND(args) args
+#define VA_ARGS_NARGS(...) \
+	VA_ARGS_NARGS_ EXPAND((__VA_ARGS__, \
+				   63,62,61,60,                   \
+				   59,58,57,56,55,54,53,52,51,50, \
+				   49,48,47,46,45,44,43,42,41,40, \
+				   39,38,37,36,35,34,33,32,31,30, \
+				   29,28,27,26,25,24,23,22,21,20, \
+				   19,18,17,16,15,14,13,12,11,10, \
+				   9, 8, 7, 6, 5, 4, 3, 2, 1, 0))
+#else
+
 #define VA_ARGS_NARGS(...) \
 	VA_ARGS_NARGS_(__VA_ARGS__, \
 				   63,62,61,60,                   \
@@ -334,6 +352,8 @@
 				   29,28,27,26,25,24,23,22,21,20, \
 				   19,18,17,16,15,14,13,12,11,10, \
 				   9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+#endif
+
 #define VA_ARGS_NARGS_( \
 	_01,_02,_03,_04,_05,_06,_07,_08,_09,_10, \
 	_11,_12,_13,_14,_15,_16,_17,_18,_19,_20, \
@@ -847,47 +867,50 @@ extern void ExceptionalCondition(const char *conditionName,
  * If the "condition" (a compile-time-constant expression) evaluates to false,
  * throw a compile error using the "errmessage" (a string literal).
  *
- * gcc 4.6 and up supports _Static_assert(), but there are bizarre syntactic
- * placement restrictions.  Macros StaticAssertStmt() and StaticAssertExpr()
+ * C11 has _Static_assert(), and most C99 compilers already support that.  For
+ * portability, we wrap it into StaticAssertDecl().  _Static_assert() is a
+ * "declaration", and so it must be placed where for example a variable
+ * declaration would be valid.  As long as we compile with
+ * -Wno-declaration-after-statement, that also means it cannot be placed after
+ * statements in a function.  Macros StaticAssertStmt() and StaticAssertExpr()
  * make it safe to use as a statement or in an expression, respectively.
- * The macro StaticAssertDecl() is suitable for use at file scope (outside of
- * any function).
  *
- * Otherwise we fall back on a kluge that assumes the compiler will complain
- * about a negative width for a struct bit-field.  This will not include a
- * helpful error message, but it beats not getting an error at all.
+ * For compilers without _Static_assert(), we fall back on a kluge that
+ * assumes the compiler will complain about a negative width for a struct
+ * bit-field.  This will not include a helpful error message, but it beats not
+ * getting an error at all.
  */
 #ifndef __cplusplus
 #ifdef HAVE__STATIC_ASSERT
+#define StaticAssertDecl(condition, errmessage) \
+	_Static_assert(condition, errmessage)
 #define StaticAssertStmt(condition, errmessage) \
 	do { _Static_assert(condition, errmessage); } while(0)
 #define StaticAssertExpr(condition, errmessage) \
 	((void) ({ StaticAssertStmt(condition, errmessage); true; }))
-#define StaticAssertDecl(condition, errmessage) \
-	_Static_assert(condition, errmessage)
 #else							/* !HAVE__STATIC_ASSERT */
+#define StaticAssertDecl(condition, errmessage) \
+	extern void static_assert_func(int static_assert_failure[(condition) ? 1 : -1])
 #define StaticAssertStmt(condition, errmessage) \
 	((void) sizeof(struct { int static_assert_failure : (condition) ? 1 : -1; }))
 #define StaticAssertExpr(condition, errmessage) \
 	StaticAssertStmt(condition, errmessage)
-#define StaticAssertDecl(condition, errmessage) \
-	extern void static_assert_func(int static_assert_failure[(condition) ? 1 : -1])
 #endif							/* HAVE__STATIC_ASSERT */
 #else							/* C++ */
 #if defined(__cpp_static_assert) && __cpp_static_assert >= 200410
+#define StaticAssertDecl(condition, errmessage) \
+	static_assert(condition, errmessage)
 #define StaticAssertStmt(condition, errmessage) \
 	static_assert(condition, errmessage)
 #define StaticAssertExpr(condition, errmessage) \
 	({ static_assert(condition, errmessage); })
-#define StaticAssertDecl(condition, errmessage) \
-	static_assert(condition, errmessage)
 #else							/* !__cpp_static_assert */
+#define StaticAssertDecl(condition, errmessage) \
+	extern void static_assert_func(int static_assert_failure[(condition) ? 1 : -1])
 #define StaticAssertStmt(condition, errmessage) \
 	do { struct static_assert_struct { int static_assert_failure : (condition) ? 1 : -1; }; } while(0)
 #define StaticAssertExpr(condition, errmessage) \
 	((void) ({ StaticAssertStmt(condition, errmessage); }))
-#define StaticAssertDecl(condition, errmessage) \
-	extern void static_assert_func(int static_assert_failure[(condition) ? 1 : -1])
 #endif							/* __cpp_static_assert */
 #endif							/* C++ */
 
