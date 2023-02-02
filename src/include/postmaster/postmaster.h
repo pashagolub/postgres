@@ -3,7 +3,7 @@
  * postmaster.h
  *	  Exports from postmaster/postmaster.c.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/postmaster/postmaster.h
@@ -15,7 +15,8 @@
 
 /* GUC options */
 extern PGDLLIMPORT bool EnableSSL;
-extern PGDLLIMPORT int ReservedBackends;
+extern PGDLLIMPORT int SuperuserReservedConnections;
+extern PGDLLIMPORT int ReservedConnections;
 extern PGDLLIMPORT int PostPortNumber;
 extern PGDLLIMPORT int Unix_socket_permissions;
 extern PGDLLIMPORT char *Unix_socket_group;

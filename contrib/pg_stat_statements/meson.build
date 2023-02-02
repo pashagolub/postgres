@@ -1,4 +1,4 @@
-# Copyright (c) 2022, PostgreSQL Global Development Group
+# Copyright (c) 2022-2023, PostgreSQL Global Development Group
 
 pg_stat_statements_sources = files(
   'pg_stat_statements.c',
@@ -41,6 +41,7 @@ tests += {
   'regress': {
     'sql': [
       'pg_stat_statements',
+      'oldextversions',
     ],
     'regress_args': ['--temp-config', files('pg_stat_statements.conf')],
     # Disabled because these tests require

@@ -8,7 +8,7 @@
  * stepping on each others' toes.  Formerly we used table-level locks
  * on pg_database, but that's too coarse-grained.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -121,7 +121,6 @@ static bool get_db_info(const char *name, LOCKMODE lockmode,
 						Oid *dbTablespace, char **dbCollate, char **dbCtype, char **dbIculocale,
 						char *dbLocProvider,
 						char **dbCollversion);
-static bool have_createdb_privilege(void);
 static void remove_dbtablespaces(Oid db_id);
 static bool check_db_file_conflict(Oid db_id);
 static int	errdetail_busy_db(int notherbackends, int npreparedxacts);
@@ -2742,7 +2741,7 @@ get_db_info(const char *name, LOCKMODE lockmode,
 }
 
 /* Check if current user has createdb privileges */
-static bool
+bool
 have_createdb_privilege(void)
 {
 	bool		result = false;

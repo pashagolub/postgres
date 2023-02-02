@@ -27,7 +27,7 @@
  * "CTID relop pseudoconstant", where relop is one of >,>=,<,<=, and
  * AND-clauses composed of such conditions.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -59,6 +59,7 @@ IsCTIDVar(Var *var, RelOptInfo *rel)
 	if (var->varattno == SelfItemPointerAttributeNumber &&
 		var->vartype == TIDOID &&
 		var->varno == rel->relid &&
+		var->varnullingrels == NULL &&
 		var->varlevelsup == 0)
 		return true;
 	return false;

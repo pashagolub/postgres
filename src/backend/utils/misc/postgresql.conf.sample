@@ -63,6 +63,7 @@
 					# (change requires restart)
 #port = 5432				# (change requires restart)
 #max_connections = 100			# (change requires restart)
+#reserved_connections = 0		# (change requires restart)
 #superuser_reserved_connections = 3	# (change requires restart)
 #unix_socket_directories = '/tmp'	# comma-separated list of directories
 					# (change requires restart)
@@ -359,6 +360,7 @@
 #max_logical_replication_workers = 4	# taken from max_worker_processes
 					# (change requires restart)
 #max_sync_workers_per_subscription = 2	# taken from max_logical_replication_workers
+#max_parallel_apply_workers_per_subscription = 2	# taken from max_logical_replication_workers
 
 
 #------------------------------------------------------------------------------
@@ -702,6 +704,7 @@
 #xmlbinary = 'base64'
 #xmloption = 'content'
 #gin_pending_list_limit = 4MB
+#createrole_self_grant = ''		# set and/or inherit
 
 # - Locale and Formatting -
 

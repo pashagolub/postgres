@@ -2293,7 +2293,7 @@ SELECT t1."C 1" FROM "S 1"."T 1" t1, LATERAL (SELECT DISTINCT t2.c1, t3.c1 FROM 
                ->  Subquery Scan on q
                      ->  HashAggregate
                            Output: t2.c1, t3.c1
-                           Group Key: t2.c1, t3.c1
+                           Group Key: t2.c1
                            ->  Foreign Scan
                                  Output: t2.c1, t3.c1
                                  Relations: (public.ft1 t2) INNER JOIN (public.ft2 t3)
@@ -2513,7 +2513,7 @@ SELECT * FROM local_tbl LEFT JOIN (SELECT ft1.*, COALESCE(ft1.c3 || ft2.c3, 'foo
 ALTER SERVER loopback OPTIONS (DROP extensions);
 ALTER SERVER loopback OPTIONS (ADD fdw_startup_cost '10000.0');
 EXPLAIN (VERBOSE, COSTS OFF)
-SELECT * FROM local_tbl LEFT JOIN (SELECT ft1.* FROM ft1 INNER JOIN ft2 ON (ft1.c1 = ft2.c1 AND ft1.c1 < 100 AND ft1.c1 = postgres_fdw_abs(ft2.c2))) ss ON (local_tbl.c3 = ss.c3) ORDER BY local_tbl.c1 FOR UPDATE OF local_tbl;
+SELECT * FROM local_tbl LEFT JOIN (SELECT ft1.* FROM ft1 INNER JOIN ft2 ON (ft1.c1 = ft2.c1 AND ft1.c1 < 100 AND (ft1.c1 - postgres_fdw_abs(ft2.c2)) = 0)) ss ON (local_tbl.c3 = ss.c3) ORDER BY local_tbl.c1 FOR UPDATE OF local_tbl;
                                                                                                                                                                                                                             QUERY PLAN                                                                                                                                                                                                                             
 -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  LockRows
@@ -2527,7 +2527,7 @@ SELECT * FROM local_tbl LEFT JOIN (SELECT ft1.* FROM ft1 INNER JOIN ft2 ON (ft1.
                Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*, ft2.*
                ->  Foreign Scan
                      Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*, ft2.*
-                     Filter: (ft1.c1 = postgres_fdw_abs(ft2.c2))
+                     Filter: ((ft1.c1 - postgres_fdw_abs(ft2.c2)) = 0)
                      Relations: (public.ft1) INNER JOIN (public.ft2)
                      Remote SQL: SELECT r4."C 1", r4.c2, r4.c3, r4.c4, r4.c5, r4.c6, r4.c7, r4.c8, CASE WHEN (r4.*)::text IS NOT NULL THEN ROW(r4."C 1", r4.c2, r4.c3, r4.c4, r4.c5, r4.c6, r4.c7, r4.c8) END, CASE WHEN (r5.*)::text IS NOT NULL THEN ROW(r5."C 1", r5.c2, r5.c3, r5.c4, r5.c5, r5.c6, r5.c7, r5.c8) END, r5.c2 FROM ("S 1"."T 1" r4 INNER JOIN "S 1"."T 1" r5 ON (((r5."C 1" = r4."C 1")) AND ((r4."C 1" < 100)))) ORDER BY r4.c3 ASC NULLS LAST
                      ->  Sort
@@ -2535,18 +2535,18 @@ SELECT * FROM local_tbl LEFT JOIN (SELECT ft1.* FROM ft1 INNER JOIN ft2 ON (ft1.
                            Sort Key: ft1.c3
                            ->  Merge Join
                                  Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*, ft2.*, ft2.c2
-                                 Merge Cond: ((ft1.c1 = (postgres_fdw_abs(ft2.c2))) AND (ft1.c1 = ft2.c1))
+                                 Merge Cond: (ft1.c1 = ft2.c1)
+                                 Join Filter: ((ft1.c1 - postgres_fdw_abs(ft2.c2)) = 0)
                                  ->  Sort
                                        Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*
                                        Sort Key: ft1.c1
                                        ->  Foreign Scan on public.ft1
                                              Output: ft1.c1, ft1.c2, ft1.c3, ft1.c4, ft1.c5, ft1.c6, ft1.c7, ft1.c8, ft1.*
                                              Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" WHERE (("C 1" < 100))
-                                 ->  Sort
-                                       Output: ft2.*, ft2.c1, ft2.c2, (postgres_fdw_abs(ft2.c2))
-                                       Sort Key: (postgres_fdw_abs(ft2.c2)), ft2.c1
+                                 ->  Materialize
+                                       Output: ft2.*, ft2.c1, ft2.c2
                                        ->  Foreign Scan on public.ft2
-                                             Output: ft2.*, ft2.c1, ft2.c2, postgres_fdw_abs(ft2.c2)
+                                             Output: ft2.*, ft2.c1, ft2.c2
                                              Remote SQL: SELECT "C 1", c2, c3, c4, c5, c6, c7, c8 FROM "S 1"."T 1" ORDER BY "C 1" ASC NULLS LAST
 (32 rows)
 
@@ -2606,7 +2606,7 @@ SELECT t1.c1, t2.c2 FROM v4 t1 LEFT JOIN v5 t2 ON (t1.c1 = t2.c1) ORDER BY t1.c1
  Foreign Scan
    Output: ft4.c1, ft5.c2, ft5.c1
    Relations: (public.ft4) LEFT JOIN (public.ft5)
-   Remote SQL: SELECT r6.c1, r9.c2, r9.c1 FROM ("S 1"."T 3" r6 LEFT JOIN "S 1"."T 4" r9 ON (((r6.c1 = r9.c1)))) ORDER BY r6.c1 ASC NULLS LAST, r9.c1 ASC NULLS LAST LIMIT 10::bigint OFFSET 10::bigint
+   Remote SQL: SELECT r4.c1, r5.c2, r5.c1 FROM ("S 1"."T 3" r4 LEFT JOIN "S 1"."T 4" r5 ON (((r4.c1 = r5.c1)))) ORDER BY r4.c1 ASC NULLS LAST, r5.c1 ASC NULLS LAST LIMIT 10::bigint OFFSET 10::bigint
 (4 rows)
 
 SELECT t1.c1, t2.c2 FROM v4 t1 LEFT JOIN v5 t2 ON (t1.c1 = t2.c1) ORDER BY t1.c1, t2.c1 OFFSET 10 LIMIT 10;
@@ -2669,7 +2669,7 @@ SELECT t1.c1, t2.c2 FROM v4 t1 LEFT JOIN ft5 t2 ON (t1.c1 = t2.c1) ORDER BY t1.c
  Foreign Scan
    Output: ft4.c1, t2.c2, t2.c1
    Relations: (public.ft4) LEFT JOIN (public.ft5 t2)
-   Remote SQL: SELECT r6.c1, r2.c2, r2.c1 FROM ("S 1"."T 3" r6 LEFT JOIN "S 1"."T 4" r2 ON (((r6.c1 = r2.c1)))) ORDER BY r6.c1 ASC NULLS LAST, r2.c1 ASC NULLS LAST LIMIT 10::bigint OFFSET 10::bigint
+   Remote SQL: SELECT r4.c1, r2.c2, r2.c1 FROM ("S 1"."T 3" r4 LEFT JOIN "S 1"."T 4" r2 ON (((r4.c1 = r2.c1)))) ORDER BY r4.c1 ASC NULLS LAST, r2.c1 ASC NULLS LAST LIMIT 10::bigint OFFSET 10::bigint
 (4 rows)
 
 SELECT t1.c1, t2.c2 FROM v4 t1 LEFT JOIN ft5 t2 ON (t1.c1 = t2.c1) ORDER BY t1.c1, t2.c1 OFFSET 10 LIMIT 10;
@@ -2864,16 +2864,13 @@ select c2 * (random() <= 1)::int as c2 from ft2 group by c2 * (random() <= 1)::i
 -- GROUP BY clause in various forms, cardinal, alias and constant expression
 explain (verbose, costs off)
 select count(c2) w, c2 x, 5 y, 7.0 z from ft1 group by 2, y, 9.0::int order by 2;
-                                      QUERY PLAN                                       
----------------------------------------------------------------------------------------
- Sort
+                                                 QUERY PLAN                                                 
+------------------------------------------------------------------------------------------------------------
+ Foreign Scan
    Output: (count(c2)), c2, 5, 7.0, 9
-   Sort Key: ft1.c2
-   ->  Foreign Scan
-         Output: (count(c2)), c2, 5, 7.0, 9
-         Relations: Aggregate on (public.ft1)
-         Remote SQL: SELECT count(c2), c2, 5, 7.0, 9 FROM "S 1"."T 1" GROUP BY 2, 3, 5
-(7 rows)
+   Relations: Aggregate on (public.ft1)
+   Remote SQL: SELECT count(c2), c2, 5, 7.0, 9 FROM "S 1"."T 1" GROUP BY 2, 3, 5 ORDER BY c2 ASC NULLS LAST
+(4 rows)
 
 select count(c2) w, c2 x, 5 y, 7.0 z from ft1 group by 2, y, 9.0::int order by 2;
   w  | x | y |  z  
@@ -2990,14 +2987,13 @@ select exists(select 1 from pg_enum), sum(c1) from ft1 group by 1;
                     QUERY PLAN                     
 ---------------------------------------------------
  GroupAggregate
-   Output: ($0), sum(ft1.c1)
-   Group Key: $0
+   Output: $0, sum(ft1.c1)
    InitPlan 1 (returns $0)
      ->  Seq Scan on pg_catalog.pg_enum
    ->  Foreign Scan on public.ft1
-         Output: $0, ft1.c1
+         Output: ft1.c1
          Remote SQL: SELECT "C 1" FROM "S 1"."T 1"
-(8 rows)
+(7 rows)
 
 select exists(select 1 from pg_enum), sum(c1) from ft1 group by 1;
  exists |  sum   
@@ -3382,14 +3378,13 @@ select array_agg(c1 order by c1 using operator(public.<^)) from ft2 where c2 = 6
 --------------------------------------------------------------------------------------------------
  GroupAggregate
    Output: array_agg(c1 ORDER BY c1 USING <^ NULLS LAST), c2
-   Group Key: ft2.c2
    ->  Sort
-         Output: c2, c1
+         Output: c1, c2
          Sort Key: ft2.c1 USING <^
          ->  Foreign Scan on public.ft2
-               Output: c2, c1
+               Output: c1, c2
                Remote SQL: SELECT "C 1", c2 FROM "S 1"."T 1" WHERE (("C 1" < 100)) AND ((c2 = 6))
-(9 rows)
+(8 rows)
 
 -- This should not be pushed either.
 explain (verbose, costs off)
@@ -3458,14 +3453,13 @@ select array_agg(c1 order by c1 using operator(public.<^)) from ft2 where c2 = 6
 --------------------------------------------------------------------------------------------------
  GroupAggregate
    Output: array_agg(c1 ORDER BY c1 USING <^ NULLS LAST), c2
-   Group Key: ft2.c2
    ->  Sort
-         Output: c2, c1
+         Output: c1, c2
          Sort Key: ft2.c1 USING <^
          ->  Foreign Scan on public.ft2
-               Output: c2, c1
+               Output: c1, c2
                Remote SQL: SELECT "C 1", c2 FROM "S 1"."T 1" WHERE (("C 1" < 100)) AND ((c2 = 6))
-(9 rows)
+(8 rows)
 
 -- Cleanup
 drop operator class my_op_class using btree;
@@ -6557,10 +6551,10 @@ CREATE VIEW rw_view AS SELECT * FROM foreign_tbl
  a      | integer |           |          |         | plain   | 
  b      | integer |           |          |         | plain   | 
 View definition:
- SELECT foreign_tbl.a,
-    foreign_tbl.b
+ SELECT a,
+    b
    FROM foreign_tbl
-  WHERE foreign_tbl.a < foreign_tbl.b;
+  WHERE a < b;
 Options: check_option=cascaded
 
 EXPLAIN (VERBOSE, COSTS OFF)
@@ -6674,10 +6668,10 @@ CREATE VIEW rw_view AS SELECT * FROM parent_tbl
  a      | integer |           |          |         | plain   | 
  b      | integer |           |          |         | plain   | 
 View definition:
- SELECT parent_tbl.a,
-    parent_tbl.b
+ SELECT a,
+    b
    FROM parent_tbl
-  WHERE parent_tbl.a < parent_tbl.b;
+  WHERE a < b;
 Options: check_option=cascaded
 
 EXPLAIN (VERBOSE, COSTS OFF)
@@ -6768,6 +6762,42 @@ DROP TRIGGER row_before_insupd_trigger ON child_tbl;
 DROP TABLE parent_tbl CASCADE;
 NOTICE:  drop cascades to view rw_view
 DROP FUNCTION row_before_insupd_trigfunc;
+-- Try a more complex permutation of WCO where there are multiple levels of
+-- partitioned tables with columns not all in the same order
+CREATE TABLE parent_tbl (a int, b text, c numeric) PARTITION BY RANGE(a);
+CREATE TABLE sub_parent (c numeric, a int, b text) PARTITION BY RANGE(a);
+ALTER TABLE parent_tbl ATTACH PARTITION sub_parent FOR VALUES FROM (1) TO (10);
+CREATE TABLE child_local (b text, c numeric, a int);
+CREATE FOREIGN TABLE child_foreign (b text, c numeric, a int)
+  SERVER loopback OPTIONS (table_name 'child_local');
+ALTER TABLE sub_parent ATTACH PARTITION child_foreign FOR VALUES FROM (1) TO (10);
+CREATE VIEW rw_view AS SELECT * FROM parent_tbl WHERE a < 5 WITH CHECK OPTION;
+INSERT INTO parent_tbl (a) VALUES(1),(5);
+EXPLAIN (VERBOSE, COSTS OFF)
+UPDATE rw_view SET b = 'text', c = 123.456;
+                                           QUERY PLAN                                            
+-------------------------------------------------------------------------------------------------
+ Update on public.parent_tbl
+   Foreign Update on public.child_foreign parent_tbl_1
+     Remote SQL: UPDATE public.child_local SET b = $2, c = $3 WHERE ctid = $1 RETURNING a
+   ->  Foreign Scan on public.child_foreign parent_tbl_1
+         Output: 'text'::text, 123.456, parent_tbl_1.tableoid, parent_tbl_1.ctid, parent_tbl_1.*
+         Remote SQL: SELECT b, c, a, ctid FROM public.child_local WHERE ((a < 5)) FOR UPDATE
+(6 rows)
+
+UPDATE rw_view SET b = 'text', c = 123.456;
+SELECT * FROM parent_tbl ORDER BY a;
+ a |  b   |    c    
+---+------+---------
+ 1 | text | 123.456
+ 5 |      |        
+(2 rows)
+
+DROP VIEW rw_view;
+DROP TABLE child_local;
+DROP FOREIGN TABLE child_foreign;
+DROP TABLE sub_parent;
+DROP TABLE parent_tbl;
 -- ===================================================================
 -- test serial columns (ie, sequence-based defaults)
 -- ===================================================================
@@ -11743,3 +11773,28 @@ SELECT * FROM prem2;
 
 ALTER SERVER loopback OPTIONS (DROP parallel_commit);
 ALTER SERVER loopback2 OPTIONS (DROP parallel_commit);
+-- ===================================================================
+-- test for ANALYZE sampling
+-- ===================================================================
+CREATE TABLE analyze_table (id int, a text, b bigint);
+CREATE FOREIGN TABLE analyze_ftable (id int, a text, b bigint)
+       SERVER loopback OPTIONS (table_name 'analyze_rtable1');
+INSERT INTO analyze_table (SELECT x FROM generate_series(1,1000) x);
+ANALYZE analyze_table;
+SET default_statistics_target = 10;
+ANALYZE analyze_table;
+ALTER SERVER loopback OPTIONS (analyze_sampling 'invalid');
+ERROR:  invalid value for string option "analyze_sampling": invalid
+ALTER SERVER loopback OPTIONS (analyze_sampling 'auto');
+ANALYZE analyze_table;
+ALTER SERVER loopback OPTIONS (SET analyze_sampling 'system');
+ANALYZE analyze_table;
+ALTER SERVER loopback OPTIONS (SET analyze_sampling 'bernoulli');
+ANALYZE analyze_table;
+ALTER SERVER loopback OPTIONS (SET analyze_sampling 'random');
+ANALYZE analyze_table;
+ALTER SERVER loopback OPTIONS (SET analyze_sampling 'off');
+ANALYZE analyze_table;
+-- cleanup
+DROP FOREIGN TABLE analyze_ftable;
+DROP TABLE analyze_table;

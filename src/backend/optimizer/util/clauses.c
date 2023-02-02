@@ -3,7 +3,7 @@
  * clauses.c
  *	  routines to manipulate qualification clauses
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -2004,14 +2004,16 @@ is_pseudo_constant_clause_relids(Node *clause, Relids relids)
  * NumRelids
  *		(formerly clause_relids)
  *
- * Returns the number of different relations referenced in 'clause'.
+ * Returns the number of different base relations referenced in 'clause'.
  */
 int
 NumRelids(PlannerInfo *root, Node *clause)
 {
+	int			result;
 	Relids		varnos = pull_varnos(root, clause);
-	int			result = bms_num_members(varnos);
 
+	varnos = bms_del_members(varnos, root->outer_join_rels);
+	result = bms_num_members(varnos);
 	bms_free(varnos);
 	return result;
 }

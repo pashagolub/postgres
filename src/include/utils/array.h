@@ -51,7 +51,7 @@
  * arrays holding the elements.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/array.h
@@ -409,6 +409,9 @@ extern bool array_contains_nulls(ArrayType *array);
 
 extern ArrayBuildState *initArrayResult(Oid element_type,
 										MemoryContext rcontext, bool subcontext);
+extern ArrayBuildState *initArrayResultWithSize(Oid element_type,
+												MemoryContext rcontext,
+												bool subcontext, int initsize);
 extern ArrayBuildState *accumArrayResult(ArrayBuildState *astate,
 										 Datum dvalue, bool disnull,
 										 Oid element_type,

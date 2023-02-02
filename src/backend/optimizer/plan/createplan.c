@@ -5,7 +5,7 @@
  *	  Planning is complete, we just need to convert the selected
  *	  Path into a Plan.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -2404,7 +2404,7 @@ create_groupingsets_plan(PlannerInfo *root, GroupingSetsPath *best_path)
 	 * sizing.
 	 */
 	maxref = 0;
-	foreach(lc, root->parse->groupClause)
+	foreach(lc, root->processed_groupClause)
 	{
 		SortGroupClause *gc = (SortGroupClause *) lfirst(lc);
 
@@ -2415,7 +2415,7 @@ create_groupingsets_plan(PlannerInfo *root, GroupingSetsPath *best_path)
 	grouping_map = (AttrNumber *) palloc0((maxref + 1) * sizeof(AttrNumber));
 
 	/* Now look up the column numbers in the child's tlist */
-	foreach(lc, root->parse->groupClause)
+	foreach(lc, root->processed_groupClause)
 	{
 		SortGroupClause *gc = (SortGroupClause *) lfirst(lc);
 		TargetEntry *tle = get_sortgroupclause_tle(gc, subplan->targetlist);
@@ -3017,6 +3017,9 @@ create_indexscan_plan(PlannerInfo *root,
 	/* it should be a base rel... */
 	Assert(baserelid > 0);
 	Assert(best_path->path.parent->rtekind == RTE_RELATION);
+	/* check the scan direction is valid */
+	Assert(best_path->indexscandir == ForwardScanDirection ||
+		   best_path->indexscandir == BackwardScanDirection);
 
 	/*
 	 * Extract the index qual expressions (stripped of RestrictInfos) from the
@@ -4158,13 +4161,21 @@ create_foreignscan_plan(PlannerInfo *root, ForeignPath *best_path,
 
 	/*
 	 * Likewise, copy the relids that are represented by this foreign scan. An
-	 * upper rel doesn't have relids set, but it covers all the base relations
-	 * participating in the underlying scan, so use root's all_baserels.
+	 * upper rel doesn't have relids set, but it covers all the relations
+	 * participating in the underlying scan/join, so use root->all_query_rels.
 	 */
 	if (rel->reloptkind == RELOPT_UPPER_REL)
-		scan_plan->fs_relids = root->all_baserels;
+		scan_plan->fs_relids = root->all_query_rels;
 	else
 		scan_plan->fs_relids = best_path->path.parent->relids;
+
+	/*
+	 * Join relid sets include relevant outer joins, but FDWs may need to know
+	 * which are the included base rels.  That's a bit tedious to get without
+	 * access to the plan-time data structures, so compute it here.
+	 */
+	scan_plan->fs_base_relids = bms_difference(scan_plan->fs_relids,
+											   root->outer_join_rels);
 
 	/*
 	 * If this is a foreign join, and to make it valid to push down we had to
@@ -5806,8 +5817,9 @@ make_foreignscan(List *qptlist,
 	node->fdw_private = fdw_private;
 	node->fdw_scan_tlist = fdw_scan_tlist;
 	node->fdw_recheck_quals = fdw_recheck_quals;
-	/* fs_relids will be filled in by create_foreignscan_plan */
+	/* fs_relids, fs_base_relids will be filled by create_foreignscan_plan */
 	node->fs_relids = NULL;
+	node->fs_base_relids = NULL;
 	/* fsSystemCol will be filled in by create_foreignscan_plan */
 	node->fsSystemCol = false;
 
@@ -6201,10 +6213,7 @@ prepare_sort_from_pathkeys(Plan *lefttree, List *pathkeys,
 			 * the pathkey's EquivalenceClass.  For now, we take the first
 			 * tlist item found in the EC. If there's no match, we'll generate
 			 * a resjunk entry using the first EC member that is an expression
-			 * in the input's vars.  (The non-const restriction only matters
-			 * if the EC is below_outer_join; but if it isn't, it won't
-			 * contain consts anyway, else we'd have discarded the pathkey as
-			 * redundant.)
+			 * in the input's vars.
 			 *
 			 * XXX if we have a choice, is there any way of figuring out which
 			 * might be cheapest to execute?  (For example, int4lt is likely

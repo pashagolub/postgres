@@ -10,7 +10,7 @@
  * their fields are intended to be constant, some fields change at runtime.
  *
  *
- * Copyright (c) 2000-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2023, PostgreSQL Global Development Group
  * Written by Peter Eisentraut <peter_e@gmx.net>.
  *
  * IDENTIFICATION
@@ -43,6 +43,7 @@
 #include "jit/jit.h"
 #include "libpq/auth.h"
 #include "libpq/libpq.h"
+#include "nodes/queryjumble.h"
 #include "optimizer/cost.h"
 #include "optimizer/geqo.h"
 #include "optimizer/optimizer.h"
@@ -77,7 +78,6 @@
 #include "utils/pg_locale.h"
 #include "utils/portal.h"
 #include "utils/ps_status.h"
-#include "utils/queryjumble.h"
 #include "utils/inval.h"
 #include "utils/xml.h"
 
@@ -392,6 +392,12 @@ static const struct config_enum_entry ssl_protocol_versions_info[] = {
 	{"TLSv1.1", PG_TLS1_1_VERSION, false},
 	{"TLSv1.2", PG_TLS1_2_VERSION, false},
 	{"TLSv1.3", PG_TLS1_3_VERSION, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry logical_replication_mode_options[] = {
+	{"buffered", LOGICAL_REP_MODE_BUFFERED, false},
+	{"immediate", LOGICAL_REP_MODE_IMMEDIATE, false},
 	{NULL, 0, false}
 };
 
@@ -2157,8 +2163,19 @@ struct config_int ConfigureNamesInt[] =
 			gettext_noop("Sets the number of connection slots reserved for superusers."),
 			NULL
 		},
-		&ReservedBackends,
+		&SuperuserReservedConnections,
 		3, 0, MAX_BACKENDS,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"reserved_connections", PGC_POSTMASTER, CONN_AUTH_SETTINGS,
+			gettext_noop("Sets the number of connection slots reserved for roles "
+						 "with privileges of pg_use_reserved_connections."),
+			NULL
+		},
+		&ReservedConnections,
+		0, 0, MAX_BACKENDS,
 		NULL, NULL, NULL
 	},
 
@@ -2997,6 +3014,18 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"max_parallel_apply_workers_per_subscription",
+			PGC_SIGHUP,
+			REPLICATION_SUBSCRIBERS,
+			gettext_noop("Maximum number of parallel apply workers per subscription."),
+			NULL,
+		},
+		&max_parallel_apply_workers_per_subscription,
+		2, 0, MAX_PARALLEL_WORKER_LIMIT,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"log_rotation_age", PGC_SIGHUP, LOGGING_WHERE,
 			gettext_noop("Sets the amount of time to wait before forcing "
 						 "log file rotation."),
@@ -3695,7 +3724,7 @@ struct config_real ConfigureNamesReal[] =
 		},
 		&CheckPointCompletionTarget,
 		0.9, 0.0, 1.0,
-		NULL, NULL, NULL
+		NULL, assign_checkpoint_completion_target, NULL
 	},
 
 	{
@@ -3929,6 +3958,18 @@ struct config_string ConfigureNamesString[] =
 		&temp_tablespaces,
 		"",
 		check_temp_tablespaces, assign_temp_tablespaces, NULL
+	},
+
+	{
+		{"createrole_self_grant", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Sets whether a CREATEROLE user automatically grants "
+						 "the role to themselves, and with which options."),
+			NULL,
+			GUC_LIST_INPUT
+		},
+		&createrole_self_grant,
+		"",
+		check_createrole_self_grant, assign_createrole_self_grant, NULL
 	},
 
 	{
@@ -4874,6 +4915,19 @@ struct config_enum ConfigureNamesEnum[] =
 		},
 		&recovery_init_sync_method,
 		RECOVERY_INIT_SYNC_METHOD_FSYNC, recovery_init_sync_method_options,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"logical_replication_mode", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Controls when to replicate or apply each change."),
+			gettext_noop("On the publisher, it allows streaming or serializing each change in logical decoding. "
+						 "On the subscriber, it allows serialization of all changes to files and notifies the "
+						 "parallel apply workers to read and apply them at the end of the transaction."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&logical_replication_mode,
+		LOGICAL_REP_MODE_BUFFERED, logical_replication_mode_options,
 		NULL, NULL, NULL
 	},
 

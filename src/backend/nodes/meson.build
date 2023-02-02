@@ -1,4 +1,4 @@
-# Copyright (c) 2022, PostgreSQL Global Development Group
+# Copyright (c) 2022-2023, PostgreSQL Global Development Group
 
 backend_sources += files(
   'bitmapset.c',
@@ -20,6 +20,7 @@ backend_sources += files(
 nodefunc_sources = files(
   'copyfuncs.c',
   'equalfuncs.c',
+  'queryjumblefuncs.c',
   'outfuncs.c',
   'readfuncs.c',
 )

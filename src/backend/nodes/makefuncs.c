@@ -4,7 +4,7 @@
  *	  creator functions for various nodes. The functions here are for the
  *	  most frequently created nodes.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -80,11 +80,13 @@ makeVar(int varno,
 	var->varlevelsup = varlevelsup;
 
 	/*
-	 * Only a few callers need to make Var nodes with varnosyn/varattnosyn
-	 * different from varno/varattno.  We don't provide separate arguments for
-	 * them, but just initialize them to the given varno/varattno.  This
-	 * reduces code clutter and chance of error for most callers.
+	 * Only a few callers need to make Var nodes with non-null varnullingrels,
+	 * or with varnosyn/varattnosyn different from varno/varattno.  We don't
+	 * provide separate arguments for them, but just initialize them to NULL
+	 * and the given varno/varattno.  This reduces code clutter and chance of
+	 * error for most callers.
 	 */
+	var->varnullingrels = NULL;
 	var->varnosyn = (Index) varno;
 	var->varattnosyn = varattno;
 

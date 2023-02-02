@@ -12,7 +12,7 @@
  * CLUSTER, handled in cluster.c.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -41,6 +41,7 @@
 #include "catalog/pg_namespace.h"
 #include "commands/cluster.h"
 #include "commands/defrem.h"
+#include "commands/tablecmds.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -91,7 +92,8 @@ static void vac_truncate_clog(TransactionId frozenXID,
 							  MultiXactId minMulti,
 							  TransactionId lastSaneFrozenXid,
 							  MultiXactId lastSaneMinMulti);
-static bool vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params);
+static bool vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params,
+					   bool skip_privs);
 static double compute_parallel_delay(void);
 static VacOptValue get_vacoptval_from_boolean(DefElem *def);
 static bool vac_tid_reaped(ItemPointer itemptr, void *state);
@@ -114,6 +116,8 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 	bool		full = false;
 	bool		disable_page_skipping = false;
 	bool		process_toast = true;
+	bool		skip_database_stats = false;
+	bool		only_database_stats = false;
 	ListCell   *lc;
 
 	/* index_cleanup and truncate values unspecified for now */
@@ -200,6 +204,10 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 					params.nworkers = nworkers;
 			}
 		}
+		else if (strcmp(opt->defname, "skip_database_stats") == 0)
+			skip_database_stats = defGetBoolean(opt);
+		else if (strcmp(opt->defname, "only_database_stats") == 0)
+			only_database_stats = defGetBoolean(opt);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -216,7 +224,9 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 		(freeze ? VACOPT_FREEZE : 0) |
 		(full ? VACOPT_FULL : 0) |
 		(disable_page_skipping ? VACOPT_DISABLE_PAGE_SKIPPING : 0) |
-		(process_toast ? VACOPT_PROCESS_TOAST : 0);
+		(process_toast ? VACOPT_PROCESS_TOAST : 0) |
+		(skip_database_stats ? VACOPT_SKIP_DATABASE_STATS : 0) |
+		(only_database_stats ? VACOPT_ONLY_DATABASE_STATS : 0);
 
 	/* sanity checks on options */
 	Assert(params.options & (VACOPT_VACUUM | VACOPT_ANALYZE));
@@ -349,6 +359,24 @@ vacuum(List *relations, VacuumParams *params,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("PROCESS_TOAST required with VACUUM FULL")));
 
+	/* sanity check for ONLY_DATABASE_STATS */
+	if (params->options & VACOPT_ONLY_DATABASE_STATS)
+	{
+		Assert(params->options & VACOPT_VACUUM);
+		if (relations != NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("ONLY_DATABASE_STATS cannot be specified with a list of tables")));
+		/* don't require people to turn off PROCESS_TOAST explicitly */
+		if (params->options & ~(VACOPT_VACUUM |
+								VACOPT_VERBOSE |
+								VACOPT_PROCESS_TOAST |
+								VACOPT_ONLY_DATABASE_STATS))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("ONLY_DATABASE_STATS cannot be specified with other VACUUM options")));
+	}
+
 	/*
 	 * Create special memory context for cross-transaction storage.
 	 *
@@ -376,7 +404,12 @@ vacuum(List *relations, VacuumParams *params,
 	 * Build list of relation(s) to process, putting any new data in
 	 * vac_context for safekeeping.
 	 */
-	if (relations != NIL)
+	if (params->options & VACOPT_ONLY_DATABASE_STATS)
+	{
+		/* We don't process any tables in this case */
+		Assert(relations == NIL);
+	}
+	else if (relations != NIL)
 	{
 		List	   *newrels = NIL;
 		ListCell   *lc;
@@ -470,7 +503,7 @@ vacuum(List *relations, VacuumParams *params,
 
 			if (params->options & VACOPT_VACUUM)
 			{
-				if (!vacuum_rel(vrel->oid, vrel->relation, params))
+				if (!vacuum_rel(vrel->oid, vrel->relation, params, false))
 					continue;
 			}
 
@@ -528,11 +561,11 @@ vacuum(List *relations, VacuumParams *params,
 		StartTransactionCommand();
 	}
 
-	if ((params->options & VACOPT_VACUUM) && !IsAutoVacuumWorkerProcess())
+	if ((params->options & VACOPT_VACUUM) &&
+		!(params->options & VACOPT_SKIP_DATABASE_STATS))
 	{
 		/*
 		 * Update pg_database.datfrozenxid, and truncate pg_xact if possible.
-		 * (autovacuum.c does this for itself.)
 		 */
 		vac_update_datfrozenxid();
 	}
@@ -560,17 +593,20 @@ vacuum_is_permitted_for_relation(Oid relid, Form_pg_class reltuple,
 
 	Assert((options & (VACOPT_VACUUM | VACOPT_ANALYZE)) != 0);
 
-	/*
+	/*----------
 	 * A role has privileges to vacuum or analyze the relation if any of the
 	 * following are true:
 	 *   - the role is a superuser
 	 *   - the role owns the relation
 	 *   - the role owns the current database and the relation is not shared
 	 *   - the role has been granted the MAINTAIN privilege on the relation
+	 *   - the role has privileges to vacuum/analyze any of the relation's
+	 *     partition ancestors
+	 *----------
 	 */
-	if (object_ownercheck(RelationRelationId, relid, GetUserId()) ||
-		(object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) && !reltuple->relisshared) ||
-		pg_class_aclcheck(relid, GetUserId(), ACL_MAINTAIN) == ACLCHECK_OK)
+	if ((object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) && !reltuple->relisshared) ||
+		pg_class_aclcheck(relid, GetUserId(), ACL_MAINTAIN) == ACLCHECK_OK ||
+		has_partition_ancestor_privs(relid, GetUserId(), ACL_MAINTAIN))
 		return true;
 
 	relname = NameStr(reltuple->relname);
@@ -874,10 +910,6 @@ get_all_vacuum_rels(int options)
 		MemoryContext oldcontext;
 		Oid			relid = classForm->oid;
 
-		/* check permissions of relation */
-		if (!vacuum_is_permitted_for_relation(relid, classForm, options))
-			continue;
-
 		/*
 		 * We include partitioned tables here; depending on which operation is
 		 * to be performed, caller will decide whether to process or ignore
@@ -886,6 +918,10 @@ get_all_vacuum_rels(int options)
 		if (classForm->relkind != RELKIND_RELATION &&
 			classForm->relkind != RELKIND_MATVIEW &&
 			classForm->relkind != RELKIND_PARTITIONED_TABLE)
+			continue;
+
+		/* check permissions of relation */
+		if (!vacuum_is_permitted_for_relation(relid, classForm, options))
 			continue;
 
 		/*
@@ -1796,7 +1832,7 @@ vac_truncate_clog(TransactionId frozenXID,
  *		At entry and exit, we are not inside a transaction.
  */
 static bool
-vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
+vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params, bool skip_privs)
 {
 	LOCKMODE	lmode;
 	Relation	rel;
@@ -1883,7 +1919,8 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 	 * happen across multiple transactions where privileges could have changed
 	 * in-between.  Make sure to only generate logs for VACUUM in this case.
 	 */
-	if (!vacuum_is_permitted_for_relation(RelationGetRelid(rel),
+	if (!skip_privs &&
+		!vacuum_is_permitted_for_relation(RelationGetRelid(rel),
 										  rel->rd_rel,
 										  params->options & VACOPT_VACUUM))
 	{
@@ -2057,7 +2094,7 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 	 * totally unimportant for toast relations.
 	 */
 	if (toast_relid != InvalidOid)
-		vacuum_rel(toast_relid, NULL, params);
+		vacuum_rel(toast_relid, NULL, params, true);
 
 	/*
 	 * Now release the session-level lock on the main table.

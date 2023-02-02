@@ -1,4 +1,4 @@
-# Copyright (c) 2022, PostgreSQL Global Development Group
+# Copyright (c) 2022-2023, PostgreSQL Global Development Group
 
 pg_walinspect_sources = files('pg_walinspect.c')
 
@@ -19,6 +19,7 @@ contrib_targets += pg_walinspect
 install_data(
   'pg_walinspect.control',
   'pg_walinspect--1.0.sql',
+  'pg_walinspect--1.0--1.1.sql',
   kwargs: contrib_data_args,
 )
 

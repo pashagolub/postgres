@@ -3,7 +3,7 @@
  * encode.c
  *	  Various data encoding/decoding things.
  *
- * Copyright (c) 2001-2022, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2023, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -18,6 +18,7 @@
 #include "mb/pg_wchar.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
+#include "varatt.h"
 
 
 /*

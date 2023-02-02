@@ -9,7 +9,7 @@
  * context's MemoryContextMethods struct.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -717,10 +717,10 @@ MemoryContextStatsDetail(MemoryContext context, int max_children,
 		 * to the connected client.
 		 *
 		 * We don't buffer the information about all memory contexts in a
-		 * backend into StringInfo and log it as one message. Otherwise which
-		 * may require the buffer to be enlarged very much and lead to OOM
-		 * error since there can be a large number of memory contexts in a
-		 * backend. Instead, we log one message per memory context.
+		 * backend into StringInfo and log it as one message.  That would
+		 * require the buffer to be enlarged, risking an OOM as there could
+		 * be a large number of memory contexts in a backend.  Instead, we
+		 * log one message per memory context.
 		 */
 		ereport(LOG_SERVER_ONLY,
 				(errhidestmt(true),

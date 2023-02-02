@@ -3,7 +3,7 @@
  * timestamp.c
  *	  Functions for the built-in SQL types "timestamp" and "interval".
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -1606,10 +1606,7 @@ current_timestamp(PG_FUNCTION_ARGS)
 	int32		typmod = -1;
 
 	if (!PG_ARGISNULL(0))
-	{
-		typmod = PG_GETARG_INT32(0);
-		anytimestamp_typmod_check(true, typmod);
-	}
+		typmod = anytimestamp_typmod_check(true, PG_GETARG_INT32(0));
 
 	ts = GetCurrentTransactionStartTimestamp();
 	if (typmod >= 0)
@@ -1627,10 +1624,7 @@ sql_localtimestamp(PG_FUNCTION_ARGS)
 	int32		typmod = -1;
 
 	if (!PG_ARGISNULL(0))
-	{
-		typmod = PG_GETARG_INT32(0);
-		anytimestamp_typmod_check(false, typmod);
-	}
+		typmod = anytimestamp_typmod_check(false, PG_GETARG_INT32(0));
 
 	ts = timestamptz2timestamp(GetCurrentTransactionStartTimestamp());
 	if (typmod >= 0)
@@ -1696,15 +1690,14 @@ TimestampDifference(TimestampTz start_time, TimestampTz stop_time,
  *
  * This is typically used to calculate a wait timeout for WaitLatch()
  * or a related function.  The choice of "long" as the result type
- * is to harmonize with that.  It is caller's responsibility that the
- * input timestamps not be so far apart as to risk overflow of "long"
- * (which'd happen at about 25 days on machines with 32-bit "long").
- *
- * Both inputs must be ordinary finite timestamps (in current usage,
- * they'll be results from GetCurrentTimestamp()).
+ * is to harmonize with that; furthermore, we clamp the result to at most
+ * INT_MAX milliseconds, because that's all that WaitLatch() allows.
  *
  * We expect start_time <= stop_time.  If not, we return zero,
  * since then we're already past the previously determined stop_time.
+ *
+ * Subtracting finite and infinite timestamps works correctly, returning
+ * zero or INT_MAX as appropriate.
  *
  * Note we round up any fractional millisecond, since waiting for just
  * less than the intended timeout is undesirable.
@@ -1712,10 +1705,16 @@ TimestampDifference(TimestampTz start_time, TimestampTz stop_time,
 long
 TimestampDifferenceMilliseconds(TimestampTz start_time, TimestampTz stop_time)
 {
-	TimestampTz diff = stop_time - start_time;
+	TimestampTz diff;
 
-	if (diff <= 0)
+	/* Deal with zero or negative elapsed time quickly. */
+	if (start_time >= stop_time)
 		return 0;
+	/* To not fail with timestamp infinities, we must detect overflow. */
+	if (pg_sub_s64_overflow(stop_time, start_time, &diff))
+		return (long) INT_MAX;
+	if (diff >= (INT_MAX * INT64CONST(1000) - 999))
+		return (long) INT_MAX;
 	else
 		return (long) ((diff + 999) / 1000);
 }

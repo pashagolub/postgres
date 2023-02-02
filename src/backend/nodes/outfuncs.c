@@ -3,7 +3,7 @@
  * outfuncs.c
  *	  Output functions for Postgres tree nodes.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -468,7 +468,6 @@ _outEquivalenceClass(StringInfo str, const EquivalenceClass *node)
 	WRITE_BITMAPSET_FIELD(ec_relids);
 	WRITE_BOOL_FIELD(ec_has_const);
 	WRITE_BOOL_FIELD(ec_has_volatile);
-	WRITE_BOOL_FIELD(ec_below_outer_join);
 	WRITE_BOOL_FIELD(ec_broken);
 	WRITE_UINT_FIELD(ec_sortref);
 	WRITE_UINT_FIELD(ec_min_security);
@@ -512,6 +511,10 @@ _outRangeTblEntry(StringInfo str, const RangeTblEntry *node)
 		case RTE_SUBQUERY:
 			WRITE_NODE_FIELD(subquery);
 			WRITE_BOOL_FIELD(security_barrier);
+			/* we re-use these RELATION fields, too: */
+			WRITE_OID_FIELD(relid);
+			WRITE_INT_FIELD(rellockmode);
+			WRITE_UINT_FIELD(perminfoindex);
 			break;
 		case RTE_JOIN:
 			WRITE_ENUM_FIELD(jointype, JoinType);
@@ -545,10 +548,11 @@ _outRangeTblEntry(StringInfo str, const RangeTblEntry *node)
 		case RTE_NAMEDTUPLESTORE:
 			WRITE_STRING_FIELD(enrname);
 			WRITE_FLOAT_FIELD(enrtuples);
-			WRITE_OID_FIELD(relid);
 			WRITE_NODE_FIELD(coltypes);
 			WRITE_NODE_FIELD(coltypmods);
 			WRITE_NODE_FIELD(colcollations);
+			/* we re-use these RELATION fields, too: */
+			WRITE_OID_FIELD(relid);
 			break;
 		case RTE_RESULT:
 			/* no extra fields */
@@ -561,7 +565,6 @@ _outRangeTblEntry(StringInfo str, const RangeTblEntry *node)
 	WRITE_BOOL_FIELD(lateral);
 	WRITE_BOOL_FIELD(inh);
 	WRITE_BOOL_FIELD(inFromCl);
-	WRITE_BITMAPSET_FIELD(extraUpdatedCols);
 	WRITE_NODE_FIELD(securityQuals);
 }
 

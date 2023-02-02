@@ -5,7 +5,7 @@
  *
  * See src/backend/utils/misc/README for design notes.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  *
  *	  src/include/utils/guc_tables.h
  *
@@ -291,6 +291,9 @@ extern struct config_generic **get_explain_guc_options(int *num);
 
 /* get string value of variable */
 extern char *ShowGUCOption(struct config_generic *record, bool use_units);
+
+/* get whether or not the GUC variable is visible to current user */
+extern bool ConfigOptionIsVisible(struct config_generic *conf);
 
 /* get the current set of variables */
 extern struct config_generic **get_guc_variables(int *num_vars);

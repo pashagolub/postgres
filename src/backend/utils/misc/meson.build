@@ -1,4 +1,4 @@
-# Copyright (c) 2022, PostgreSQL Global Development Group
+# Copyright (c) 2022-2023, PostgreSQL Global Development Group
 
 backend_sources += files(
   'conffiles.c',
@@ -11,7 +11,6 @@ backend_sources += files(
   'pg_rusage.c',
   'ps_status.c',
   'queryenvironment.c',
-  'queryjumble.c',
   'rls.c',
   'sampling.c',
   'superuser.c',

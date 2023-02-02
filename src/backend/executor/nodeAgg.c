@@ -237,7 +237,7 @@
  *    to filter expressions having to be evaluated early, and allows to JIT
  *    the entire expression into one native function.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -2476,7 +2476,7 @@ agg_retrieve_direct(AggState *aggstate)
 					 * If we are grouping, check whether we've crossed a group
 					 * boundary.
 					 */
-					if (node->aggstrategy != AGG_PLAIN)
+					if (node->aggstrategy != AGG_PLAIN && node->numCols > 0)
 					{
 						tmpcontext->ecxt_innertuple = firstSlot;
 						if (!ExecQual(aggstate->phase->eqfunctions[node->numCols - 1],
@@ -2961,10 +2961,10 @@ hashagg_spill_tuple(AggState *aggstate, HashAggSpill *spill,
 
 	tape = spill->partitions[partition];
 
-	LogicalTapeWrite(tape, (void *) &hash, sizeof(uint32));
+	LogicalTapeWrite(tape, &hash, sizeof(uint32));
 	total_written += sizeof(uint32);
 
-	LogicalTapeWrite(tape, (void *) tuple, tuple->t_len);
+	LogicalTapeWrite(tape, tuple, tuple->t_len);
 	total_written += tuple->t_len;
 
 	if (shouldFree)
@@ -3029,7 +3029,7 @@ hashagg_batch_read(HashAggBatch *batch, uint32 *hashp)
 	tuple->t_len = t_len;
 
 	nread = LogicalTapeRead(tape,
-							(void *) ((char *) tuple + sizeof(uint32)),
+							(char *) tuple + sizeof(uint32),
 							t_len - sizeof(uint32));
 	if (nread != t_len - sizeof(uint32))
 		ereport(ERROR,
@@ -3480,8 +3480,6 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 			 */
 			if (aggnode->aggstrategy == AGG_SORTED)
 			{
-				Assert(aggnode->numCols > 0);
-
 				/*
 				 * Build a separate function for each subset of columns that
 				 * need to be compared.
@@ -3494,6 +3492,11 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 				{
 					int			length = phasedata->gset_lengths[k];
 
+					/* nothing to do for empty grouping set */
+					if (length == 0)
+						continue;
+
+					/* if we already had one of this length, it'll do */
 					if (phasedata->eqfunctions[length - 1] != NULL)
 						continue;
 
@@ -3507,7 +3510,8 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 				}
 
 				/* and for all grouped columns, unless already computed */
-				if (phasedata->eqfunctions[aggnode->numCols - 1] == NULL)
+				if (aggnode->numCols > 0 &&
+					phasedata->eqfunctions[aggnode->numCols - 1] == NULL)
 				{
 					phasedata->eqfunctions[aggnode->numCols - 1] =
 						execTuplesMatchPrepare(scanDesc,

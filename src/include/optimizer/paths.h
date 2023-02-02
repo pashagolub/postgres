@@ -4,7 +4,7 @@
  *	  prototypes for various files in optimizer/path
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/paths.h
@@ -122,13 +122,12 @@ typedef bool (*ec_matches_callback_type) (PlannerInfo *root,
 
 extern bool process_equivalence(PlannerInfo *root,
 								RestrictInfo **p_restrictinfo,
-								bool below_outer_join);
+								JoinDomain *jdomain);
 extern Expr *canonicalize_ec_expression(Expr *expr,
 										Oid req_type, Oid req_collation);
 extern void reconsider_outer_join_clauses(PlannerInfo *root);
 extern EquivalenceClass *get_eclass_for_sort_expr(PlannerInfo *root,
 												  Expr *expr,
-												  Relids nullable_relids,
 												  List *opfamilies,
 												  Oid opcintype,
 												  Oid collation,
@@ -216,7 +215,7 @@ extern List *build_index_pathkeys(PlannerInfo *root, IndexOptInfo *index,
 extern List *build_partition_pathkeys(PlannerInfo *root, RelOptInfo *partrel,
 									  ScanDirection scandir, bool *partialkeys);
 extern List *build_expression_pathkey(PlannerInfo *root, Expr *expr,
-									  Relids nullable_relids, Oid opno,
+									  Oid opno,
 									  Relids rel, bool create_it);
 extern List *convert_subquery_pathkeys(PlannerInfo *root, RelOptInfo *rel,
 									   List *subquery_pathkeys,
@@ -228,6 +227,11 @@ extern List *build_join_pathkeys(PlannerInfo *root,
 extern List *make_pathkeys_for_sortclauses(PlannerInfo *root,
 										   List *sortclauses,
 										   List *tlist);
+extern List *make_pathkeys_for_sortclauses_extended(PlannerInfo *root,
+													List **sortclauses,
+													List *tlist,
+													bool remove_redundant,
+													bool *sortable);
 extern void initialize_mergeclause_eclasses(PlannerInfo *root,
 											RestrictInfo *restrictinfo);
 extern void update_mergeclause_eclasses(PlannerInfo *root,

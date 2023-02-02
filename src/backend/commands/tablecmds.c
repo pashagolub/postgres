@@ -3,7 +3,7 @@
  * tablecmds.c
  *	  Commands for creating and altering table structures and settings
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -2320,8 +2320,12 @@ storage_name(char c)
  *		(3) If conflicting defaults are inherited from different parents
  *			(and not overridden by the child), an error is raised.
  *		(4) Otherwise the inherited default is used.
- *		Rule (3) is new in Postgres 7.1; in earlier releases you got a
- *		rather arbitrary choice of which parent default to use.
+ *
+ *		Note that the default-value infrastructure is used for generated
+ *		columns' expressions too, so most of the preceding paragraph applies
+ *		to generation expressions too.  We insist that a child column be
+ *		generated if and only if its parent(s) are, but it need not have
+ *		the same generation expression.
  *----------
  */
 static List *
@@ -2659,7 +2663,7 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 			}
 
 			/*
-			 * Locate default if any
+			 * Locate default/generation expression if any
 			 */
 			if (attribute->atthasdef)
 			{
@@ -2923,23 +2927,20 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 				/*
 				 * Check for conflicts related to generated columns.
 				 *
-				 * If the parent column is generated, the child column must be
-				 * unadorned and will be made a generated column.  (We could
-				 * in theory allow the child column definition specifying the
-				 * exact same generation expression, but that's a bit
-				 * complicated to implement and doesn't seem very useful.)  We
-				 * also check that the child column doesn't specify a default
-				 * value or identity, which matches the rules for a single
-				 * column in parse_util.c.
+				 * If the parent column is generated, the child column will be
+				 * made a generated column if it isn't already.  If it is a
+				 * generated column, we'll take its generation expression in
+				 * preference to the parent's.  We must check that the child
+				 * column doesn't specify a default value or identity, which
+				 * matches the rules for a single column in parse_util.c.
+				 *
+				 * Conversely, if the parent column is not generated, the
+				 * child column can't be either.  (We used to allow that, but
+				 * it results in being able to override the generation
+				 * expression via UPDATEs through the parent.)
 				 */
 				if (def->generated)
 				{
-					if (newdef->generated)
-						ereport(ERROR,
-								(errcode(ERRCODE_INVALID_COLUMN_DEFINITION),
-								 errmsg("child column \"%s\" specifies generation expression",
-										def->colname),
-								 errhint("Omit the generation expression in the definition of the child table column to inherit the generation expression from the parent table.")));
 					if (newdef->raw_default && !newdef->generated)
 						ereport(ERROR,
 								(errcode(ERRCODE_INVALID_COLUMN_DEFINITION),
@@ -2951,15 +2952,14 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 								 errmsg("column \"%s\" inherits from generated column but specifies identity",
 										def->colname)));
 				}
-
-				/*
-				 * If the parent column is not generated, then take whatever
-				 * the child column definition says.
-				 */
 				else
 				{
 					if (newdef->generated)
-						def->generated = newdef->generated;
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_COLUMN_DEFINITION),
+								 errmsg("child column \"%s\" specifies generation expression",
+										def->colname),
+								 errhint("A child table column cannot be generated unless its parent column is.")));
 				}
 
 				/* If new def has a default, override previous default */
@@ -2994,8 +2994,8 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 	/*
 	 * Now that we have the column definition list for a partition, we can
 	 * check whether the columns referenced in the column constraint specs
-	 * actually exist.  Also, we merge NOT NULL and defaults into each
-	 * corresponding column definition.
+	 * actually exist.  Also, we merge parent's NOT NULL constraints and
+	 * defaults into each corresponding column definition.
 	 */
 	if (is_partition)
 	{
@@ -3013,6 +3013,19 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 				{
 					found = true;
 					coldef->is_not_null |= restdef->is_not_null;
+
+					/*
+					 * As above, reject generated columns in partitions that
+					 * are not generated in the parent.
+					 */
+					if (restdef->generated && !coldef->generated)
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_COLUMN_DEFINITION),
+								 errmsg("child column \"%s\" specifies generation expression",
+										restdef->colname),
+								 errhint("A child table column cannot be generated unless its parent column is.")));
+					/* Other way around should have been dealt with above */
+					Assert(!(coldef->generated && !restdef->generated));
 
 					/*
 					 * Override the parent's default value for this column
@@ -3058,7 +3071,8 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_COLUMN_DEFINITION),
 							 errmsg("column \"%s\" inherits conflicting generation expressions",
-									def->colname)));
+									def->colname),
+							 errhint("To resolve the conflict, specify a generation expression explicitly.")));
 				else
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_COLUMN_DEFINITION),
@@ -15038,64 +15052,18 @@ MergeAttributesIntoExisting(Relation child_rel, Relation parent_rel)
 								attributeName)));
 
 			/*
-			 * If parent column is generated, child column must be, too.
+			 * Child column must be generated if and only if parent column is.
 			 */
 			if (attribute->attgenerated && !childatt->attgenerated)
 				ereport(ERROR,
 						(errcode(ERRCODE_DATATYPE_MISMATCH),
 						 errmsg("column \"%s\" in child table must be a generated column",
 								attributeName)));
-
-			/*
-			 * Check that both generation expressions match.
-			 *
-			 * The test we apply is to see whether they reverse-compile to the
-			 * same source string.  This insulates us from issues like whether
-			 * attributes have the same physical column numbers in parent and
-			 * child relations.  (See also constraints_equivalent().)
-			 */
-			if (attribute->attgenerated && childatt->attgenerated)
-			{
-				TupleConstr *child_constr = child_rel->rd_att->constr;
-				TupleConstr *parent_constr = parent_rel->rd_att->constr;
-				char	   *child_expr = NULL;
-				char	   *parent_expr = NULL;
-
-				Assert(child_constr != NULL);
-				Assert(parent_constr != NULL);
-
-				for (int i = 0; i < child_constr->num_defval; i++)
-				{
-					if (child_constr->defval[i].adnum == childatt->attnum)
-					{
-						child_expr =
-							TextDatumGetCString(DirectFunctionCall2(pg_get_expr,
-																	CStringGetTextDatum(child_constr->defval[i].adbin),
-																	ObjectIdGetDatum(child_rel->rd_id)));
-						break;
-					}
-				}
-				Assert(child_expr != NULL);
-
-				for (int i = 0; i < parent_constr->num_defval; i++)
-				{
-					if (parent_constr->defval[i].adnum == attribute->attnum)
-					{
-						parent_expr =
-							TextDatumGetCString(DirectFunctionCall2(pg_get_expr,
-																	CStringGetTextDatum(parent_constr->defval[i].adbin),
-																	ObjectIdGetDatum(parent_rel->rd_id)));
-						break;
-					}
-				}
-				Assert(parent_expr != NULL);
-
-				if (strcmp(child_expr, parent_expr) != 0)
-					ereport(ERROR,
-							(errcode(ERRCODE_DATATYPE_MISMATCH),
-							 errmsg("column \"%s\" in child table has a conflicting generation expression",
-									attributeName)));
-			}
+			if (childatt->attgenerated && !attribute->attgenerated)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATATYPE_MISMATCH),
+						 errmsg("column \"%s\" in child table must not be a generated column",
+								attributeName)));
 
 			/*
 			 * OK, bump the child column's inheritance count.  (If we fail
@@ -15805,7 +15773,10 @@ ATExecDropOf(Relation rel, LOCKMODE lockmode)
  * relation_mark_replica_identity: Update a table's replica identity
  *
  * Iff ri_type = REPLICA_IDENTITY_INDEX, indexOid must be the Oid of a suitable
- * index. Otherwise, it should be InvalidOid.
+ * index. Otherwise, it must be InvalidOid.
+ *
+ * Caller had better hold an exclusive lock on the relation, as the results
+ * of running two of these concurrently wouldn't be pretty.
  */
 static void
 relation_mark_replica_identity(Relation rel, char ri_type, Oid indexOid,
@@ -15817,7 +15788,6 @@ relation_mark_replica_identity(Relation rel, char ri_type, Oid indexOid,
 	HeapTuple	pg_index_tuple;
 	Form_pg_class pg_class_form;
 	Form_pg_index pg_index_form;
-
 	ListCell   *index;
 
 	/*
@@ -15839,29 +15809,7 @@ relation_mark_replica_identity(Relation rel, char ri_type, Oid indexOid,
 	heap_freetuple(pg_class_tuple);
 
 	/*
-	 * Check whether the correct index is marked indisreplident; if so, we're
-	 * done.
-	 */
-	if (OidIsValid(indexOid))
-	{
-		Assert(ri_type == REPLICA_IDENTITY_INDEX);
-
-		pg_index_tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(indexOid));
-		if (!HeapTupleIsValid(pg_index_tuple))
-			elog(ERROR, "cache lookup failed for index %u", indexOid);
-		pg_index_form = (Form_pg_index) GETSTRUCT(pg_index_tuple);
-
-		if (pg_index_form->indisreplident)
-		{
-			ReleaseSysCache(pg_index_tuple);
-			return;
-		}
-		ReleaseSysCache(pg_index_tuple);
-	}
-
-	/*
-	 * Clear the indisreplident flag from any index that had it previously,
-	 * and set it for any index that should have it now.
+	 * Update the per-index indisreplident flags correctly.
 	 */
 	pg_index = table_open(IndexRelationId, RowExclusiveLock);
 	foreach(index, RelationGetIndexList(rel))
@@ -15875,19 +15823,23 @@ relation_mark_replica_identity(Relation rel, char ri_type, Oid indexOid,
 			elog(ERROR, "cache lookup failed for index %u", thisIndexOid);
 		pg_index_form = (Form_pg_index) GETSTRUCT(pg_index_tuple);
 
-		/*
-		 * Unset the bit if set.  We know it's wrong because we checked this
-		 * earlier.
-		 */
-		if (pg_index_form->indisreplident)
+		if (thisIndexOid == indexOid)
 		{
-			dirty = true;
-			pg_index_form->indisreplident = false;
+			/* Set the bit if not already set. */
+			if (!pg_index_form->indisreplident)
+			{
+				dirty = true;
+				pg_index_form->indisreplident = true;
+			}
 		}
-		else if (thisIndexOid == indexOid)
+		else
 		{
-			dirty = true;
-			pg_index_form->indisreplident = true;
+			/* Unset the bit if set. */
+			if (pg_index_form->indisreplident)
+			{
+				dirty = true;
+				pg_index_form->indisreplident = false;
+			}
 		}
 
 		if (dirty)
@@ -15899,7 +15851,9 @@ relation_mark_replica_identity(Relation rel, char ri_type, Oid indexOid,
 			/*
 			 * Invalidate the relcache for the table, so that after we commit
 			 * all sessions will refresh the table's replica identity index
-			 * before attempting any UPDATE or DELETE on the table.
+			 * before attempting any UPDATE or DELETE on the table.  (If we
+			 * changed the table's pg_class row above, then a relcache inval
+			 * is already queued due to that; but we might not have.)
 			 */
 			CacheInvalidateRelcache(rel);
 		}
@@ -15983,12 +15937,6 @@ ATExecReplicaIdentity(Relation rel, ReplicaIdentityStmt *stmt, LOCKMODE lockmode
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot use partial index \"%s\" as replica identity",
-						RelationGetRelationName(indexRel))));
-	/* And neither are invalid indexes. */
-	if (!indexRel->rd_index->indisvalid)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot use invalid index \"%s\" as replica identity",
 						RelationGetRelationName(indexRel))));
 
 	/* Check index for nullable columns. */
@@ -16918,10 +16866,36 @@ RangeVarCallbackMaintainsTable(const RangeVar *relation,
 				 errmsg("\"%s\" is not a table or materialized view", relation->relname)));
 
 	/* Check permissions */
-	if (!object_ownercheck(RelationRelationId, relId, GetUserId()) &&
-		pg_class_aclcheck(relId, GetUserId(), ACL_MAINTAIN) != ACLCHECK_OK)
+	if (pg_class_aclcheck(relId, GetUserId(), ACL_MAINTAIN) != ACLCHECK_OK &&
+		!has_partition_ancestor_privs(relId, GetUserId(), ACL_MAINTAIN))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE,
 					   relation->relname);
+}
+
+/*
+ * If relid is a partition, returns whether userid has any of the privileges
+ * specified in acl on any of its ancestors.  Otherwise, returns false.
+ */
+bool
+has_partition_ancestor_privs(Oid relid, Oid userid, AclMode acl)
+{
+	List	   *ancestors;
+	ListCell   *lc;
+
+	if (!get_rel_relispartition(relid))
+		return false;
+
+	ancestors = get_partition_ancestors(relid);
+	foreach(lc, ancestors)
+	{
+		Oid			ancestor = lfirst_oid(lc);
+
+		if (OidIsValid(ancestor) &&
+			pg_class_aclcheck(ancestor, userid, acl) == ACLCHECK_OK)
+			return true;
+	}
+
+	return false;
 }
 
 /*

@@ -77,7 +77,14 @@ ALTER SUBSCRIPTION regress_testsub4 SET (origin = any);
 DROP SUBSCRIPTION regress_testsub3;
 DROP SUBSCRIPTION regress_testsub4;
 
--- fail - invalid connection string
+-- fail, connection string does not parse
+CREATE SUBSCRIPTION regress_testsub5 CONNECTION 'i_dont_exist=param' PUBLICATION testpub;
+
+-- fail, connection string parses, but doesn't work (and does so without
+-- connecting, so this is reliable and safe)
+CREATE SUBSCRIPTION regress_testsub5 CONNECTION 'port=-1' PUBLICATION testpub;
+
+-- fail - invalid connection string during ALTER
 ALTER SUBSCRIPTION regress_testsub CONNECTION 'foobar';
 
 \dRs+
@@ -167,11 +174,15 @@ ALTER SUBSCRIPTION regress_testsub SET (slot_name = NONE);
 
 DROP SUBSCRIPTION regress_testsub;
 
--- fail - streaming must be boolean
+-- fail - streaming must be boolean or 'parallel'
 CREATE SUBSCRIPTION regress_testsub CONNECTION 'dbname=regress_doesnotexist' PUBLICATION testpub WITH (connect = false, streaming = foo);
 
 -- now it works
 CREATE SUBSCRIPTION regress_testsub CONNECTION 'dbname=regress_doesnotexist' PUBLICATION testpub WITH (connect = false, streaming = true);
+
+\dRs+
+
+ALTER SUBSCRIPTION regress_testsub SET (streaming = parallel);
 
 \dRs+
 
@@ -194,7 +205,7 @@ ALTER SUBSCRIPTION regress_testsub ADD PUBLICATION testpub1, testpub2 WITH (refr
 
 \dRs+
 
--- fail - publication used more then once
+-- fail - publication used more than once
 ALTER SUBSCRIPTION regress_testsub DROP PUBLICATION testpub1, testpub1 WITH (refresh = false);
 
 -- fail - all publications are deleted

@@ -12,7 +12,7 @@
  * example.  For the most part, however, code outside the core planner
  * should not need to include any optimizer/ header except this one.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/optimizer.h
@@ -197,6 +197,6 @@ extern bool contain_var_clause(Node *node);
 extern bool contain_vars_of_level(Node *node, int levelsup);
 extern int	locate_var_of_level(Node *node, int levelsup);
 extern List *pull_var_clause(Node *node, int flags);
-extern Node *flatten_join_alias_vars(Query *query, Node *node);
+extern Node *flatten_join_alias_vars(PlannerInfo *root, Query *query, Node *node);
 
 #endif							/* OPTIMIZER_H */

@@ -14,7 +14,7 @@
  * contain optimizable statements, which we should transform.
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	src/backend/parser/analyze.c
@@ -30,6 +30,7 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/queryjumble.h"
 #include "optimizer/optimizer.h"
 #include "parser/analyze.h"
 #include "parser/parse_agg.h"
@@ -50,7 +51,6 @@
 #include "utils/backend_status.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
-#include "utils/queryjumble.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -615,6 +615,7 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 	else
 	{
 		sub_rtable = NIL;		/* not used, but keep compiler quiet */
+		sub_rteperminfos = NIL;
 		sub_namespace = NIL;
 	}
 
@@ -675,6 +676,7 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 		sub_pstate->p_rtable = sub_rtable;
 		sub_pstate->p_rteperminfos = sub_rteperminfos;
 		sub_pstate->p_joinexprs = NIL;	/* sub_rtable has no joins */
+		sub_pstate->p_nullingrels = NIL;
 		sub_pstate->p_namespace = sub_namespace;
 		sub_pstate->p_resolve_unknowns = false;
 
@@ -856,7 +858,7 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 		/*
 		 * Generate list of Vars referencing the RTE
 		 */
-		exprList = expandNSItemVars(nsitem, 0, -1, NULL);
+		exprList = expandNSItemVars(pstate, nsitem, 0, -1, NULL);
 
 		/*
 		 * Re-apply any indirection on the target column specs to the Vars

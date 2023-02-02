@@ -20,7 +20,7 @@
  * appropriate value for a free lock.  The meaning of the variable is up to
  * the caller, the lightweight lock code just assigns and compares it.
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -186,6 +186,10 @@ static const char *const BuiltinTrancheNames[] = {
 	"PgStatsHash",
 	/* LWTRANCHE_PGSTATS_DATA: */
 	"PgStatsData",
+	/* LWTRANCHE_LAUNCHER_DSA: */
+	"LogicalRepLauncherDSA",
+	/* LWTRANCHE_LAUNCHER_HASH: */
+	"LogicalRepLauncherHash",
 };
 
 StaticAssertDecl(lengthof(BuiltinTrancheNames) ==

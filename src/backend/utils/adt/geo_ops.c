@@ -13,7 +13,7 @@
  * - circle
  * - polygon
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -35,6 +35,7 @@
 #include "utils/float.h"
 #include "utils/fmgrprotos.h"
 #include "utils/geo_decls.h"
+#include "varatt.h"
 
 /*
  * * Type constructors have this form:

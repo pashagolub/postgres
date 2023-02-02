@@ -3,7 +3,7 @@
  * parse_target.c
  *	  handle target lists
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -1371,7 +1371,7 @@ ExpandSingleTable(ParseState *pstate, ParseNamespaceItem *nsitem,
 		List	   *vars;
 		ListCell   *l;
 
-		vars = expandNSItemVars(nsitem, sublevels_up, location, NULL);
+		vars = expandNSItemVars(pstate, nsitem, sublevels_up, location, NULL);
 
 		/*
 		 * Require read access to the table.  This is normally redundant with

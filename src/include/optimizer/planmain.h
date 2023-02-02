@@ -4,7 +4,7 @@
  *	  prototypes for various files in optimizer/plan
  *
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/planmain.h
@@ -83,9 +83,7 @@ extern RestrictInfo *process_implied_equality(PlannerInfo *root,
 											  Expr *item1,
 											  Expr *item2,
 											  Relids qualscope,
-											  Relids nullable_relids,
 											  Index security_level,
-											  bool below_outer_join,
 											  bool both_const);
 extern RestrictInfo *build_implied_join_equality(PlannerInfo *root,
 												 Oid opno,
@@ -93,7 +91,6 @@ extern RestrictInfo *build_implied_join_equality(PlannerInfo *root,
 												 Expr *item1,
 												 Expr *item2,
 												 Relids qualscope,
-												 Relids nullable_relids,
 												 Index security_level);
 extern void match_foreign_keys_to_quals(PlannerInfo *root);
 

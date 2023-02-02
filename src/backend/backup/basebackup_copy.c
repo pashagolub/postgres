@@ -16,7 +16,7 @@
  * An older method that sent each archive using a separate COPY OUT
  * operation is no longer supported.
  *
- * Portions Copyright (c) 2010-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/backup/basebackup_copy.c
@@ -215,7 +215,8 @@ bbsink_copystream_archive_contents(bbsink *sink, size_t len)
 		 * the system clock was set backward, so that such occurrences don't
 		 * have the effect of suppressing further progress messages.
 		 */
-		if (ms < 0 || ms >= PROGRESS_REPORT_MILLISECOND_THRESHOLD)
+		if (ms >= PROGRESS_REPORT_MILLISECOND_THRESHOLD ||
+			now < mysink->last_progress_report_time)
 		{
 			mysink->last_progress_report_time = now;
 

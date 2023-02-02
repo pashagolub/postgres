@@ -3,7 +3,7 @@
  * index.c
  *	  code to create and destroy POSTGRES index relations
  *
- * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -3482,9 +3482,8 @@ index_set_state_flags(Oid indexId, IndexStateFlagsAction action)
 			 * CONCURRENTLY that failed partway through.)
 			 *
 			 * Note: the CLUSTER logic assumes that indisclustered cannot be
-			 * set on any invalid index, so clear that flag too.  Similarly,
-			 * ALTER TABLE assumes that indisreplident cannot be set for
-			 * invalid indexes.
+			 * set on any invalid index, so clear that flag too.  For
+			 * cleanliness, also clear indisreplident.
 			 */
 			indexForm->indisvalid = false;
 			indexForm->indisclustered = false;

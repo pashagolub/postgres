@@ -681,7 +681,7 @@ SELECT * FROM local_tbl LEFT JOIN (SELECT ft1.*, COALESCE(ft1.c3 || ft2.c3, 'foo
 ALTER SERVER loopback OPTIONS (DROP extensions);
 ALTER SERVER loopback OPTIONS (ADD fdw_startup_cost '10000.0');
 EXPLAIN (VERBOSE, COSTS OFF)
-SELECT * FROM local_tbl LEFT JOIN (SELECT ft1.* FROM ft1 INNER JOIN ft2 ON (ft1.c1 = ft2.c1 AND ft1.c1 < 100 AND ft1.c1 = postgres_fdw_abs(ft2.c2))) ss ON (local_tbl.c3 = ss.c3) ORDER BY local_tbl.c1 FOR UPDATE OF local_tbl;
+SELECT * FROM local_tbl LEFT JOIN (SELECT ft1.* FROM ft1 INNER JOIN ft2 ON (ft1.c1 = ft2.c1 AND ft1.c1 < 100 AND (ft1.c1 - postgres_fdw_abs(ft2.c2)) = 0)) ss ON (local_tbl.c3 = ss.c3) ORDER BY local_tbl.c1 FOR UPDATE OF local_tbl;
 ALTER SERVER loopback OPTIONS (DROP fdw_startup_cost);
 ALTER SERVER loopback OPTIONS (ADD extensions 'postgres_fdw');
 
@@ -1579,6 +1579,29 @@ DROP TRIGGER row_before_insupd_trigger ON child_tbl;
 DROP TABLE parent_tbl CASCADE;
 
 DROP FUNCTION row_before_insupd_trigfunc;
+
+-- Try a more complex permutation of WCO where there are multiple levels of
+-- partitioned tables with columns not all in the same order
+CREATE TABLE parent_tbl (a int, b text, c numeric) PARTITION BY RANGE(a);
+CREATE TABLE sub_parent (c numeric, a int, b text) PARTITION BY RANGE(a);
+ALTER TABLE parent_tbl ATTACH PARTITION sub_parent FOR VALUES FROM (1) TO (10);
+CREATE TABLE child_local (b text, c numeric, a int);
+CREATE FOREIGN TABLE child_foreign (b text, c numeric, a int)
+  SERVER loopback OPTIONS (table_name 'child_local');
+ALTER TABLE sub_parent ATTACH PARTITION child_foreign FOR VALUES FROM (1) TO (10);
+CREATE VIEW rw_view AS SELECT * FROM parent_tbl WHERE a < 5 WITH CHECK OPTION;
+
+INSERT INTO parent_tbl (a) VALUES(1),(5);
+EXPLAIN (VERBOSE, COSTS OFF)
+UPDATE rw_view SET b = 'text', c = 123.456;
+UPDATE rw_view SET b = 'text', c = 123.456;
+SELECT * FROM parent_tbl ORDER BY a;
+
+DROP VIEW rw_view;
+DROP TABLE child_local;
+DROP FOREIGN TABLE child_foreign;
+DROP TABLE sub_parent;
+DROP TABLE parent_tbl;
 
 -- ===================================================================
 -- test serial columns (ie, sequence-based defaults)
@@ -3915,3 +3938,39 @@ SELECT * FROM prem2;
 
 ALTER SERVER loopback OPTIONS (DROP parallel_commit);
 ALTER SERVER loopback2 OPTIONS (DROP parallel_commit);
+
+-- ===================================================================
+-- test for ANALYZE sampling
+-- ===================================================================
+
+CREATE TABLE analyze_table (id int, a text, b bigint);
+
+CREATE FOREIGN TABLE analyze_ftable (id int, a text, b bigint)
+       SERVER loopback OPTIONS (table_name 'analyze_rtable1');
+
+INSERT INTO analyze_table (SELECT x FROM generate_series(1,1000) x);
+ANALYZE analyze_table;
+
+SET default_statistics_target = 10;
+ANALYZE analyze_table;
+
+ALTER SERVER loopback OPTIONS (analyze_sampling 'invalid');
+
+ALTER SERVER loopback OPTIONS (analyze_sampling 'auto');
+ANALYZE analyze_table;
+
+ALTER SERVER loopback OPTIONS (SET analyze_sampling 'system');
+ANALYZE analyze_table;
+
+ALTER SERVER loopback OPTIONS (SET analyze_sampling 'bernoulli');
+ANALYZE analyze_table;
+
+ALTER SERVER loopback OPTIONS (SET analyze_sampling 'random');
+ANALYZE analyze_table;
+
+ALTER SERVER loopback OPTIONS (SET analyze_sampling 'off');
+ANALYZE analyze_table;
+
+-- cleanup
+DROP FOREIGN TABLE analyze_ftable;
+DROP TABLE analyze_table;

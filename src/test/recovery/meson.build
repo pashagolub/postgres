@@ -1,4 +1,4 @@
-# Copyright (c) 2022, PostgreSQL Global Development Group
+# Copyright (c) 2022-2023, PostgreSQL Global Development Group
 
 tests += {
   'name': 'recovery',
@@ -17,7 +17,6 @@ tests += {
       't/008_fsm_truncation.pl',
       't/009_twophase.pl',
       't/010_logical_decoding_timelines.pl',
-      't/011_crash_recovery.pl',
       't/012_subtransactions.pl',
       't/013_crash_restart.pl',
       't/014_unlogged_reinit.pl',
