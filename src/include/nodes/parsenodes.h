@@ -355,7 +355,7 @@ union ValUnion
 
 typedef struct A_Const
 {
-	pg_node_attr(custom_copy_equal, custom_read_write)
+	pg_node_attr(custom_copy_equal, custom_read_write, custom_query_jumble)
 
 	NodeTag		type;
 	union ValUnion val;
@@ -1212,7 +1212,7 @@ typedef struct RangeTblEntry
  * 		needed after rule expansion.
  *
  * Only the relations directly mentioned in the query are checked for
- * accesss permissions by the core executor, so only their RTEPermissionInfos
+ * access permissions by the core executor, so only their RTEPermissionInfos
  * are present in the Query.  However, extensions may want to check inheritance
  * children too, depending on the value of rte->inh, so it's copied in 'inh'
  * for their perusal.
@@ -1728,9 +1728,14 @@ typedef struct TriggerTransition
  *
  * stmt_location/stmt_len identify the portion of the source text string
  * containing this raw statement (useful for multi-statement strings).
+ *
+ * This is irrelevant for query jumbling, as this is not used in parsed
+ * queries.
  */
 typedef struct RawStmt
 {
+	pg_node_attr(no_query_jumble)
+
 	NodeTag		type;
 	Node	   *stmt;			/* raw parse tree */
 	int			stmt_location;	/* start location, or -1 if unknown */
