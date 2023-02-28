@@ -1,7 +1,7 @@
 tasks:
   - init: |
       sudo apt-get -yq update
-      sudo apt-get -yq install build-essential libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache liblz4-dev
+      sudo apt-get -yq install build-essential libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache liblz4-dev libzstd-dev
       ./configure --with-lz4 --with-zstd --with-ssl=openssl
       make
       sudo make install
