@@ -36,8 +36,8 @@ INSERT INTO INTERVAL_TBL (f1) VALUES ('@ 30 eons ago');
 SELECT pg_input_is_valid('1.5 weeks', 'interval');
 SELECT pg_input_is_valid('garbage', 'interval');
 SELECT pg_input_is_valid('@ 30 eons ago', 'interval');
-SELECT pg_input_error_message('garbage', 'interval');
-SELECT pg_input_error_message('@ 30 eons ago', 'interval');
+SELECT * FROM pg_input_error_info('garbage', 'interval');
+SELECT * FROM pg_input_error_info('@ 30 eons ago', 'interval');
 
 -- test interval operators
 
@@ -328,6 +328,7 @@ select interval 'P1.0Y0M3DT4H5M6S';
 select interval 'P1.1Y0M3DT4H5M6S';
 select interval 'P1.Y0M3DT4H5M6S';
 select interval 'P.1Y0M3DT4H5M6S';
+select interval 'P10.5e4Y';  -- not per spec, but we've historically taken it
 select interval 'P.Y0M3DT4H5M6S';  -- error
 
 -- test a couple rounding cases that changed since 8.3 w/ HAVE_INT64_TIMESTAMP.
