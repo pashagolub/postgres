@@ -2936,7 +2936,8 @@ XLogFileInitInternal(XLogSegNo logsegno, TimeLineID logtli,
 	 * Try to use existent file (checkpoint maker may have created it already)
 	 */
 	*added = false;
-	fd = BasicOpenFile(path, O_RDWR | PG_BINARY | get_sync_bit(sync_method));
+	fd = BasicOpenFile(path, O_RDWR | PG_BINARY | O_CLOEXEC |
+					   get_sync_bit(sync_method));
 	if (fd < 0)
 	{
 		if (errno != ENOENT)
@@ -2981,7 +2982,7 @@ XLogFileInitInternal(XLogSegNo logsegno, TimeLineID logtli,
 		 * indirect blocks are down on disk.  Therefore, fdatasync(2) or
 		 * O_DSYNC will be sufficient to sync future writes to the log file.
 		 */
-		rc = pg_pwrite_zeros(fd, wal_segment_size);
+		rc = pg_pwrite_zeros(fd, wal_segment_size, 0);
 
 		if (rc < 0)
 			save_errno = errno;
@@ -3097,7 +3098,8 @@ XLogFileInit(XLogSegNo logsegno, TimeLineID logtli)
 		return fd;
 
 	/* Now open original target segment (might not be file I just made) */
-	fd = BasicOpenFile(path, O_RDWR | PG_BINARY | get_sync_bit(sync_method));
+	fd = BasicOpenFile(path, O_RDWR | PG_BINARY | O_CLOEXEC |
+					   get_sync_bit(sync_method));
 	if (fd < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -3328,7 +3330,8 @@ XLogFileOpen(XLogSegNo segno, TimeLineID tli)
 
 	XLogFilePath(path, tli, segno, wal_segment_size);
 
-	fd = BasicOpenFile(path, O_RDWR | PG_BINARY | get_sync_bit(sync_method));
+	fd = BasicOpenFile(path, O_RDWR | PG_BINARY | O_CLOEXEC |
+					   get_sync_bit(sync_method));
 	if (fd < 0)
 		ereport(PANIC,
 				(errcode_for_file_access(),
