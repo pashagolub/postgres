@@ -4536,7 +4536,7 @@ invalid command \lo
 	\timing arg1
 	\unset arg1
 	\w arg1
-	\watch arg1
+	\watch arg1 arg2
 	\x arg1
 	-- \else here is eaten as part of OT_FILEPIPE argument
 	\w |/no/such/file \else
@@ -6199,9 +6199,9 @@ List of schemas
 (0 rows)
 
 \dO "no.such.collation"
-                            List of collations
- Schema | Name | Collate | Ctype | ICU Locale | Provider | Deterministic? 
---------+------+---------+-------+------------+----------+----------------
+                                  List of collations
+ Schema | Name | Provider | Collate | Ctype | ICU Locale | ICU Rules | Deterministic? 
+--------+------+----------+---------+-------+------------+-----------+----------------
 (0 rows)
 
 \dp "no.such.access.privilege"
@@ -6388,9 +6388,9 @@ cross-database references are not implemented: "no.such.schema"."no.such.languag
 (0 rows)
 
 \dO "no.such.schema"."no.such.collation"
-                            List of collations
- Schema | Name | Collate | Ctype | ICU Locale | Provider | Deterministic? 
---------+------+---------+-------+------------+----------+----------------
+                                  List of collations
+ Schema | Name | Provider | Collate | Ctype | ICU Locale | ICU Rules | Deterministic? 
+--------+------+----------+---------+-------+------------+-----------+----------------
 (0 rows)
 
 \dp "no.such.schema"."no.such.access.privilege"
@@ -6531,9 +6531,9 @@ List of text search templates
 (0 rows)
 
 \dO regression."no.such.schema"."no.such.collation"
-                            List of collations
- Schema | Name | Collate | Ctype | ICU Locale | Provider | Deterministic? 
---------+------+---------+-------+------------+----------+----------------
+                                  List of collations
+ Schema | Name | Provider | Collate | Ctype | ICU Locale | ICU Rules | Deterministic? 
+--------+------+----------+---------+-------+------------+-----------+----------------
 (0 rows)
 
 \dp regression."no.such.schema"."no.such.access.privilege"

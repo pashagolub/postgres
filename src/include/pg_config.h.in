@@ -196,6 +196,12 @@
 /* Define to 1 if you have the `getpeerucred' function. */
 #undef HAVE_GETPEERUCRED
 
+/* Define to 1 if you have the <gssapi_ext.h> header file. */
+#undef HAVE_GSSAPI_EXT_H
+
+/* Define to 1 if you have the <gssapi/gssapi_ext.h> header file. */
+#undef HAVE_GSSAPI_GSSAPI_EXT_H
+
 /* Define to 1 if you have the <gssapi/gssapi.h> header file. */
 #undef HAVE_GSSAPI_GSSAPI_H
 
@@ -394,6 +400,9 @@
 /* Define to 1 if you have spinlocks. */
 #undef HAVE_SPINLOCKS
 
+/* Define to 1 if you have the `SSL_CTX_set_cert_cb' function. */
+#undef HAVE_SSL_CTX_SET_CERT_CB
+
 /* Define to 1 if stdbool.h conforms to C99. */
 #undef HAVE_STDBOOL_H
 
@@ -426,9 +435,6 @@
 
 /* Define to 1 if you have the `strsignal' function. */
 #undef HAVE_STRSIGNAL
-
-/* Define to 1 if the system has the type `struct cmsgcred'. */
-#undef HAVE_STRUCT_CMSGCRED
 
 /* Define to 1 if the system has the type `struct option'. */
 #undef HAVE_STRUCT_OPTION

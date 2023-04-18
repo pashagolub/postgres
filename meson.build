@@ -18,7 +18,7 @@ project('postgresql',
   default_options: [
     'warning_level=1', #-Wall equivalent
     'b_pch=false',
-    'buildtype=release',
+    'buildtype=debugoptimized', # -O2 + debug
     # For compatibility with the autoconf build, set a default prefix. This
     # works even on windows, where it's a drive-relative path (i.e. when on
     # d:/somepath it'll install to d:/usr/local/pgsql)
@@ -43,6 +43,7 @@ cc = meson.get_compiler('c')
 
 not_found_dep = dependency('', required: false)
 thread_dep = dependency('threads')
+auto_features = get_option('auto_features')
 
 
 
@@ -232,8 +233,10 @@ elif host_system == 'darwin'
   sysroot_args = [files('src/tools/darwin_sysroot'), get_option('darwin_sysroot')]
   pg_sysroot = run_command(sysroot_args, check:true).stdout().strip()
   message('darwin sysroot: @0@'.format(pg_sysroot))
-  cflags += ['-isysroot', pg_sysroot]
-  ldflags += ['-isysroot', pg_sysroot]
+  if pg_sysroot != ''
+    cflags += ['-isysroot', pg_sysroot]
+    ldflags += ['-isysroot', pg_sysroot]
+  endif
   # meson defaults to -Wl,-undefined,dynamic_lookup for modules, which we
   # don't want because a) it's different from what we do for autoconf, b) it
   # causes warnings starting in macOS Ventura
@@ -333,11 +336,13 @@ prove = find_program(get_option('PROVE'), native: true, required: false)
 tar = find_program(get_option('TAR'), native: true)
 gzip = find_program(get_option('GZIP'), native: true)
 program_lz4 = find_program(get_option('LZ4'), native: true, required: false)
-touch = find_program('touch', native: true)
 openssl = find_program(get_option('OPENSSL'), native: true, required: false)
 program_zstd = find_program(get_option('ZSTD'), native: true, required: false)
 dtrace = find_program(get_option('DTRACE'), native: true, required: get_option('dtrace'))
 missing = find_program('config/missing', native: true)
+cp = find_program('cp', required: false, native: true)
+xmllint_bin = find_program(get_option('XMLLINT'), native: true, required: false)
+xsltproc_bin = find_program(get_option('XSLTPROC'), native: true, required: false)
 
 bison_flags = []
 if bison.found()
@@ -367,6 +372,8 @@ flex_cmd = [python, flex_wrapper,
 
 wget = find_program('wget', required: false, native: true)
 wget_flags = ['-O', '@OUTPUT0@', '--no-use-server-timestamps']
+
+install_files = files('src/tools/install_files')
 
 
 
@@ -501,7 +508,7 @@ dir_man = get_option('mandir')
 
 # FIXME: These used to be separately configurable - worth adding?
 dir_doc = get_option('datadir') / 'doc' / 'postgresql'
-dir_doc_html = dir_doc
+dir_doc_html = dir_doc / 'html'
 
 dir_locale = get_option('localedir')
 
@@ -563,6 +570,39 @@ endif
 
 
 ###############################################################
+# Option: docs in HTML and man page format
+###############################################################
+
+docs_opt = get_option('docs')
+docs_dep = not_found_dep
+if not docs_opt.disabled()
+  if xmllint_bin.found() and xsltproc_bin.found()
+    docs_dep = declare_dependency()
+  elif docs_opt.enabled()
+    error('missing required tools for docs in HTML / man page format')
+  endif
+endif
+
+
+
+###############################################################
+# Option: docs in PDF format
+###############################################################
+
+docs_pdf_opt = get_option('docs_pdf')
+docs_pdf_dep = not_found_dep
+if not docs_pdf_opt.disabled()
+  fop = find_program(get_option('FOP'), native: true, required: docs_pdf_opt)
+  if xmllint_bin.found() and xsltproc_bin.found() and fop.found()
+    docs_pdf_dep = declare_dependency()
+  elif docs_pdf_opt.enabled()
+    error('missing required tools for docs in PDF format')
+  endif
+endif
+
+
+
+###############################################################
 # Library: GSSAPI
 ###############################################################
 
@@ -584,14 +624,24 @@ if not gssapiopt.disabled()
   endif
 
   if not have_gssapi
-  elif cc.has_function('gss_init_sec_context', dependencies: gssapi,
+  elif cc.check_header('gssapi/gssapi_ext.h', dependencies: gssapi, required: false,
+      args: test_c_args, include_directories: postgres_inc)
+    cdata.set('HAVE_GSSAPI_GSSAPI_EXT_H', 1)
+  elif cc.check_header('gssapi_ext.h', args: test_c_args, dependencies: gssapi, required: gssapiopt)
+    cdata.set('HAVE_GSSAPI_EXT_H', 1)
+  else
+    have_gssapi = false
+  endif
+
+  if not have_gssapi
+  elif cc.has_function('gss_store_cred_into', dependencies: gssapi,
       args: test_c_args, include_directories: postgres_inc)
     cdata.set('ENABLE_GSS', 1)
 
     krb_srvtab = 'FILE:/@0@/krb5.keytab)'.format(get_option('sysconfdir'))
     cdata.set_quoted('PG_KRB_SRVTAB', krb_srvtab)
   elif gssapiopt.enabled()
-    error('''could not find function 'gss_init_sec_context' required for GSSAPI''')
+    error('''could not find function 'gss_store_cred_into' required for GSSAPI''')
   else
     have_gssapi = false
   endif
@@ -1171,7 +1221,16 @@ cdata.set('USE_SYSTEMD', systemd.found() ? 1 : false)
 # Library: SSL
 ###############################################################
 
-if get_option('ssl') == 'openssl'
+ssl = not_found_dep
+ssl_library = 'none'
+sslopt = get_option('ssl')
+
+if sslopt == 'auto' and auto_features.disabled()
+  sslopt = 'none'
+endif
+
+if sslopt in ['auto', 'openssl']
+  openssl_required = (sslopt == 'openssl')
 
   # Try to find openssl via pkg-config et al, if that doesn't work
   # (e.g. because it's provided as part of the OS, like on FreeBSD), look for
@@ -1179,72 +1238,91 @@ if get_option('ssl') == 'openssl'
 
   # via pkg-config et al
   ssl = dependency('openssl', required: false)
+  # only meson >= 0.57 supports declare_dependency() in cc.has_function(), so
+  # we pass cc.find_library() results if necessary
+  ssl_int = []
 
   # via library + headers
   if not ssl.found()
     ssl_lib = cc.find_library('ssl',
       dirs: test_lib_d,
       header_include_directories: postgres_inc,
-      has_headers: ['openssl/ssl.h', 'openssl/err.h'])
+      has_headers: ['openssl/ssl.h', 'openssl/err.h'],
+      required: openssl_required)
     crypto_lib = cc.find_library('crypto',
       dirs: test_lib_d,
-      header_include_directories: postgres_inc)
-    ssl_int = [ssl_lib, crypto_lib]
-
-    ssl = declare_dependency(dependencies: ssl_int,
-                             include_directories: postgres_inc)
-  else
-    cc.has_header('openssl/ssl.h', args: test_c_args, dependencies: ssl, required: true)
-    cc.has_header('openssl/err.h', args: test_c_args, dependencies: ssl, required: true)
-
+      required: openssl_required)
+    if ssl_lib.found() and crypto_lib.found()
+      ssl_int = [ssl_lib, crypto_lib]
+      ssl = declare_dependency(dependencies: ssl_int, include_directories: postgres_inc)
+    endif
+  elif cc.has_header('openssl/ssl.h', args: test_c_args, dependencies: ssl, required: openssl_required) and \
+       cc.has_header('openssl/err.h', args: test_c_args, dependencies: ssl, required: openssl_required)
     ssl_int = [ssl]
+  else
+    ssl = not_found_dep
   endif
 
-  check_funcs = [
-    ['CRYPTO_new_ex_data', {'required': true}],
-    ['SSL_new', {'required': true}],
+  if ssl.found()
+    check_funcs = [
+      ['CRYPTO_new_ex_data', {'required': true}],
+      ['SSL_new', {'required': true}],
 
-    # Function introduced in OpenSSL 1.0.2.
-    ['X509_get_signature_nid'],
+      # Functions introduced in OpenSSL 1.0.2.
+      ['X509_get_signature_nid'],
+      ['SSL_CTX_set_cert_cb'], # not in LibreSSL
 
-    # Functions introduced in OpenSSL 1.1.0. We used to check for
-    # OPENSSL_VERSION_NUMBER, but that didn't work with 1.1.0, because LibreSSL
-    # defines OPENSSL_VERSION_NUMBER to claim version 2.0.0, even though it
-    # doesn't have these OpenSSL 1.1.0 functions. So check for individual
-    # functions.
-    ['OPENSSL_init_ssl'],
-    ['BIO_get_data'],
-    ['BIO_meth_new'],
-    ['ASN1_STRING_get0_data'],
-    ['HMAC_CTX_new'],
-    ['HMAC_CTX_free'],
+      # Functions introduced in OpenSSL 1.1.0. We used to check for
+      # OPENSSL_VERSION_NUMBER, but that didn't work with 1.1.0, because LibreSSL
+      # defines OPENSSL_VERSION_NUMBER to claim version 2.0.0, even though it
+      # doesn't have these OpenSSL 1.1.0 functions. So check for individual
+      # functions.
+      ['OPENSSL_init_ssl'],
+      ['BIO_get_data'],
+      ['BIO_meth_new'],
+      ['ASN1_STRING_get0_data'],
+      ['HMAC_CTX_new'],
+      ['HMAC_CTX_free'],
 
-    # OpenSSL versions before 1.1.0 required setting callback functions, for
-    # thread-safety. In 1.1.0, it's no longer required, and CRYPTO_lock()
-    # function was removed.
-    ['CRYPTO_lock'],
+      # OpenSSL versions before 1.1.0 required setting callback functions, for
+      # thread-safety. In 1.1.0, it's no longer required, and CRYPTO_lock()
+      # function was removed.
+      ['CRYPTO_lock'],
 
-    # Function introduced in OpenSSL 1.1.1
-    ['X509_get_signature_info'],
-  ]
+      # Function introduced in OpenSSL 1.1.1
+      ['X509_get_signature_info'],
+    ]
 
-  foreach c : check_funcs
-    func = c.get(0)
-    val = cc.has_function(func, args: test_c_args, dependencies: ssl_int)
-    required = c.get(1, {}).get('required', false)
-    if required and not val
-      error('openssl function @0@ is required'.format(func))
-    elif not required
-      cdata.set('HAVE_' + func.to_upper(), val ? 1 : false)
+    are_openssl_funcs_complete = true
+    foreach c : check_funcs
+      func = c.get(0)
+      val = cc.has_function(func, args: test_c_args, dependencies: ssl_int)
+      required = c.get(1, {}).get('required', false)
+      if required and not val
+        are_openssl_funcs_complete = false
+        if openssl_required
+          error('openssl function @0@ is required'.format(func))
+        endif
+        break
+      elif not required
+        cdata.set('HAVE_' + func.to_upper(), val ? 1 : false)
+      endif
+    endforeach
+
+    if are_openssl_funcs_complete
+      cdata.set('USE_OPENSSL', 1,
+                description: 'Define to 1 to build with OpenSSL support. (-Dssl=openssl)')
+      cdata.set('OPENSSL_API_COMPAT', '0x10001000L',
+                description: '''Define to the OpenSSL API version in use. This avoids deprecation warnings from newer OpenSSL versions.''')
+      ssl_library = 'openssl'
+    else
+      ssl = not_found_dep
     endif
-  endforeach
+  endif
+endif
 
-  cdata.set('USE_OPENSSL', 1,
-            description: 'Define to 1 to build with OpenSSL support. (-Dssl=openssl)')
-  cdata.set('OPENSSL_API_COMPAT', '0x10001000L',
-            description: '''Define to the OpenSSL API version in use. This avoids deprecation warnings from newer OpenSSL versions.''')
-else
-  ssl = not_found_dep
+if sslopt == 'auto' and auto_features.enabled() and not ssl.found()
+  error('no SSL library found')
 endif
 
 
@@ -1268,7 +1346,7 @@ if uuidopt != 'none'
   elif uuidopt == 'ossp'
     uuid = dependency('ossp-uuid', required: true)
     uuidfunc = 'uuid_export'
-    uuidheader = 'ossp/uuid.h'
+    uuidheader = 'uuid.h'
   else
     error('huh')
   endif
@@ -2116,20 +2194,6 @@ foreach c : decl_checks
 endforeach
 
 
-if cc.has_type('struct cmsgcred',
-    args: test_c_args + ['@0@'.format(cdata.get('HAVE_SYS_UCRED_H')) == 'false' ? '' : '-DHAVE_SYS_UCRED_H'],
-    include_directories: postgres_inc,
-    prefix: '''
-#include <sys/socket.h>
-#include <sys/param.h>
-#ifdef HAVE_SYS_UCRED_H
-#include <sys/ucred.h>
-#endif''')
-  cdata.set('HAVE_STRUCT_CMSGCRED', 1)
-else
-  cdata.set('HAVE_STRUCT_CMSGCRED', false)
-endif
-
 if cc.has_type('struct option',
     args: test_c_args, include_directories: postgres_inc,
     prefix: '@0@'.format(cdata.get('HAVE_GETOPT_H')) == '1' ? '#include <getopt.h>' : '')
@@ -2527,6 +2591,7 @@ bin_targets = []
 pl_targets = []
 contrib_targets = []
 testprep_targets = []
+nls_targets = []
 
 
 # Define the tests to distribute them to the correct test styles later
@@ -2885,6 +2950,64 @@ endif
 
 
 ###############################################################
+# Install targets
+###############################################################
+
+
+# We want to define additional install targets beyond what meson provides. For
+# that we need to define targets depending on nearly everything. We collected
+# the results of i18n.gettext() invocations into nls_targets, that also
+# includes maintainer targets though. Collect the ones we want as a dependency.
+#
+# i18n.gettext() doesn't return the dependencies before 0.60 - but the gettext
+# generation happens during install, so that's not a real issue.
+nls_mo_targets = []
+if libintl.found() and meson.version().version_compare('>=0.60')
+  # use range() to avoid the flattening of the list that foreach() would do
+  foreach off : range(0, nls_targets.length())
+    # i18n.gettext() list containing 1) list of built .mo files 2) maintainer
+    # -pot target 3) maintainer -pot target
+    nls_mo_targets += nls_targets[off][0]
+  endforeach
+  alias_target('nls', nls_mo_targets)
+endif
+
+
+all_built = [
+  backend_targets,
+  bin_targets,
+  libpq_st,
+  pl_targets,
+  contrib_targets,
+  nls_mo_targets,
+  testprep_targets,
+  ecpg_targets,
+]
+
+# Meson's default install target is quite verbose. Provide one that is quiet.
+install_quiet = custom_target('install-quiet',
+  output: 'install-quiet',
+  build_always_stale: true,
+  build_by_default: false,
+  command: [meson_bin, meson_args, 'install', '--quiet', '--no-rebuild'],
+  depends: all_built,
+)
+
+# Target to install files used for tests, which aren't installed by default
+install_test_files_args = [
+  install_files,
+  '--prefix', dir_prefix,
+  '--install', contrib_data_dir, test_install_data,
+  '--install', dir_lib_pkg, test_install_libs,
+]
+run_target('install-test-files',
+  command: [python] + install_test_files_args,
+  depends: testprep_targets,
+)
+
+
+
+###############################################################
 # Test prep
 ###############################################################
 
@@ -2922,21 +3045,9 @@ test('tmp_install',
     is_parallel: false,
     suite: ['setup'])
 
-# get full paths of test_install_libs to copy them
-test_install_libs_fp = []
-foreach lib: test_install_libs
-  test_install_libs_fp += lib.full_path()
-endforeach
-
-install_test_files = files('src/tools/install_test_files')
 test('install_test_files',
-    python, args: [
-      install_test_files,
-      '--datadir', test_install_location / contrib_data_args['install_dir'],
-      '--libdir', test_install_location / dir_lib_pkg,
-      '--install-data', test_install_data,
-      '--install-libs', test_install_libs_fp,
-    ],
+    python,
+    args: install_test_files_args + ['--destdir', test_install_destdir],
     priority: setup_tests_priority,
     is_parallel: false,
     suite: ['setup'])
@@ -3052,6 +3163,7 @@ foreach test_dir : tests
       env.prepend('PATH', temp_install_bindir, test_dir['bd'])
 
       test_kwargs = {
+        'protocol': 'tap',
         'priority': 10,
         'timeout': 1000,
         'depends': test_deps + t.get('deps', []),
@@ -3166,6 +3278,7 @@ if meson.version().version_compare('>=0.57')
 endif
 
 
+
 ###############################################################
 # Pseudo targets
 ###############################################################
@@ -3175,6 +3288,7 @@ alias_target('bin', bin_targets + [libpq_st])
 alias_target('pl', pl_targets)
 alias_target('contrib', contrib_targets)
 alias_target('testprep', testprep_targets)
+alias_target('install-world', install_quiet, installdocs)
 
 
 
@@ -3254,6 +3368,8 @@ if meson.version().version_compare('>=0.57')
     {
       'bonjour': bonjour,
       'bsd_auth': bsd_auth,
+      'docs': docs_dep,
+      'docs_pdf': docs_pdf_dep,
       'gss': gssapi,
       'icu': icu,
       'ldap': ldap,
@@ -3262,13 +3378,13 @@ if meson.version().version_compare('>=0.57')
       'llvm': llvm,
       'lz4': lz4,
       'nls': libintl,
+      'openssl': ssl,
       'pam': pam,
       'plperl': perl_dep,
       'plpython': python3_dep,
       'pltcl': tcl_dep,
       'readline': readline,
       'selinux': selinux,
-      'ssl': ssl,
       'systemd': systemd,
       'uuid': uuid,
       'zlib': zlib,

@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include <dirent.h>
+#include <limits.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -773,11 +774,10 @@ usage(void)
 			 "                         (default: 1 or the value used in STARTSEG)\n"));
 	printf(_("  -V, --version          output version information, then exit\n"));
 	printf(_("  -w, --fullpage         only show records with a full page write\n"));
-	printf(_("      --save-fullpage=PATH\n"
-			 "                         save full page images\n"));
 	printf(_("  -x, --xid=XID          only show records with transaction ID XID\n"));
 	printf(_("  -z, --stats[=record]   show statistics instead of records\n"
 			 "                         (optionally, show per-record statistics)\n"));
+	printf(_("  --save-fullpage=DIR    save full page images to DIR\n"));
 	printf(_("  -?, --help             show this help, then exit\n"));
 	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
 	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
@@ -1007,12 +1007,40 @@ main(int argc, char **argv)
 					private.startptr = (uint64) xlogid << 32 | xrecoff;
 				break;
 			case 't':
-				if (sscanf(optarg, "%u", &private.timeline) != 1)
+
+				/*
+				 * This is like option_parse_int() but needs to handle
+				 * unsigned 32-bit int.  Also, we accept both decimal and
+				 * hexadecimal specifications here.
+				 */
 				{
-					pg_log_error("invalid timeline specification: \"%s\"", optarg);
-					goto bad_argument;
+					char	   *endptr;
+					unsigned long val;
+
+					errno = 0;
+					val = strtoul(optarg, &endptr, 0);
+
+					while (*endptr != '\0' && isspace((unsigned char) *endptr))
+						endptr++;
+
+					if (*endptr != '\0')
+					{
+						pg_log_error("invalid value \"%s\" for option %s",
+									 optarg, "-t/--timeline");
+						goto bad_argument;
+					}
+
+					if (errno == ERANGE || val < 1 || val > UINT_MAX)
+					{
+						pg_log_error("%s must be in range %u..%u",
+									 "-t/--timeline", 1, UINT_MAX);
+						goto bad_argument;
+					}
+
+					private.timeline = val;
+
+					break;
 				}
-				break;
 			case 'w':
 				config.filter_by_fpw = true;
 				break;

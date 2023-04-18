@@ -439,6 +439,9 @@ drop table minmaxtest cascade;
 -- check for correct detection of nested-aggregate errors
 select max(min(unique1)) from tenk1;
 select (select max(min(unique1)) from int8_tbl) from tenk1;
+select avg((select avg(a1.col1 order by (select avg(a2.col2) from tenk1 a3))
+            from tenk1 a1(col1)))
+from tenk1 a2(col2);
 
 --
 -- Test removal of redundant GROUP BY columns
@@ -1201,6 +1204,45 @@ SET LOCAL max_parallel_workers_per_gather=4;
 
 EXPLAIN (COSTS OFF) SELECT balk(hundred) FROM tenk1;
 SELECT balk(hundred) FROM tenk1;
+
+ROLLBACK;
+
+-- test multiple usage of an aggregate whose finalfn returns a R/W datum
+BEGIN;
+
+CREATE FUNCTION rwagg_sfunc(x anyarray, y anyarray) RETURNS anyarray
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    RETURN array_fill(y[1], ARRAY[4]);
+END;
+$$;
+
+CREATE FUNCTION rwagg_finalfunc(x anyarray) RETURNS anyarray
+LANGUAGE plpgsql STRICT IMMUTABLE AS $$
+DECLARE
+    res x%TYPE;
+BEGIN
+    -- assignment is essential for this test, it expands the array to R/W
+    res := array_fill(x[1], ARRAY[4]);
+    RETURN res;
+END;
+$$;
+
+CREATE AGGREGATE rwagg(anyarray) (
+    STYPE = anyarray,
+    SFUNC = rwagg_sfunc,
+    FINALFUNC = rwagg_finalfunc
+);
+
+CREATE FUNCTION eatarray(x real[]) RETURNS real[]
+LANGUAGE plpgsql STRICT IMMUTABLE AS $$
+BEGIN
+    x[1] := x[1] + 1;
+    RETURN x;
+END;
+$$;
+
+SELECT eatarray(rwagg(ARRAY[1.0::real])), eatarray(rwagg(ARRAY[1.0::real]));
 
 ROLLBACK;
 

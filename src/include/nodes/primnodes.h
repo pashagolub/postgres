@@ -128,8 +128,10 @@ typedef struct TableFunc
  * CREATE MATERIALIZED VIEW
  *
  * For CREATE MATERIALIZED VIEW, viewQuery is the parsed-but-not-rewritten
- * SELECT Query for the view; otherwise it's NULL.  (Although it's actually
- * Query*, we declare it as Node* to avoid a forward reference.)
+ * SELECT Query for the view; otherwise it's NULL.  This is irrelevant in
+ * the query jumbling as CreateTableAsStmt already includes a reference to
+ * its own Query, so ignore it.  (Although it's actually Query*, we declare
+ * it as Node* to avoid a forward reference.)
  */
 typedef struct IntoClause
 {
@@ -141,7 +143,8 @@ typedef struct IntoClause
 	List	   *options;		/* options from WITH clause */
 	OnCommitAction onCommit;	/* what do we do at COMMIT? */
 	char	   *tableSpaceName; /* table space to use, or NULL */
-	Node	   *viewQuery;		/* materialized view's SELECT query */
+	/* materialized view's SELECT query */
+	Node	   *viewQuery pg_node_attr(query_jumble_ignore);
 	bool		skipData;		/* true for WITH NO DATA */
 } IntoClause;
 
@@ -1461,7 +1464,7 @@ typedef enum XmlExprOp
 	IS_XMLPARSE,				/* XMLPARSE(text, is_doc, preserve_ws) */
 	IS_XMLPI,					/* XMLPI(name [, args]) */
 	IS_XMLROOT,					/* XMLROOT(xml, version, standalone) */
-	IS_XMLSERIALIZE,			/* XMLSERIALIZE(is_document, xmlval) */
+	IS_XMLSERIALIZE,			/* XMLSERIALIZE(is_document, xmlval, indent) */
 	IS_DOCUMENT					/* xmlval IS DOCUMENT */
 } XmlExprOp;
 
@@ -1486,12 +1489,125 @@ typedef struct XmlExpr
 	List	   *args;
 	/* DOCUMENT or CONTENT */
 	XmlOptionType xmloption pg_node_attr(query_jumble_ignore);
+	/* INDENT option for XMLSERIALIZE */
+	bool		indent;
 	/* target type/typmod for XMLSERIALIZE */
 	Oid			type pg_node_attr(query_jumble_ignore);
 	int32		typmod pg_node_attr(query_jumble_ignore);
 	/* token location, or -1 if unknown */
 	int			location;
 } XmlExpr;
+
+/*
+ * JsonEncoding -
+ *		representation of JSON ENCODING clause
+ */
+typedef enum JsonEncoding
+{
+	JS_ENC_DEFAULT,				/* unspecified */
+	JS_ENC_UTF8,
+	JS_ENC_UTF16,
+	JS_ENC_UTF32,
+} JsonEncoding;
+
+/*
+ * JsonFormatType -
+ *		enumeration of JSON formats used in JSON FORMAT clause
+ */
+typedef enum JsonFormatType
+{
+	JS_FORMAT_DEFAULT,			/* unspecified */
+	JS_FORMAT_JSON,				/* FORMAT JSON [ENCODING ...] */
+	JS_FORMAT_JSONB				/* implicit internal format for RETURNING
+								 * jsonb */
+} JsonFormatType;
+
+/*
+ * JsonFormat -
+ *		representation of JSON FORMAT clause
+ */
+typedef struct JsonFormat
+{
+	NodeTag		type;
+	JsonFormatType format_type; /* format type */
+	JsonEncoding encoding;		/* JSON encoding */
+	int			location;		/* token location, or -1 if unknown */
+} JsonFormat;
+
+/*
+ * JsonReturning -
+ *		transformed representation of JSON RETURNING clause
+ */
+typedef struct JsonReturning
+{
+	NodeTag		type;
+	JsonFormat *format;			/* output JSON format */
+	Oid			typid;			/* target type Oid */
+	int32		typmod;			/* target type modifier */
+} JsonReturning;
+
+/*
+ * JsonValueExpr -
+ *		representation of JSON value expression (expr [FORMAT JsonFormat])
+ */
+typedef struct JsonValueExpr
+{
+	NodeTag		type;
+	Expr	   *raw_expr;		/* raw expression */
+	Expr	   *formatted_expr; /* formatted expression or NULL */
+	JsonFormat *format;			/* FORMAT clause, if specified */
+} JsonValueExpr;
+
+typedef enum JsonConstructorType
+{
+	JSCTOR_JSON_OBJECT = 1,
+	JSCTOR_JSON_ARRAY = 2,
+	JSCTOR_JSON_OBJECTAGG = 3,
+	JSCTOR_JSON_ARRAYAGG = 4
+} JsonConstructorType;
+
+/*
+ * JsonConstructorExpr -
+ *		wrapper over FuncExpr/Aggref/WindowFunc for SQL/JSON constructors
+ */
+typedef struct JsonConstructorExpr
+{
+	Expr		xpr;
+	JsonConstructorType type;	/* constructor type */
+	List	   *args;
+	Expr	   *func;			/* underlying json[b]_xxx() function call */
+	Expr	   *coercion;		/* coercion to RETURNING type */
+	JsonReturning *returning;	/* RETURNING clause */
+	bool		absent_on_null; /* ABSENT ON NULL? */
+	bool		unique;			/* WITH UNIQUE KEYS? (JSON_OBJECT[AGG] only) */
+	int			location;
+} JsonConstructorExpr;
+
+/*
+ * JsonValueType -
+ *		representation of JSON item type in IS JSON predicate
+ */
+typedef enum JsonValueType
+{
+	JS_TYPE_ANY,				/* IS JSON [VALUE] */
+	JS_TYPE_OBJECT,				/* IS JSON OBJECT */
+	JS_TYPE_ARRAY,				/* IS JSON ARRAY */
+	JS_TYPE_SCALAR				/* IS JSON SCALAR */
+} JsonValueType;
+
+/*
+ * JsonIsPredicate -
+ *		representation of IS JSON predicate
+ */
+typedef struct JsonIsPredicate
+{
+	NodeTag		type;
+	Node	   *expr;			/* subject expression */
+	JsonFormat *format;			/* FORMAT clause, if specified */
+	JsonValueType item_type;	/* JSON item type */
+	bool		unique_keys;	/* check key uniqueness? */
+	int			location;		/* token location, or -1 if unknown */
+} JsonIsPredicate;
 
 /* ----------------
  * NullTest

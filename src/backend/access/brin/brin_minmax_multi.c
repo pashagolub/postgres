@@ -2364,14 +2364,14 @@ brin_minmax_multi_distance_inet(PG_FUNCTION_ARGS)
 		unsigned char mask;
 		int			nbits;
 
-		nbits = lena - (i * 8);
+		nbits = Max(0, lena - (i * 8));
 		if (nbits < 8)
 		{
 			mask = (0xFF << (8 - nbits));
 			addra[i] = (addra[i] & mask);
 		}
 
-		nbits = lenb - (i * 8);
+		nbits = Max(0, lenb - (i * 8));
 		if (nbits < 8)
 		{
 			mask = (0xFF << (8 - nbits));
@@ -2953,7 +2953,6 @@ minmax_multi_get_strategy_procinfo(BrinDesc *bdesc, uint16 attno, Oid subtype,
 		HeapTuple	tuple;
 		Oid			opfamily,
 					oprid;
-		bool		isNull;
 
 		opfamily = bdesc->bd_index->rd_opfamily[attno - 1];
 		attr = TupleDescAttr(bdesc->bd_tupdesc, attno - 1);
@@ -2965,10 +2964,10 @@ minmax_multi_get_strategy_procinfo(BrinDesc *bdesc, uint16 attno, Oid subtype,
 			elog(ERROR, "missing operator %d(%u,%u) in opfamily %u",
 				 strategynum, attr->atttypid, subtype, opfamily);
 
-		oprid = DatumGetObjectId(SysCacheGetAttr(AMOPSTRATEGY, tuple,
-												 Anum_pg_amop_amopopr, &isNull));
+		oprid = DatumGetObjectId(SysCacheGetAttrNotNull(AMOPSTRATEGY, tuple,
+														Anum_pg_amop_amopopr));
 		ReleaseSysCache(tuple);
-		Assert(!isNull && RegProcedureIsValid(oprid));
+		Assert(RegProcedureIsValid(oprid));
 
 		fmgr_info_cxt(get_opcode(oprid),
 					  &opaque->strategy_procinfos[strategynum - 1],

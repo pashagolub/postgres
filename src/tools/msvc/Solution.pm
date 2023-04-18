@@ -262,6 +262,8 @@ sub GenerateFiles
 		HAVE_GETOPT_LONG                            => undef,
 		HAVE_GETPEEREID                             => undef,
 		HAVE_GETPEERUCRED                           => undef,
+		HAVE_GSSAPI_EXT_H                           => undef,
+		HAVE_GSSAPI_GSSAPI_EXT_H                    => undef,
 		HAVE_GSSAPI_GSSAPI_H                        => undef,
 		HAVE_GSSAPI_H                               => undef,
 		HAVE_HMAC_CTX_FREE                          => undef,
@@ -327,6 +329,7 @@ sub GenerateFiles
 		HAVE_SETPROCTITLE_FAST                   => undef,
 		HAVE_SOCKLEN_T                           => 1,
 		HAVE_SPINLOCKS                           => 1,
+		HAVE_SSL_CTX_SET_CERT_CB                 => undef,
 		HAVE_STDBOOL_H                           => 1,
 		HAVE_STDINT_H                            => 1,
 		HAVE_STDLIB_H                            => 1,
@@ -338,7 +341,6 @@ sub GenerateFiles
 		HAVE_STRLCPY                             => undef,
 		HAVE_STRNLEN                             => 1,
 		HAVE_STRSIGNAL                           => undef,
-		HAVE_STRUCT_CMSGCRED                     => undef,
 		HAVE_STRUCT_OPTION                       => undef,
 		HAVE_STRUCT_SOCKADDR_SA_LEN              => undef,
 		HAVE_STRUCT_TM_TM_ZONE                   => undef,
@@ -507,6 +509,14 @@ sub GenerateFiles
 			$define{HAVE_HMAC_CTX_NEW}          = 1;
 			$define{HAVE_OPENSSL_INIT_SSL}      = 1;
 		}
+
+		# Symbols needed with OpenSSL 1.0.2 and above.
+		if (   ($digit1 >= '3' && $digit2 >= '0' && $digit3 >= '0')
+			|| ($digit1 >= '1' && $digit2 >= '1' && $digit3 >= '0')
+			|| ($digit1 >= '1' && $digit2 >= '0' && $digit3 >= '2'))
+		{
+			$define{HAVE_SSL_CTX_SET_CERT_CB} = 1;
+		}
 	}
 
 	$self->GenerateConfigHeader('src/include/pg_config.h',     \%define, 1);
@@ -629,6 +639,16 @@ sub GenerateFiles
 		print "Generating pltclerrcodes.h...\n";
 		system(
 			'perl src/pl/tcl/generate-pltclerrcodes.pl src/backend/utils/errcodes.txt > src/pl/tcl/pltclerrcodes.h'
+		);
+	}
+
+	if (IsNewer('contrib/fuzzystrmatch/daitch_mokotoff.h',
+				'contrib/fuzzystrmatch/daitch_mokotoff_header.pl'))
+	{
+		print "Generating daitch_mokotoff.h...\n";
+		system(
+			'perl contrib/fuzzystrmatch/daitch_mokotoff_header.pl ' .
+			'contrib/fuzzystrmatch/daitch_mokotoff.h'
 		);
 	}
 

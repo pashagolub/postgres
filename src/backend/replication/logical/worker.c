@@ -207,6 +207,7 @@
 #include "utils/rls.h"
 #include "utils/syscache.h"
 #include "utils/timeout.h"
+#include "utils/usercontext.h"
 
 #define NAPTIME_PER_CYCLE 1000	/* max sleep time between cycles (1s) */
 
@@ -400,12 +401,15 @@ static void apply_handle_insert_internal(ApplyExecutionData *edata,
 static void apply_handle_update_internal(ApplyExecutionData *edata,
 										 ResultRelInfo *relinfo,
 										 TupleTableSlot *remoteslot,
-										 LogicalRepTupleData *newtup);
+										 LogicalRepTupleData *newtup,
+										 Oid localindexoid);
 static void apply_handle_delete_internal(ApplyExecutionData *edata,
 										 ResultRelInfo *relinfo,
-										 TupleTableSlot *remoteslot);
+										 TupleTableSlot *remoteslot,
+										 Oid localindexoid);
 static bool FindReplTupleInLocalRel(EState *estate, Relation localrel,
 									LogicalRepRelation *remoterel,
+									Oid localidxoid,
 									TupleTableSlot *remoteslot,
 									TupleTableSlot **localslot);
 static void apply_handle_tuple_routing(ApplyExecutionData *edata,
@@ -671,6 +675,7 @@ create_edata_for_relation(LogicalRepRelMapEntry *rel)
 	ApplyExecutionData *edata;
 	EState	   *estate;
 	RangeTblEntry *rte;
+	List	   *perminfos = NIL;
 	ResultRelInfo *resultRelInfo;
 
 	edata = (ApplyExecutionData *) palloc0(sizeof(ApplyExecutionData));
@@ -683,9 +688,10 @@ create_edata_for_relation(LogicalRepRelMapEntry *rel)
 	rte->relid = RelationGetRelid(rel->localrel);
 	rte->relkind = rel->localrel->rd_rel->relkind;
 	rte->rellockmode = AccessShareLock;
-	ExecInitRangeTable(estate, list_make1(rte));
 
-	addRTEPermissionInfo(&estate->es_rteperminfos, rte);
+	addRTEPermissionInfo(&perminfos, rte);
+
+	ExecInitRangeTable(estate, list_make1(rte), perminfos);
 
 	edata->targetRelInfo = resultRelInfo = makeNode(ResultRelInfo);
 
@@ -2349,24 +2355,6 @@ apply_handle_type(StringInfo s)
 }
 
 /*
- * Get replica identity index or if it is not defined a primary key.
- *
- * If neither is defined, returns InvalidOid
- */
-static Oid
-GetRelationIdentityOrPK(Relation rel)
-{
-	Oid			idxoid;
-
-	idxoid = RelationGetReplicaIndex(rel);
-
-	if (!OidIsValid(idxoid))
-		idxoid = RelationGetPrimaryKeyIndex(rel);
-
-	return idxoid;
-}
-
-/*
  * Check that we (the subscription owner) have sufficient privileges on the
  * target relation to perform the given operation.
  */
@@ -2408,10 +2396,12 @@ apply_handle_insert(StringInfo s)
 	LogicalRepRelMapEntry *rel;
 	LogicalRepTupleData newtup;
 	LogicalRepRelId relid;
+	UserContext		ucxt;
 	ApplyExecutionData *edata;
 	EState	   *estate;
 	TupleTableSlot *remoteslot;
 	MemoryContext oldctx;
+	bool		run_as_owner;
 
 	/*
 	 * Quick return if we are skipping data modification changes or handling
@@ -2435,6 +2425,14 @@ apply_handle_insert(StringInfo s)
 		end_replication_step();
 		return;
 	}
+
+	/*
+	 * Make sure that any user-supplied code runs as the table owner, unless
+	 * the user has opted out of that behavior.
+	 */
+	run_as_owner = MySubscription->runasowner;
+	if (!run_as_owner)
+		SwitchToUntrustedUser(rel->localrel->rd_rel->relowner, &ucxt);
 
 	/* Set relation for error callback */
 	apply_error_callback_arg.rel = rel;
@@ -2464,6 +2462,9 @@ apply_handle_insert(StringInfo s)
 
 	/* Reset relation for error callback */
 	apply_error_callback_arg.rel = NULL;
+
+	if (!run_as_owner)
+		RestoreUserContext(&ucxt);
 
 	logicalrep_rel_close(rel, NoLock);
 
@@ -2543,6 +2544,7 @@ apply_handle_update(StringInfo s)
 {
 	LogicalRepRelMapEntry *rel;
 	LogicalRepRelId relid;
+	UserContext		ucxt;
 	ApplyExecutionData *edata;
 	EState	   *estate;
 	LogicalRepTupleData oldtup;
@@ -2551,6 +2553,7 @@ apply_handle_update(StringInfo s)
 	TupleTableSlot *remoteslot;
 	RTEPermissionInfo *target_perminfo;
 	MemoryContext oldctx;
+	bool		run_as_owner;
 
 	/*
 	 * Quick return if we are skipping data modification changes or handling
@@ -2581,6 +2584,14 @@ apply_handle_update(StringInfo s)
 
 	/* Check if we can do the update. */
 	check_relation_updatable(rel);
+
+	/*
+	 * Make sure that any user-supplied code runs as the table owner, unless
+	 * the user has opted out of that behavior.
+	 */
+	run_as_owner = MySubscription->runasowner;
+	if (!run_as_owner)
+		SwitchToUntrustedUser(rel->localrel->rd_rel->relowner, &ucxt);
 
 	/* Initialize the executor state. */
 	edata = create_edata_for_relation(rel);
@@ -2625,12 +2636,15 @@ apply_handle_update(StringInfo s)
 								   remoteslot, &newtup, CMD_UPDATE);
 	else
 		apply_handle_update_internal(edata, edata->targetRelInfo,
-									 remoteslot, &newtup);
+									 remoteslot, &newtup, rel->localindexoid);
 
 	finish_edata(edata);
 
 	/* Reset relation for error callback */
 	apply_error_callback_arg.rel = NULL;
+
+	if (!run_as_owner)
+		RestoreUserContext(&ucxt);
 
 	logicalrep_rel_close(rel, NoLock);
 
@@ -2646,7 +2660,8 @@ static void
 apply_handle_update_internal(ApplyExecutionData *edata,
 							 ResultRelInfo *relinfo,
 							 TupleTableSlot *remoteslot,
-							 LogicalRepTupleData *newtup)
+							 LogicalRepTupleData *newtup,
+							 Oid localindexoid)
 {
 	EState	   *estate = edata->estate;
 	LogicalRepRelMapEntry *relmapentry = edata->targetRel;
@@ -2661,6 +2676,7 @@ apply_handle_update_internal(ApplyExecutionData *edata,
 
 	found = FindReplTupleInLocalRel(estate, localrel,
 									&relmapentry->remoterel,
+									localindexoid,
 									remoteslot, &localslot);
 	ExecClearTuple(remoteslot);
 
@@ -2713,10 +2729,12 @@ apply_handle_delete(StringInfo s)
 	LogicalRepRelMapEntry *rel;
 	LogicalRepTupleData oldtup;
 	LogicalRepRelId relid;
+	UserContext		ucxt;
 	ApplyExecutionData *edata;
 	EState	   *estate;
 	TupleTableSlot *remoteslot;
 	MemoryContext oldctx;
+	bool		run_as_owner;
 
 	/*
 	 * Quick return if we are skipping data modification changes or handling
@@ -2747,6 +2765,14 @@ apply_handle_delete(StringInfo s)
 	/* Check if we can do the delete. */
 	check_relation_updatable(rel);
 
+	/*
+	 * Make sure that any user-supplied code runs as the table owner, unless
+	 * the user has opted out of that behavior.
+	 */
+	run_as_owner = MySubscription->runasowner;
+	if (!run_as_owner)
+		SwitchToUntrustedUser(rel->localrel->rd_rel->relowner, &ucxt);
+
 	/* Initialize the executor state. */
 	edata = create_edata_for_relation(rel);
 	estate = edata->estate;
@@ -2765,12 +2791,15 @@ apply_handle_delete(StringInfo s)
 								   remoteslot, NULL, CMD_DELETE);
 	else
 		apply_handle_delete_internal(edata, edata->targetRelInfo,
-									 remoteslot);
+									 remoteslot, rel->localindexoid);
 
 	finish_edata(edata);
 
 	/* Reset relation for error callback */
 	apply_error_callback_arg.rel = NULL;
+
+	if (!run_as_owner)
+		RestoreUserContext(&ucxt);
 
 	logicalrep_rel_close(rel, NoLock);
 
@@ -2785,7 +2814,8 @@ apply_handle_delete(StringInfo s)
 static void
 apply_handle_delete_internal(ApplyExecutionData *edata,
 							 ResultRelInfo *relinfo,
-							 TupleTableSlot *remoteslot)
+							 TupleTableSlot *remoteslot,
+							 Oid localindexoid)
 {
 	EState	   *estate = edata->estate;
 	Relation	localrel = relinfo->ri_RelationDesc;
@@ -2797,7 +2827,7 @@ apply_handle_delete_internal(ApplyExecutionData *edata,
 	EvalPlanQualInit(&epqstate, estate, NULL, NIL, -1);
 	ExecOpenIndices(relinfo, false);
 
-	found = FindReplTupleInLocalRel(estate, localrel, remoterel,
+	found = FindReplTupleInLocalRel(estate, localrel, remoterel, localindexoid,
 									remoteslot, &localslot);
 
 	/* If found delete it. */
@@ -2831,17 +2861,17 @@ apply_handle_delete_internal(ApplyExecutionData *edata,
 /*
  * Try to find a tuple received from the publication side (in 'remoteslot') in
  * the corresponding local relation using either replica identity index,
- * primary key or if needed, sequential scan.
+ * primary key, index or if needed, sequential scan.
  *
  * Local tuple, if found, is returned in '*localslot'.
  */
 static bool
 FindReplTupleInLocalRel(EState *estate, Relation localrel,
 						LogicalRepRelation *remoterel,
+						Oid localidxoid,
 						TupleTableSlot *remoteslot,
 						TupleTableSlot **localslot)
 {
-	Oid			idxoid;
 	bool		found;
 
 	/*
@@ -2852,12 +2882,11 @@ FindReplTupleInLocalRel(EState *estate, Relation localrel,
 
 	*localslot = table_slot_create(localrel, &estate->es_tupleTable);
 
-	idxoid = GetRelationIdentityOrPK(localrel);
-	Assert(OidIsValid(idxoid) ||
+	Assert(OidIsValid(localidxoid) ||
 		   (remoterel->replident == REPLICA_IDENTITY_FULL));
 
-	if (OidIsValid(idxoid))
-		found = RelationFindReplTupleByIndex(localrel, idxoid,
+	if (OidIsValid(localidxoid))
+		found = RelationFindReplTupleByIndex(localrel, localidxoid,
 											 LockTupleExclusive,
 											 remoteslot, *localslot);
 	else
@@ -2958,7 +2987,8 @@ apply_handle_tuple_routing(ApplyExecutionData *edata,
 
 		case CMD_DELETE:
 			apply_handle_delete_internal(edata, partrelinfo,
-										 remoteslot_part);
+										 remoteslot_part,
+										 part_entry->localindexoid);
 			break;
 
 		case CMD_UPDATE:
@@ -2978,6 +3008,7 @@ apply_handle_tuple_routing(ApplyExecutionData *edata,
 				/* Get the matching local tuple from the partition. */
 				found = FindReplTupleInLocalRel(estate, partrel,
 												&part_entry->remoterel,
+												part_entry->localindexoid,
 												remoteslot_part, &localslot);
 				if (!found)
 				{
@@ -3074,7 +3105,8 @@ apply_handle_tuple_routing(ApplyExecutionData *edata,
 
 					/* DELETE old tuple found in the old partition. */
 					apply_handle_delete_internal(edata, partrelinfo,
-												 localslot);
+												 localslot,
+												 part_entry->localindexoid);
 
 					/* INSERT new tuple into the new partition. */
 
@@ -3214,12 +3246,18 @@ apply_handle_truncate(StringInfo s)
 	 * Even if we used CASCADE on the upstream primary we explicitly default
 	 * to replaying changes without further cascading. This might be later
 	 * changeable with a user specified option.
+	 *
+	 * MySubscription->runasowner tells us whether we want to execute
+	 * replication actions as the subscription owner; the last argument to
+	 * TruncateGuts tells it whether we want to switch to the table owner.
+	 * Those are exactly opposite conditions.
 	 */
 	ExecuteTruncateGuts(rels,
 						relids,
 						relids_logged,
 						DROP_RESTRICT,
-						restart_seqs);
+						restart_seqs,
+						!MySubscription->runasowner);
 	foreach(lc, remote_rels)
 	{
 		LogicalRepRelMapEntry *rel = lfirst(lc);
@@ -4529,6 +4567,7 @@ ApplyWorkerMain(Datum main_arg)
 		RepOriginId originid;
 		TimeLineID	startpointTLI;
 		char	   *err;
+		bool		must_use_password;
 
 		myslotname = MySubscription->slotname;
 
@@ -4552,9 +4591,16 @@ ApplyWorkerMain(Datum main_arg)
 		replorigin_session_setup(originid, 0);
 		replorigin_session_origin = originid;
 		origin_startpos = replorigin_session_get_progress(false);
+
+		/* Is the use of a password mandatory? */
+		must_use_password = MySubscription->passwordrequired &&
+			!superuser_arg(MySubscription->owner);
+
+		/* Note that the superuser_arg call can access the DB */
 		CommitTransactionCommand();
 
 		LogRepWorkerWalRcvConn = walrcv_connect(MySubscription->conninfo, true,
+												must_use_password,
 												MySubscription->name, &err);
 		if (LogRepWorkerWalRcvConn == NULL)
 			ereport(ERROR,

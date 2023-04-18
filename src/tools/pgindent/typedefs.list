@@ -26,6 +26,7 @@ AcquireSampleRowsFunc
 ActionList
 ActiveSnapshotElt
 AddForeignUpdateTargets_function
+AddrInfo
 AffixNode
 AffixNodeData
 AfterTriggerEvent
@@ -707,6 +708,8 @@ ExprEvalRowtypeCache
 ExprEvalStep
 ExprState
 ExprStateEvalFunc
+ExtendBufferedFlags
+ExtendBufferedWhat
 ExtensibleNode
 ExtensibleNodeEntry
 ExtensibleNodeMethods
@@ -1246,6 +1249,7 @@ JsonBehaviorType
 JsonCoercion
 JsonCommon
 JsonConstructorExpr
+JsonConstructorExprState
 JsonConstructorType
 JsonEncoding
 JsonExpr
@@ -1699,8 +1703,10 @@ PGEventResultDestroy
 PGFInfoFunction
 PGFileType
 PGFunction
+PGIOAlignedBlock
 PGLZ_HistEntry
 PGLZ_Strategy
+PGLoadBalanceType
 PGMessageField
 PGModuleMagicFunction
 PGNoticeHooks
@@ -2032,7 +2038,6 @@ PgStatShared_SLRU
 PgStatShared_Subscription
 PgStatShared_Wal
 PgStat_ArchiverStats
-PgStat_BackendFunctionEntry
 PgStat_BackendSubEntry
 PgStat_BgWriterStats
 PgStat_BktypeIO
@@ -2049,6 +2054,8 @@ PgStat_Kind
 PgStat_KindInfo
 PgStat_LocalState
 PgStat_PendingDroppedStatsItem
+PgStat_PendingIO
+PgStat_PendingWalStats
 PgStat_SLRUStats
 PgStat_ShmemControl
 PgStat_Snapshot
@@ -2332,6 +2339,7 @@ ReplicaIdentityStmt
 ReplicationKind
 ReplicationSlot
 ReplicationSlotCtlData
+ReplicationSlotInvalidationCause
 ReplicationSlotOnDisk
 ReplicationSlotPersistency
 ReplicationSlotPersistentData
@@ -3602,6 +3610,7 @@ pthread_mutex_t
 pthread_once_t
 pthread_t
 ptrdiff_t
+published_rel
 pull_var_clause_context
 pull_varattnos_context
 pull_varnos_context
@@ -3933,3 +3942,4 @@ yyscan_t
 z_stream
 z_streamp
 zic_t
+ZSTD_CStream

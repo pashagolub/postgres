@@ -186,7 +186,6 @@ static const unit_conversion time_unit_conversion_table[] =
 static const char *const map_old_guc_names[] = {
 	"sort_mem", "work_mem",
 	"vacuum_mem", "maintenance_work_mem",
-	"force_parallel_mode", "debug_parallel_query",
 	NULL
 };
 
@@ -1388,7 +1387,7 @@ check_GUC_name_for_parameter_acl(const char *name)
  *
  * This performs two sanity checks.  First, it checks that the initial
  * value of a GUC is the same when declared and when loaded to prevent
- * anybody looking at the C declarations of these GUCS from being fooled by
+ * anybody looking at the C declarations of these GUCs from being fooled by
  * mismatched values.  Second, it checks for incorrect flag combinations.
  *
  * The following validation rules apply for the values:
@@ -4209,8 +4208,9 @@ GetConfigOption(const char *name, bool missing_ok, bool restrict_privileged)
 		!ConfigOptionIsVisible(record))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser or have privileges of pg_read_all_settings to examine \"%s\"",
-						name)));
+				 errmsg("permission denied to examine \"%s\"", name),
+				 errdetail("Only roles with privileges of the \"%s\" role may examine this parameter.",
+						   "pg_read_all_settings")));
 
 	switch (record->vartype)
 	{
@@ -4255,8 +4255,9 @@ GetConfigOptionResetString(const char *name)
 	if (!ConfigOptionIsVisible(record))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser or have privileges of pg_read_all_settings to examine \"%s\"",
-						name)));
+				 errmsg("permission denied to examine \"%s\"", name),
+				 errdetail("Only roles with privileges of the \"%s\" role may examine this parameter.",
+						   "pg_read_all_settings")));
 
 	switch (record->vartype)
 	{
@@ -5261,8 +5262,9 @@ GetConfigOptionByName(const char *name, const char **varname, bool missing_ok)
 	if (!ConfigOptionIsVisible(record))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser or have privileges of pg_read_all_settings to examine \"%s\"",
-						name)));
+				 errmsg("permission denied to examine \"%s\"", name),
+				 errdetail("Only roles with privileges of the \"%s\" role may examine this parameter.",
+						   "pg_read_all_settings")));
 
 	if (varname)
 		*varname = record->name;
@@ -6270,7 +6272,7 @@ ProcessGUCArray(ArrayType *array, ArrayType *usersetArray,
 			userSetDatum = BoolGetDatum(false);
 
 		/*
-		 * USER SET values are appliciable only for PGC_USERSET parameters. We
+		 * USER SET values are applicable only for PGC_USERSET parameters. We
 		 * use InvalidOid as role in order to evade possible privileges of the
 		 * current user.
 		 */
@@ -6363,8 +6365,8 @@ GUCArrayAdd(ArrayType *array, ArrayType **usersetArray,
 				}
 
 				/*
-				 * Recheck permissons if we found an option without USER SET
-				 * flag while we're setting an optionn with USER SET flag.
+				 * Recheck permissions if we found an option without USER SET
+				 * flag while we're setting an option with USER SET flag.
 				 */
 				if (!currentUserSet && user_set)
 					(void) validate_option_array_item(name, value,
