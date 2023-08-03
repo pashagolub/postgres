@@ -24,6 +24,7 @@
 #include "catalog/pg_enum.h"
 #include "catalog/storage.h"
 #include "commands/async.h"
+#include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "executor/execParallel.h"
 #include "libpq/libpq.h"
@@ -326,7 +327,7 @@ InitializeParallelDSM(ParallelContext *pcxt)
 	fps->database_id = MyDatabaseId;
 	fps->authenticated_user_id = GetAuthenticatedUserId();
 	fps->outer_user_id = GetCurrentRoleId();
-	fps->is_superuser = session_auth_is_superuser;
+	fps->is_superuser = current_role_is_superuser;
 	GetUserIdAndSecContext(&fps->current_user_id, &fps->sec_context);
 	GetTempNamespaceState(&fps->temp_namespace_id,
 						  &fps->temp_toast_namespace_id);
@@ -375,8 +376,8 @@ InitializeParallelDSM(ParallelContext *pcxt)
 		shm_toc_insert(pcxt->toc, PARALLEL_KEY_COMBO_CID, combocidspace);
 
 		/*
-		 * Serialize the transaction snapshot if the transaction
-		 * isolation-level uses a transaction snapshot.
+		 * Serialize the transaction snapshot if the transaction isolation
+		 * level uses a transaction snapshot.
 		 */
 		if (IsolationUsesXactSnapshot())
 		{
@@ -1199,6 +1200,23 @@ HandleParallelMessage(ParallelContext *pcxt, int i, StringInfo msg)
 				break;
 			}
 
+		case 'P':				/* Parallel progress reporting */
+			{
+				/*
+				 * Only incremental progress reporting is currently supported.
+				 * However, it's possible to add more fields to the message to
+				 * allow for handling of other backend progress APIs.
+				 */
+				int			index = pq_getmsgint(msg, 4);
+				int64		incr = pq_getmsgint64(msg);
+
+				pq_getmsgend(msg);
+
+				pgstat_progress_incr_param(index, incr);
+
+				break;
+			}
+
 		case 'X':				/* Terminate, indicating clean exit */
 			{
 				shm_mq_detach(pcxt->worker[i].error_mqh);
@@ -1497,8 +1515,8 @@ ParallelWorkerMain(Datum main_arg)
 	RestoreClientConnectionInfo(clientconninfospace);
 
 	/*
-	 * Initialize SystemUser now that MyClientConnectionInfo is restored.
-	 * Also ensure that auth_method is actually valid, aka authn_id is not NULL.
+	 * Initialize SystemUser now that MyClientConnectionInfo is restored. Also
+	 * ensure that auth_method is actually valid, aka authn_id is not NULL.
 	 */
 	if (MyClientConnectionInfo.authn_id)
 		InitializeSystemUser(MyClientConnectionInfo.authn_id,

@@ -278,8 +278,25 @@ pqParseInput3(PGconn *conn)
 					}
 					break;
 				case '2':		/* Bind Complete */
+					/* Nothing to do for this message type */
+					break;
 				case '3':		/* Close Complete */
-					/* Nothing to do for these message types */
+					/* If we're doing PQsendClose, we're done; else ignore */
+					if (conn->cmd_queue_head &&
+						conn->cmd_queue_head->queryclass == PGQUERY_CLOSE)
+					{
+						if (!pgHavePendingResult(conn))
+						{
+							conn->result = PQmakeEmptyPGresult(conn,
+															   PGRES_COMMAND_OK);
+							if (!conn->result)
+							{
+								libpq_append_conn_error(conn, "out of memory");
+								pqSaveErrorResult(conn);
+							}
+						}
+						conn->asyncStatus = PGASYNC_READY;
+					}
 					break;
 				case 'S':		/* parameter status */
 					if (getParameterStatus(conn))
@@ -466,7 +483,7 @@ static void
 handleSyncLoss(PGconn *conn, char id, int msgLength)
 {
 	libpq_append_conn_error(conn, "lost synchronization with server: got message type \"%c\", length %d",
-					  id, msgLength);
+							id, msgLength);
 	/* build an error result holding the error message */
 	pqSaveErrorResult(conn);
 	conn->asyncStatus = PGASYNC_READY;	/* drop out of PQgetResult wait loop */
@@ -1420,20 +1437,21 @@ pqGetNegotiateProtocolVersion3(PGconn *conn)
 	}
 
 	if (their_version < conn->pversion)
-		appendPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("protocol version not supported by server: client uses %u.%u, server supports up to %u.%u\n"),
-						  PG_PROTOCOL_MAJOR(conn->pversion), PG_PROTOCOL_MINOR(conn->pversion),
-						  PG_PROTOCOL_MAJOR(their_version), PG_PROTOCOL_MINOR(their_version));
+		libpq_append_conn_error(conn, "protocol version not supported by server: client uses %u.%u, server supports up to %u.%u",
+								PG_PROTOCOL_MAJOR(conn->pversion), PG_PROTOCOL_MINOR(conn->pversion),
+								PG_PROTOCOL_MAJOR(their_version), PG_PROTOCOL_MINOR(their_version));
 	if (num > 0)
+	{
 		appendPQExpBuffer(&conn->errorMessage,
-						  libpq_ngettext("protocol extension not supported by server: %s\n",
-										 "protocol extensions not supported by server: %s\n", num),
+						  libpq_ngettext("protocol extension not supported by server: %s",
+										 "protocol extensions not supported by server: %s", num),
 						  buf.data);
+		appendPQExpBufferChar(&conn->errorMessage, '\n');
+	}
 
 	/* neither -- server shouldn't have sent it */
 	if (!(their_version < conn->pversion) && !(num > 0))
-		appendPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("invalid %s message"), "NegotiateProtocolVersion");
+		libpq_append_conn_error(conn, "invalid %s message", "NegotiateProtocolVersion");
 
 	termPQExpBuffer(&buf);
 	return 0;
@@ -1500,7 +1518,7 @@ getNotify(PGconn *conn)
 	}
 
 	/*
-	 * Store the strings right after the PQnotify structure so it can all be
+	 * Store the strings right after the PGnotify structure so it can all be
 	 * freed at once.  We don't use NAMEDATALEN because we don't want to tie
 	 * this interface to a specific server name length.
 	 */

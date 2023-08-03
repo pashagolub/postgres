@@ -422,7 +422,7 @@ retry:
 		ereport(WARNING,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				 errmsg("out of logical replication worker slots"),
-				 errhint("You might need to increase max_logical_replication_workers.")));
+				 errhint("You might need to increase %s.", "max_logical_replication_workers")));
 		return false;
 	}
 
@@ -456,27 +456,33 @@ retry:
 	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
 	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
-	snprintf(bgw.bgw_library_name, BGW_MAXLEN, "postgres");
+	snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres");
 
 	if (is_parallel_apply_worker)
+	{
 		snprintf(bgw.bgw_function_name, BGW_MAXLEN, "ParallelApplyWorkerMain");
-	else
-		snprintf(bgw.bgw_function_name, BGW_MAXLEN, "ApplyWorkerMain");
-
-	if (OidIsValid(relid))
 		snprintf(bgw.bgw_name, BGW_MAXLEN,
-				 "logical replication worker for subscription %u sync %u", subid, relid);
-	else if (is_parallel_apply_worker)
-		snprintf(bgw.bgw_name, BGW_MAXLEN,
-				 "logical replication parallel apply worker for subscription %u", subid);
-	else
-		snprintf(bgw.bgw_name, BGW_MAXLEN,
-				 "logical replication apply worker for subscription %u", subid);
-
-	if (is_parallel_apply_worker)
+				 "logical replication parallel apply worker for subscription %u",
+				 subid);
 		snprintf(bgw.bgw_type, BGW_MAXLEN, "logical replication parallel worker");
+	}
+	else if (OidIsValid(relid))
+	{
+		snprintf(bgw.bgw_function_name, BGW_MAXLEN, "TablesyncWorkerMain");
+		snprintf(bgw.bgw_name, BGW_MAXLEN,
+				 "logical replication tablesync worker for subscription %u sync %u",
+				 subid,
+				 relid);
+		snprintf(bgw.bgw_type, BGW_MAXLEN, "logical replication tablesync worker");
+	}
 	else
-		snprintf(bgw.bgw_type, BGW_MAXLEN, "logical replication worker");
+	{
+		snprintf(bgw.bgw_function_name, BGW_MAXLEN, "ApplyWorkerMain");
+		snprintf(bgw.bgw_name, BGW_MAXLEN,
+				 "logical replication apply worker for subscription %u",
+				 subid);
+		snprintf(bgw.bgw_type, BGW_MAXLEN, "logical replication apply worker");
+	}
 
 	bgw.bgw_restart_time = BGW_NEVER_RESTART;
 	bgw.bgw_notify_pid = MyProcPid;
@@ -496,7 +502,7 @@ retry:
 		ereport(WARNING,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				 errmsg("out of background worker slots"),
-				 errhint("You might need to increase max_worker_processes.")));
+				 errhint("You might need to increase %s.", "max_worker_processes")));
 		return false;
 	}
 
@@ -609,18 +615,36 @@ logicalrep_worker_stop(Oid subid, Oid relid)
 }
 
 /*
- * Stop the logical replication parallel apply worker corresponding to the
- * input slot number.
+ * Stop the given logical replication parallel apply worker.
  *
  * Node that the function sends SIGINT instead of SIGTERM to the parallel apply
  * worker so that the worker exits cleanly.
  */
 void
-logicalrep_pa_worker_stop(int slot_no, uint16 generation)
+logicalrep_pa_worker_stop(ParallelApplyWorkerInfo *winfo)
 {
+	int			slot_no;
+	uint16		generation;
 	LogicalRepWorker *worker;
 
+	SpinLockAcquire(&winfo->shared->mutex);
+	generation = winfo->shared->logicalrep_worker_generation;
+	slot_no = winfo->shared->logicalrep_worker_slot_no;
+	SpinLockRelease(&winfo->shared->mutex);
+
 	Assert(slot_no >= 0 && slot_no < max_logical_replication_workers);
+
+	/*
+	 * Detach from the error_mq_handle for the parallel apply worker before
+	 * stopping it. This prevents the leader apply worker from trying to
+	 * receive the message from the error queue that might already be detached
+	 * by the parallel apply worker.
+	 */
+	if (winfo->error_mq_handle)
+	{
+		shm_mq_detach(winfo->error_mq_handle);
+		winfo->error_mq_handle = NULL;
+	}
 
 	LWLockAcquire(LogicalRepWorkerLock, LW_SHARED);
 
@@ -797,8 +821,11 @@ logicalrep_worker_onexit(int code, Datum arg)
 	 * Session level locks may be acquired outside of a transaction in
 	 * parallel apply mode and will not be released when the worker
 	 * terminates, so manually release all locks before the worker exits.
+	 *
+	 * The locks will be acquired once the worker is initialized.
 	 */
-	LockReleaseAll(DEFAULT_LOCKMETHOD, true);
+	if (!InitializingApplyWorker)
+		LockReleaseAll(DEFAULT_LOCKMETHOD, true);
 
 	ApplyLauncherWakeup();
 }
@@ -889,7 +916,7 @@ ApplyLauncherRegister(void)
 	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
 	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
-	snprintf(bgw.bgw_library_name, BGW_MAXLEN, "postgres");
+	snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres");
 	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "ApplyLauncherMain");
 	snprintf(bgw.bgw_name, BGW_MAXLEN,
 			 "logical replication launcher");

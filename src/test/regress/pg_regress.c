@@ -85,14 +85,14 @@ typedef enum TAPtype
 	TEST_STATUS,
 	PLAN,
 	NONE
-}			TAPtype;
+} TAPtype;
 
 /* options settable from command line */
 _stringlist *dblist = NULL;
 bool		debug = false;
 char	   *inputdir = ".";
 char	   *outputdir = ".";
-char       *expecteddir = ".";
+char	   *expecteddir = ".";
 char	   *bindir = PGBINDIR;
 char	   *launcher = NULL;
 static _stringlist *loadextension = NULL;
@@ -798,6 +798,7 @@ initialize_environment(void)
 		unsetenv("PGCONNECT_TIMEOUT");
 		unsetenv("PGDATA");
 		unsetenv("PGDATABASE");
+		unsetenv("PGGSSDELEGATION");
 		unsetenv("PGGSSENCMODE");
 		unsetenv("PGGSSLIB");
 		/* PGHOSTADDR, see below */
@@ -1225,7 +1226,6 @@ spawn_process(const char *cmdline)
 #else
 	PROCESS_INFORMATION pi;
 	char	   *cmdline2;
-	HANDLE		restrictedToken;
 	const char *comspec;
 
 	/* Find CMD.EXE location using COMSPEC, if it's set */
@@ -1236,8 +1236,7 @@ spawn_process(const char *cmdline)
 	memset(&pi, 0, sizeof(pi));
 	cmdline2 = psprintf("\"%s\" /c \"%s\"", comspec, cmdline);
 
-	if ((restrictedToken =
-		 CreateRestrictedProcess(cmdline2, &pi)) == 0)
+	if (!CreateRestrictedProcess(cmdline2, &pi))
 		exit(2);
 
 	CloseHandle(pi.hThread);
@@ -1891,14 +1890,14 @@ run_single_test(const char *test, test_start_function startfunc,
 
 	if (exit_status != 0)
 	{
-		test_status_failed(test, false, INSTR_TIME_GET_MILLISEC(stoptime));
+		test_status_failed(test, INSTR_TIME_GET_MILLISEC(stoptime), false);
 		log_child_failure(exit_status);
 	}
 	else
 	{
 		if (differ)
 		{
-			test_status_failed(test, false, INSTR_TIME_GET_MILLISEC(stoptime));
+			test_status_failed(test, INSTR_TIME_GET_MILLISEC(stoptime), false);
 		}
 		else
 		{
@@ -1971,10 +1970,10 @@ create_database(const char *dbname)
 	 */
 	if (encoding)
 		psql_add_command(buf, "CREATE DATABASE \"%s\" TEMPLATE=template0 ENCODING='%s'%s", dbname, encoding,
-						 (nolocale) ? " LC_COLLATE='C' LC_CTYPE='C'" : "");
+						 (nolocale) ? " LOCALE='C'" : "");
 	else
 		psql_add_command(buf, "CREATE DATABASE \"%s\" TEMPLATE=template0%s", dbname,
-						 (nolocale) ? " LC_COLLATE='C' LC_CTYPE='C'" : "");
+						 (nolocale) ? " LOCALE='C'" : "");
 	psql_add_command(buf,
 					 "ALTER DATABASE \"%s\" SET lc_messages TO 'C';"
 					 "ALTER DATABASE \"%s\" SET lc_monetary TO 'C';"
@@ -2292,6 +2291,7 @@ regression_main(int argc, char *argv[],
 
 	if (temp_instance)
 	{
+		StringInfoData cmd;
 		FILE	   *pg_conf;
 		const char *env_wait;
 		int			wait_seconds;
@@ -2317,22 +2317,27 @@ regression_main(int argc, char *argv[],
 			make_directory(buf);
 
 		/* initdb */
-		snprintf(buf, sizeof(buf),
-				 "\"%s%sinitdb\" -D \"%s/data\" --no-clean --no-sync%s%s > \"%s/log/initdb.log\" 2>&1",
-				 bindir ? bindir : "",
-				 bindir ? "/" : "",
-				 temp_instance,
-				 debug ? " --debug" : "",
-				 nolocale ? " --no-locale" : "",
-				 outputdir);
+		initStringInfo(&cmd);
+		appendStringInfo(&cmd,
+						 "\"%s%sinitdb\" -D \"%s/data\" --no-clean --no-sync",
+						 bindir ? bindir : "",
+						 bindir ? "/" : "",
+						 temp_instance);
+		if (debug)
+			appendStringInfo(&cmd, " --debug");
+		if (nolocale)
+			appendStringInfo(&cmd, " --no-locale");
+		appendStringInfo(&cmd, " > \"%s/log/initdb.log\" 2>&1", outputdir);
 		fflush(NULL);
-		if (system(buf))
+		if (system(cmd.data))
 		{
 			bail("initdb failed\n"
 				 "# Examine \"%s/log/initdb.log\" for the reason.\n"
 				 "# Command was: %s",
-				 outputdir, buf);
+				 outputdir, cmd.data);
 		}
+
+		pfree(cmd.data);
 
 		/*
 		 * Adjust the default postgresql.conf for regression testing. The user

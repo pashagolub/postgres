@@ -106,6 +106,7 @@
 #include "pgstat.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalrelation.h"
+#include "replication/logicalworker.h"
 #include "replication/walreceiver.h"
 #include "replication/worker_internal.h"
 #include "replication/slot.h"
@@ -120,6 +121,7 @@
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/usercontext.h"
 
 static bool table_states_valid = false;
 static List *table_states_not_ready = NIL;
@@ -563,7 +565,7 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 				 * the lock.
 				 */
 				int			nsyncworkers =
-				logicalrep_sync_worker_count(MyLogicalRepWorker->subid);
+					logicalrep_sync_worker_count(MyLogicalRepWorker->subid);
 
 				/* Now safe to release the LWLock */
 				LWLockRelease(LogicalRepWorkerLock);
@@ -1240,7 +1242,7 @@ ReplicationSlotNameForTablesync(Oid suboid, Oid relid,
  *
  * The returned slot name is palloc'ed in current memory context.
  */
-char *
+static char *
 LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 {
 	char	   *slotname;
@@ -1252,13 +1254,21 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 	WalRcvExecResult *res;
 	char		originname[NAMEDATALEN];
 	RepOriginId originid;
+	UserContext ucxt;
 	bool		must_use_password;
+	bool		run_as_owner;
 
 	/* Check the state of the table synchronization. */
 	StartTransactionCommand();
 	relstate = GetSubscriptionRelState(MyLogicalRepWorker->subid,
 									   MyLogicalRepWorker->relid,
 									   &relstate_lsn);
+
+	/* Is the use of a password mandatory? */
+	must_use_password = MySubscription->passwordrequired &&
+		!superuser_arg(MySubscription->owner);
+
+	/* Note that the superuser_arg call can access the DB */
 	CommitTransactionCommand();
 
 	SpinLockAcquire(&MyLogicalRepWorker->relmutex);
@@ -1284,10 +1294,6 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 									MyLogicalRepWorker->relid,
 									slotname,
 									NAMEDATALEN);
-
-	/* Is the use of a password mandatory? */
-	must_use_password = MySubscription->passwordrequired &&
-		!superuser_arg(MySubscription->owner);
 
 	/*
 	 * Here we use the slot name instead of the subscription name as the
@@ -1375,31 +1381,6 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 	rel = table_open(MyLogicalRepWorker->relid, RowExclusiveLock);
 
 	/*
-	 * Check that our table sync worker has permission to insert into the
-	 * target table.
-	 */
-	aclresult = pg_class_aclcheck(RelationGetRelid(rel), GetUserId(),
-								  ACL_INSERT);
-	if (aclresult != ACLCHECK_OK)
-		aclcheck_error(aclresult,
-					   get_relkind_objtype(rel->rd_rel->relkind),
-					   RelationGetRelationName(rel));
-
-	/*
-	 * COPY FROM does not honor RLS policies.  That is not a problem for
-	 * subscriptions owned by roles with BYPASSRLS privilege (or superuser,
-	 * who has it implicitly), but other roles should not be able to
-	 * circumvent RLS.  Disallow logical replication into RLS enabled
-	 * relations for such roles.
-	 */
-	if (check_enable_rls(RelationGetRelid(rel), InvalidOid, false) == RLS_ENABLED)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("user \"%s\" cannot replicate into relation with row-level security enabled: \"%s\"",
-						GetUserNameFromId(GetUserId(), true),
-						RelationGetRelationName(rel))));
-
-	/*
 	 * Start a transaction in the remote node in REPEATABLE READ mode.  This
 	 * ensures that both the replication slot we create (see below) and the
 	 * COPY are consistent with each other.
@@ -1456,6 +1437,39 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 						originname)));
 	}
 
+	/*
+	 * Make sure that the copy command runs as the table owner, unless the
+	 * user has opted out of that behaviour.
+	 */
+	run_as_owner = MySubscription->runasowner;
+	if (!run_as_owner)
+		SwitchToUntrustedUser(rel->rd_rel->relowner, &ucxt);
+
+	/*
+	 * Check that our table sync worker has permission to insert into the
+	 * target table.
+	 */
+	aclresult = pg_class_aclcheck(RelationGetRelid(rel), GetUserId(),
+								  ACL_INSERT);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult,
+					   get_relkind_objtype(rel->rd_rel->relkind),
+					   RelationGetRelationName(rel));
+
+	/*
+	 * COPY FROM does not honor RLS policies.  That is not a problem for
+	 * subscriptions owned by roles with BYPASSRLS privilege (or superuser,
+	 * who has it implicitly), but other roles should not be able to
+	 * circumvent RLS.  Disallow logical replication into RLS enabled
+	 * relations for such roles.
+	 */
+	if (check_enable_rls(RelationGetRelid(rel), InvalidOid, false) == RLS_ENABLED)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("user \"%s\" cannot replicate into relation with row-level security enabled: \"%s\"",
+						GetUserNameFromId(GetUserId(), true),
+						RelationGetRelationName(rel))));
+
 	/* Now do the initial data copy */
 	PushActiveSnapshot(GetTransactionSnapshot());
 	copy_table(rel);
@@ -1468,6 +1482,9 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 				 errmsg("table copy could not finish transaction on publisher: %s",
 						res->err)));
 	walrcv_clear_result(res);
+
+	if (!run_as_owner)
+		RestoreUserContext(&ucxt);
 
 	table_close(rel, NoLock);
 
@@ -1556,7 +1573,7 @@ FetchTableStates(bool *started_tx)
 		 * Does the subscription have tables?
 		 *
 		 * If there were not-READY relations found then we know it does. But
-		 * if table_state_not_ready was empty we still need to check again to
+		 * if table_states_not_ready was empty we still need to check again to
 		 * see if there are 0 tables.
 		 */
 		has_subrels = (table_states_not_ready != NIL) ||
@@ -1566,6 +1583,94 @@ FetchTableStates(bool *started_tx)
 	}
 
 	return has_subrels;
+}
+
+/*
+ * Execute the initial sync with error handling. Disable the subscription,
+ * if it's required.
+ *
+ * Allocate the slot name in long-lived context on return. Note that we don't
+ * handle FATAL errors which are probably because of system resource error and
+ * are not repeatable.
+ */
+static void
+start_table_sync(XLogRecPtr *origin_startpos, char **slotname)
+{
+	char	   *sync_slotname = NULL;
+
+	Assert(am_tablesync_worker());
+
+	PG_TRY();
+	{
+		/* Call initial sync. */
+		sync_slotname = LogicalRepSyncTableStart(origin_startpos);
+	}
+	PG_CATCH();
+	{
+		if (MySubscription->disableonerr)
+			DisableSubscriptionAndExit();
+		else
+		{
+			/*
+			 * Report the worker failed during table synchronization. Abort
+			 * the current transaction so that the stats message is sent in an
+			 * idle state.
+			 */
+			AbortOutOfAnyTransaction();
+			pgstat_report_subscription_error(MySubscription->oid, false);
+
+			PG_RE_THROW();
+		}
+	}
+	PG_END_TRY();
+
+	/* allocate slot name in long-lived context */
+	*slotname = MemoryContextStrdup(ApplyContext, sync_slotname);
+	pfree(sync_slotname);
+}
+
+/*
+ * Runs the tablesync worker.
+ *
+ * It starts syncing tables. After a successful sync, sets streaming options
+ * and starts streaming to catchup with apply worker.
+ */
+static void
+run_tablesync_worker()
+{
+	char		originname[NAMEDATALEN];
+	XLogRecPtr	origin_startpos = InvalidXLogRecPtr;
+	char	   *slotname = NULL;
+	WalRcvStreamOptions options;
+
+	start_table_sync(&origin_startpos, &slotname);
+
+	ReplicationOriginNameForLogicalRep(MySubscription->oid,
+									   MyLogicalRepWorker->relid,
+									   originname,
+									   sizeof(originname));
+
+	set_apply_error_context_origin(originname);
+
+	set_stream_options(&options, slotname, &origin_startpos);
+
+	walrcv_startstreaming(LogRepWorkerWalRcvConn, &options);
+
+	/* Apply the changes till we catchup with the apply worker. */
+	start_apply(origin_startpos);
+}
+
+/* Logical Replication Tablesync worker entry point */
+void
+TablesyncWorkerMain(Datum main_arg)
+{
+	int			worker_slot = DatumGetInt32(main_arg);
+
+	SetupApplyOrSyncWorker(worker_slot);
+
+	run_tablesync_worker();
+
+	finish_sync_worker();
 }
 
 /*

@@ -61,6 +61,7 @@
 #include "commands/trigger.h"
 #include "commands/typecmds.h"
 #include "commands/user.h"
+#include "commands/vacuum.h"
 #include "executor/executor.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
@@ -806,7 +807,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		AclResult	aclresult;
 
 		aclresult = object_aclcheck(TableSpaceRelationId, tablespaceId, GetUserId(),
-										   ACL_CREATE);
+									ACL_CREATE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_TABLESPACE,
 						   get_tablespace_name(tablespaceId));
@@ -1931,7 +1932,7 @@ ExecuteTruncateGuts(List *explicit_rels,
 	resultRelInfo = resultRelInfos;
 	foreach(cell, rels)
 	{
-		UserContext	ucxt;
+		UserContext ucxt;
 
 		if (run_as_table_owner)
 			SwitchToUntrustedUser(resultRelInfo->ri_RelationDesc->rd_rel->relowner,
@@ -2143,7 +2144,7 @@ ExecuteTruncateGuts(List *explicit_rels,
 	resultRelInfo = resultRelInfos;
 	foreach(cell, rels)
 	{
-		UserContext	ucxt;
+		UserContext ucxt;
 
 		if (run_as_table_owner)
 			SwitchToUntrustedUser(resultRelInfo->ri_RelationDesc->rd_rel->relowner,
@@ -2449,8 +2450,7 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 
 	/*
 	 * Scan the parents left-to-right, and merge their attributes to form a
-	 * list of inherited attributes (inhSchema).  Also check to see if we need
-	 * to inherit an OID column.
+	 * list of inherited attributes (inhSchema).
 	 */
 	child_attno = 0;
 	foreach(entry, supers)
@@ -2635,7 +2635,7 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 				if (CompressionMethodIsValid(attribute->attcompression))
 				{
 					const char *compression =
-					GetCompressionMethodName(attribute->attcompression);
+						GetCompressionMethodName(attribute->attcompression);
 
 					if (def->compression == NULL)
 						def->compression = pstrdup(compression);
@@ -2984,7 +2984,7 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 				 * generated column, we'll take its generation expression in
 				 * preference to the parent's.  We must check that the child
 				 * column doesn't specify a default value or identity, which
-				 * matches the rules for a single column in parse_util.c.
+				 * matches the rules for a single column in parse_utilcmd.c.
 				 *
 				 * Conversely, if the parent column is not generated, the
 				 * child column can't be either.  (We used to allow that, but
@@ -6944,7 +6944,7 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	attribute.attrelid = myrelid;
 	namestrcpy(&(attribute.attname), colDef->colname);
 	attribute.atttypid = typeOid;
-	attribute.attstattarget = (newattnum > 0) ? -1 : 0;
+	attribute.attstattarget = -1;
 	attribute.attlen = tform->typlen;
 	attribute.attnum = newattnum;
 	if (list_length(colDef->typeName->arrayBounds) > PG_INT16_MAX)
@@ -7067,7 +7067,7 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	 * is certainly not going to touch them.  System attributes don't have
 	 * interesting defaults, either.
 	 */
-	if (RELKIND_HAS_STORAGE(relkind) && attribute.attnum > 0)
+	if (RELKIND_HAS_STORAGE(relkind))
 	{
 		/*
 		 * For an identity column, we can't use build_column_default(),
@@ -8017,7 +8017,7 @@ ATPrepDropExpression(Relation rel, AlterTableCmd *cmd, bool recurse, bool recurs
 	 * is a bit complicated.  GENERATED clauses must be attached to the column
 	 * definition and cannot be added later like DEFAULT, so if a child table
 	 * has a generation expression that the parent does not have, the child
-	 * column will necessarily be an attlocal column.  So to implement ONLY
+	 * column will necessarily be an attislocal column.  So to implement ONLY
 	 * here, we'd need extra code to update attislocal of the direct child
 	 * tables, somewhat similar to how DROP COLUMN does it, so that the
 	 * resulting state can be properly dumped and restored.
@@ -8180,9 +8180,9 @@ ATExecSetStatistics(Relation rel, const char *colName, int16 colNum, Node *newVa
 				 errmsg("statistics target %d is too low",
 						newtarget)));
 	}
-	else if (newtarget > 10000)
+	else if (newtarget > MAX_STATISTICS_TARGET)
 	{
-		newtarget = 10000;
+		newtarget = MAX_STATISTICS_TARGET;
 		ereport(WARNING,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("lowering statistics target to %d",
@@ -10147,7 +10147,7 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 		Oid			deleteTriggerOid,
 					updateTriggerOid;
 
-		tuple = SearchSysCache1(CONSTROID, constrOid);
+		tuple = SearchSysCache1(CONSTROID, ObjectIdGetDatum(constrOid));
 		if (!HeapTupleIsValid(tuple))
 			elog(ERROR, "cache lookup failed for constraint %u", constrOid);
 		constrForm = (Form_pg_constraint) GETSTRUCT(tuple);
@@ -10353,7 +10353,7 @@ CloneFkReferencing(List **wqueue, Relation parentRel, Relation partRel)
 		Oid			insertTriggerOid,
 					updateTriggerOid;
 
-		tuple = SearchSysCache1(CONSTROID, parentConstrOid);
+		tuple = SearchSysCache1(CONSTROID, ObjectIdGetDatum(parentConstrOid));
 		if (!HeapTupleIsValid(tuple))
 			elog(ERROR, "cache lookup failed for constraint %u",
 				 parentConstrOid);
@@ -10911,7 +10911,7 @@ ATExecAlterConstraint(Relation rel, AlterTableCmd *cmd, bool recurse,
 				 ancestorname && ancestortable ?
 				 errdetail("Constraint \"%s\" is derived from constraint \"%s\" of relation \"%s\".",
 						   cmdcon->conname, ancestorname, ancestortable) : 0,
-				 errhint("You may alter the constraint it derives from, instead.")));
+				 errhint("You may alter the constraint it derives from instead.")));
 	}
 
 	/*
@@ -10930,7 +10930,7 @@ ATExecAlterConstraint(Relation rel, AlterTableCmd *cmd, bool recurse,
 	}
 
 	/*
-	 * ATExecConstrRecurse already invalidated relcache for the relations
+	 * ATExecAlterConstrRecurse already invalidated relcache for the relations
 	 * having the constraint itself; here we also invalidate for relations
 	 * that have any triggers that are part of the constraint.
 	 */
@@ -13723,7 +13723,7 @@ ATExecAlterColumnGenericOptions(Relation rel,
 
 	/* First, determine FDW validator associated to the foreign table. */
 	ftrel = table_open(ForeignTableRelationId, AccessShareLock);
-	tuple = SearchSysCache1(FOREIGNTABLEREL, rel->rd_id);
+	tuple = SearchSysCache1(FOREIGNTABLEREL, ObjectIdGetDatum(rel->rd_id));
 	if (!HeapTupleIsValid(tuple))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -13860,7 +13860,7 @@ ATExecChangeOwner(Oid relationOid, Oid newOwnerId, bool recursing, LOCKMODE lock
 							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 							 errmsg("cannot change owner of index \"%s\"",
 									NameStr(tuple_class->relname)),
-							 errhint("Change the ownership of the index's table, instead.")));
+							 errhint("Change the ownership of the index's table instead.")));
 				/* quick hack to exit via the no-op path */
 				newOwnerId = tuple_class->relowner;
 			}
@@ -13872,7 +13872,7 @@ ATExecChangeOwner(Oid relationOid, Oid newOwnerId, bool recursing, LOCKMODE lock
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("cannot change owner of index \"%s\"",
 							NameStr(tuple_class->relname)),
-					 errhint("Change the ownership of the index's table, instead.")));
+					 errhint("Change the ownership of the index's table instead.")));
 			break;
 		case RELKIND_SEQUENCE:
 			if (!recursing &&
@@ -13947,7 +13947,7 @@ ATExecChangeOwner(Oid relationOid, Oid newOwnerId, bool recursing, LOCKMODE lock
 
 				/* New owner must have CREATE privilege on namespace */
 				aclresult = object_aclcheck(NamespaceRelationId, namespaceOid, newOwnerId,
-												  ACL_CREATE);
+											ACL_CREATE);
 				if (aclresult != ACLCHECK_OK)
 					aclcheck_error(aclresult, OBJECT_SCHEMA,
 								   get_namespace_name(namespaceOid));
@@ -14377,7 +14377,7 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 		if (check_option)
 		{
 			const char *view_updatable_error =
-			view_query_is_auto_updatable(view_query, true);
+				view_query_is_auto_updatable(view_query, true);
 
 			if (view_updatable_error)
 				ereport(ERROR,
@@ -14656,7 +14656,7 @@ AlterTableMoveAll(AlterTableMoveAllStmt *stmt)
 		AclResult	aclresult;
 
 		aclresult = object_aclcheck(TableSpaceRelationId, new_tablespaceoid, GetUserId(),
-										   ACL_CREATE);
+									ACL_CREATE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_TABLESPACE,
 						   get_tablespace_name(new_tablespaceoid));
@@ -16186,7 +16186,8 @@ ATExecGenericOptions(Relation rel, List *options)
 
 	ftrel = table_open(ForeignTableRelationId, RowExclusiveLock);
 
-	tuple = SearchSysCacheCopy1(FOREIGNTABLEREL, rel->rd_id);
+	tuple = SearchSysCacheCopy1(FOREIGNTABLEREL,
+								ObjectIdGetDatum(rel->rd_id));
 	if (!HeapTupleIsValid(tuple))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -16607,7 +16608,7 @@ AlterRelationNamespaceInternal(Relation classRel, Oid relOid,
 								NamespaceRelationId,
 								oldNspOid,
 								newNspOid) != 1)
-			elog(ERROR, "failed to change schema dependency for relation \"%s\"",
+			elog(ERROR, "could not change schema dependency for relation \"%s\"",
 				 NameStr(classForm->relname));
 	}
 	if (!already_done)
@@ -16977,13 +16978,13 @@ AtEOSubXact_on_commit_actions(bool isCommit, SubTransactionId mySubid,
  * This is intended as a callback for RangeVarGetRelidExtended().  It allows
  * the relation to be locked only if (1) it's a plain or partitioned table,
  * materialized view, or TOAST table and (2) the current user is the owner (or
- * the superuser) or has been granted MAINTAIN.  This meets the
- * permission-checking needs of CLUSTER, REINDEX TABLE, and REFRESH
- * MATERIALIZED VIEW; we expose it here so that it can be used by all.
+ * the superuser).  This meets the permission-checking needs of CLUSTER,
+ * REINDEX TABLE, and REFRESH MATERIALIZED VIEW; we expose it here so that it
+ * can be used by all.
  */
 void
-RangeVarCallbackMaintainsTable(const RangeVar *relation,
-							   Oid relId, Oid oldRelId, void *arg)
+RangeVarCallbackOwnsTable(const RangeVar *relation,
+						  Oid relId, Oid oldRelId, void *arg)
 {
 	char		relkind;
 
@@ -17006,36 +17007,8 @@ RangeVarCallbackMaintainsTable(const RangeVar *relation,
 				 errmsg("\"%s\" is not a table or materialized view", relation->relname)));
 
 	/* Check permissions */
-	if (pg_class_aclcheck(relId, GetUserId(), ACL_MAINTAIN) != ACLCHECK_OK &&
-		!has_partition_ancestor_privs(relId, GetUserId(), ACL_MAINTAIN))
-		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE,
-					   relation->relname);
-}
-
-/*
- * If relid is a partition, returns whether userid has any of the privileges
- * specified in acl on any of its ancestors.  Otherwise, returns false.
- */
-bool
-has_partition_ancestor_privs(Oid relid, Oid userid, AclMode acl)
-{
-	List	   *ancestors;
-	ListCell   *lc;
-
-	if (!get_rel_relispartition(relid))
-		return false;
-
-	ancestors = get_partition_ancestors(relid);
-	foreach(lc, ancestors)
-	{
-		Oid			ancestor = lfirst_oid(lc);
-
-		if (OidIsValid(ancestor) &&
-			pg_class_aclcheck(ancestor, userid, acl) == ACLCHECK_OK)
-			return true;
-	}
-
-	return false;
+	if (!object_ownercheck(RelationRelationId, relId, GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relId)), relation->relname);
 }
 
 /*
@@ -17134,7 +17107,7 @@ RangeVarCallbackForAlterRelation(const RangeVar *rv, Oid relid, Oid oldrelid,
 	if (IsA(stmt, RenameStmt))
 	{
 		aclresult = object_aclcheck(NamespaceRelationId, classform->relnamespace,
-										  GetUserId(), ACL_CREATE);
+									GetUserId(), ACL_CREATE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_SCHEMA,
 						   get_namespace_name(classform->relnamespace));
@@ -18130,8 +18103,8 @@ AttachPartitionEnsureIndexes(Relation rel, Relation attachrel)
 
 		/*
 		 * Scan the list of existing indexes in the partition-to-be, and mark
-		 * the first matching, unattached one we find, if any, as partition of
-		 * the parent index.  If we find one, we're done.
+		 * the first matching, valid, unattached one we find, if any, as
+		 * partition of the parent index.  If we find one, we're done.
 		 */
 		for (i = 0; i < list_length(attachRelIdxs); i++)
 		{
@@ -18140,6 +18113,10 @@ AttachPartitionEnsureIndexes(Relation rel, Relation attachrel)
 
 			/* does this index have a parent?  if so, can't use it */
 			if (attachrelIdxRels[i]->rd_rel->relispartition)
+				continue;
+
+			/* If this index is invalid, can't use it */
+			if (!attachrelIdxRels[i]->rd_index->indisvalid)
 				continue;
 
 			if (CompareIndexInfo(attachInfos[i], info,
@@ -19198,17 +19175,24 @@ validatePartitionedIndex(Relation partedIdx, Relation partedTbl)
 	if (tuples == RelationGetPartitionDesc(partedTbl, true)->nparts)
 	{
 		Relation	idxRel;
-		HeapTuple	newtup;
+		HeapTuple	indTup;
+		Form_pg_index indexForm;
 
 		idxRel = table_open(IndexRelationId, RowExclusiveLock);
+		indTup = SearchSysCacheCopy1(INDEXRELID,
+									 ObjectIdGetDatum(RelationGetRelid(partedIdx)));
+		if (!HeapTupleIsValid(indTup))
+			elog(ERROR, "cache lookup failed for index %u",
+				 RelationGetRelid(partedIdx));
+		indexForm = (Form_pg_index) GETSTRUCT(indTup);
 
-		newtup = heap_copytuple(partedIdx->rd_indextuple);
-		((Form_pg_index) GETSTRUCT(newtup))->indisvalid = true;
+		indexForm->indisvalid = true;
 		updated = true;
 
-		CatalogTupleUpdate(idxRel, &partedIdx->rd_indextuple->t_self, newtup);
+		CatalogTupleUpdate(idxRel, &indTup->t_self, indTup);
 
 		table_close(idxRel, RowExclusiveLock);
+		heap_freetuple(indTup);
 	}
 
 	/*

@@ -202,7 +202,6 @@ enable_debug	= @enable_debug@
 enable_dtrace	= @enable_dtrace@
 enable_coverage	= @enable_coverage@
 enable_tap_tests	= @enable_tap_tests@
-enable_thread_safety	= @enable_thread_safety@
 
 python_includespec	= @python_includespec@
 python_libdir		= @python_libdir@
@@ -464,7 +463,7 @@ cd $(srcdir) && \
    TESTLOGDIR='$(CURDIR)/tmp_check/log' \
    TESTDATADIR='$(CURDIR)/tmp_check' \
    PATH="$(bindir):$(CURDIR):$$PATH" \
-   PGPORT='6$(DEF_PGPORT)' top_builddir='$(top_builddir)' \
+   PGPORT='6$(DEF_PGPORT)' \
    PG_REGRESS='$(top_builddir)/src/test/regress/pg_regress' \
    $(PROVE) $(PG_PROVE_FLAGS) $(PROVE_FLAGS) $(if $(PROVE_TESTS),$(PROVE_TESTS),t/*.pl)
 endef

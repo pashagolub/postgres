@@ -52,12 +52,10 @@
 #include <netinet/tcp.h>
 #endif
 
-#ifdef ENABLE_THREAD_SAFETY
 #ifdef WIN32
 #include "pthread-win32.h"
 #else
 #include <pthread.h>
-#endif
 #endif
 
 #ifdef USE_LDAP
@@ -343,9 +341,9 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
 		"GSS-library", "", 7,	/* sizeof("gssapi") == 7 */
 	offsetof(struct pg_conn, gsslib)},
 
-	{"gssdeleg", "PGGSSDELEG", NULL, NULL,
-		"GSS-delegation", "", 8,	/* sizeof("disable") == 8 */
-	offsetof(struct pg_conn, gssdeleg)},
+	{"gssdelegation", "PGGSSDELEGATION", "0", NULL,
+		"GSS-delegation", "", 1,
+	offsetof(struct pg_conn, gssdelegation)},
 
 	{"replication", NULL, NULL, NULL,
 		"Replication", "D", 5,
@@ -1051,9 +1049,9 @@ libpq_prng_init(PGconn *conn)
 	gettimeofday(&tval, NULL);
 
 	rseed = ((uintptr_t) conn) ^
-			((uint64) getpid()) ^
-			((uint64) tval.tv_usec) ^
-			((uint64) tval.tv_sec);
+		((uint64) getpid()) ^
+		((uint64) tval.tv_usec) ^
+		((uint64) tval.tv_sec);
 
 	pg_prng_seed(&conn->prng_state, rseed);
 }
@@ -1407,8 +1405,8 @@ connectOptions2(PGconn *conn)
 			else
 			{
 				conn->status = CONNECTION_BAD;
-				libpq_append_conn_error(conn, "invalid require_auth method: \"%s\"",
-										method);
+				libpq_append_conn_error(conn, "invalid %s value: \"%s\"",
+										"require_auth", method);
 
 				free(part);
 				return false;
@@ -1481,8 +1479,8 @@ connectOptions2(PGconn *conn)
 		&& strcmp(conn->sslrootcert, "system") == 0)
 	{
 		conn->status = CONNECTION_BAD;
-		libpq_append_conn_error(conn, "sslrootcert value \"%s\" invalid when SSL support is not compiled in",
-								conn->sslrootcert);
+		libpq_append_conn_error(conn, "%s value \"%s\" invalid when SSL support is not compiled in",
+								"sslrootcert", conn->sslrootcert);
 		return false;
 	}
 #endif
@@ -1543,7 +1541,7 @@ connectOptions2(PGconn *conn)
 		&& strcmp(conn->sslmode, "verify-full") != 0)
 	{
 		conn->status = CONNECTION_BAD;
-		libpq_append_conn_error(conn, "weak sslmode \"%s\" may not be used with sslrootcert=system (use verify-full)",
+		libpq_append_conn_error(conn, "weak sslmode \"%s\" may not be used with sslrootcert=system (use \"verify-full\")",
 								conn->sslmode);
 		return false;
 	}
@@ -4453,7 +4451,7 @@ freePGconn(PGconn *conn)
 	free(conn->gssencmode);
 	free(conn->krbsrvname);
 	free(conn->gsslib);
-	free(conn->gssdeleg);
+	free(conn->gssdelegation);
 	free(conn->connip);
 	/* Note that conn->Pfdebug is not ours to close or free */
 	free(conn->write_err_msg);
@@ -7784,7 +7782,6 @@ pqGetHomeDirectory(char *buf, int bufsize)
 static void
 default_threadlock(int acquire)
 {
-#ifdef ENABLE_THREAD_SAFETY
 #ifndef WIN32
 	static pthread_mutex_t singlethread_lock = PTHREAD_MUTEX_INITIALIZER;
 #else
@@ -7813,7 +7810,6 @@ default_threadlock(int acquire)
 		if (pthread_mutex_unlock(&singlethread_lock))
 			Assert(false);
 	}
-#endif
 }
 
 pgthreadlock_t

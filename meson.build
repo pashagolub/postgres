@@ -8,7 +8,7 @@
 
 project('postgresql',
   ['c'],
-  version: '16devel',
+  version: '17devel',
   license: 'PostgreSQL',
 
   # We want < 0.56 for python 3.5 compatibility on old platforms. EPEL for
@@ -150,7 +150,7 @@ cdata.set_quoted('PG_MAJORVERSION', pg_version_major.to_string())
 cdata.set('PG_MAJORVERSION_NUM', pg_version_major)
 cdata.set('PG_MINORVERSION_NUM', pg_version_minor)
 cdata.set('PG_VERSION_NUM', pg_version_num)
-# PG_VERSION_STR is built later, it depends compiler test results
+# PG_VERSION_STR is built later, it depends on compiler test results
 cdata.set_quoted('CONFIGURE_ARGS', '')
 
 
@@ -361,6 +361,10 @@ bison_kw = {
 }
 
 flex_flags = []
+if flex.found()
+  flex_version_c = run_command(flex, '--version', check: true)
+  flex_version = flex_version_c.stdout().split(' ')[1].split('\n')[0]
+endif
 flex_wrapper = files('src/tools/pgflex')
 flex_cmd = [python, flex_wrapper,
   '--builddir', '@BUILD_ROOT@',
@@ -385,7 +389,7 @@ install_files = files('src/tools/install_files')
 # https://github.com/mesonbuild/meson/issues/8511
 meson_binpath_r = run_command(python, 'src/tools/find_meson', check: true)
 
-if meson_binpath_r.returncode() != 0 or meson_binpath_r.stdout() == ''
+if meson_binpath_r.stdout() == ''
   error('huh, could not run find_meson.\nerrcode: @0@\nstdout: @1@\nstderr: @2@'.format(
     meson_binpath_r.returncode(),
     meson_binpath_r.stdout(),
@@ -558,7 +562,7 @@ endif
 ###############################################################
 
 bonjouropt = get_option('bonjour')
-bonjour = dependency('', required : false)
+bonjour = not_found_dep
 if cc.check_header('dns_sd.h', required: bonjouropt,
     args: test_c_args, include_directories: postgres_inc) and \
    cc.has_function('DNSServiceRegister',
@@ -722,8 +726,6 @@ choke me
     endif
   endif
 
-  # XXX: this shouldn't be tested in the windows case, but should be tested in
-  # the dependency() success case
   if ldap.found() and cc.has_function('ldap_initialize',
       dependencies: ldap, args: test_c_args)
     cdata.set('HAVE_LDAP_INITIALIZE', 1)
@@ -744,8 +746,8 @@ endif
 ###############################################################
 
 llvmopt = get_option('llvm')
-if not llvmopt.disabled()
-  add_languages('cpp', required: true, native: false)
+llvm = not_found_dep
+if add_languages('cpp', required: llvmopt, native: false)
   llvm = dependency('llvm', version: '>=3.9', method: 'config-tool', required: llvmopt)
 
   if llvm.found()
@@ -759,8 +761,8 @@ if not llvmopt.disabled()
     ccache = find_program('ccache', native: true, required: false)
     clang = find_program(llvm_binpath / 'clang', required: true)
   endif
-else
-  llvm = not_found_dep
+elif llvmopt.auto()
+  message('llvm requires a C++ compiler')
 endif
 
 
@@ -771,8 +773,8 @@ endif
 
 icuopt = get_option('icu')
 if not icuopt.disabled()
-  icu = dependency('icu-uc', required: icuopt.enabled())
-  icu_i18n = dependency('icu-i18n', required: icuopt.enabled())
+  icu = dependency('icu-uc', required: icuopt)
+  icu_i18n = dependency('icu-i18n', required: icuopt)
 
   if icu.found()
     cdata.set('USE_ICU', 1)
@@ -1056,9 +1058,9 @@ endif
 pyopt = get_option('plpython')
 if not pyopt.disabled()
   pm = import('python')
-  python3_inst = pm.find_installation(required: pyopt.enabled())
-  python3_dep = python3_inst.dependency(embed: true, required: pyopt.enabled())
-  if not cc.check_header('Python.h', dependencies: python3_dep, required: pyopt.enabled())
+  python3_inst = pm.find_installation(required: pyopt)
+  python3_dep = python3_inst.dependency(embed: true, required: pyopt)
+  if not cc.check_header('Python.h', dependencies: python3_dep, required: pyopt)
     python3_dep = not_found_dep
   endif
 else
@@ -1081,7 +1083,7 @@ if not get_option('readline').disabled()
     readline = dependency(readline_dep, required: false)
     if not readline.found()
       readline = cc.find_library(readline_dep,
-        required: get_option('readline').enabled(),
+        required: get_option('readline'),
         dirs: test_lib_d)
     endif
     if readline.found()
@@ -1133,7 +1135,7 @@ if not get_option('readline').disabled()
       error('''readline header not found
 If you have @0@ already installed, see meson-log/meson-log.txt for details on the
 failure. It is possible the compiler isn't looking in the proper directory.
-Use -Dreadline=false to disable readline support.'''.format(readline_dep))
+Use -Dreadline=disabled to disable readline support.'''.format(readline_dep))
     endif
 
     check_funcs = [
@@ -1148,7 +1150,7 @@ Use -Dreadline=false to disable readline support.'''.format(readline_dep))
     foreach func : check_funcs
       found = cc.has_function(func, dependencies: [readline],
         args: test_c_args, include_directories: postgres_inc)
-      cdata.set('HAVE_'+func.to_upper(), found ? 1 : false)
+      cdata.set('HAVE_' + func.to_upper(), found ? 1 : false)
     endforeach
 
     check_vars = [
@@ -1158,7 +1160,7 @@ Use -Dreadline=false to disable readline support.'''.format(readline_dep))
     ]
 
     foreach var : check_vars
-      cdata.set('HAVE_'+var.to_upper(),
+      cdata.set('HAVE_' + var.to_upper(),
         cc.has_header_symbol(readline_h, var,
           args: test_c_args, include_directories: postgres_inc,
           prefix: '#include <stdio.h>',
@@ -1268,9 +1270,8 @@ if sslopt in ['auto', 'openssl']
       ['CRYPTO_new_ex_data', {'required': true}],
       ['SSL_new', {'required': true}],
 
-      # Functions introduced in OpenSSL 1.0.2.
-      ['X509_get_signature_nid'],
-      ['SSL_CTX_set_cert_cb'], # not in LibreSSL
+      # Function introduced in OpenSSL 1.0.2, not in LibreSSL.
+      ['SSL_CTX_set_cert_cb'],
 
       # Functions introduced in OpenSSL 1.1.0. We used to check for
       # OPENSSL_VERSION_NUMBER, but that didn't work with 1.1.0, because LibreSSL
@@ -1312,8 +1313,8 @@ if sslopt in ['auto', 'openssl']
     if are_openssl_funcs_complete
       cdata.set('USE_OPENSSL', 1,
                 description: 'Define to 1 to build with OpenSSL support. (-Dssl=openssl)')
-      cdata.set('OPENSSL_API_COMPAT', '0x10001000L',
-                description: '''Define to the OpenSSL API version in use. This avoids deprecation warnings from newer OpenSSL versions.''')
+      cdata.set('OPENSSL_API_COMPAT', '0x10002000L',
+                description: 'Define to the OpenSSL API version in use. This avoids deprecation warnings from newer OpenSSL versions.')
       ssl_library = 'openssl'
     else
       ssl = not_found_dep
@@ -1348,7 +1349,7 @@ if uuidopt != 'none'
     uuidfunc = 'uuid_export'
     uuidheader = 'uuid.h'
   else
-    error('huh')
+    error('unknown uuid build option value: @0@'.format(uuidopt))
   endif
 
   if not cc.has_header_symbol(uuidheader, uuidfunc, args: test_c_args, dependencies: uuid)
@@ -1381,7 +1382,7 @@ if not zlibopt.disabled()
     warning('did not find zlib')
   elif not cc.has_header('zlib.h',
       args: test_c_args, include_directories: postgres_inc,
-      dependencies: [zlib_t], required: zlibopt.enabled())
+      dependencies: [zlib_t], required: zlibopt)
     warning('zlib header not found')
   elif not cc.has_type('z_streamp',
       dependencies: [zlib_t], prefix: '#include <zlib.h>',
@@ -1601,8 +1602,7 @@ if cc.links('''
 
   if not buggy_int128
     cdata.set('PG_INT128_TYPE', '__int128')
-    cdata.set('ALIGNOF_PG_INT128_TYPE', cc.
-      alignment('__int128', args: test_c_args))
+    cdata.set('ALIGNOF_PG_INT128_TYPE', cc.alignment('__int128', args: test_c_args))
   endif
 endif
 
@@ -1644,8 +1644,8 @@ endif
 # We use <stdbool.h> if we have it and it declares type bool as having
 # size 1.  Otherwise, c.h will fall back to declaring bool as unsigned char.
 if cc.has_type('_Bool', args: test_c_args) \
-  and cc.has_type('bool', prefix: '#include <stdbool.h>', args: test_c_args) \
-  and cc.sizeof('bool', prefix: '#include <stdbool.h>', args: test_c_args) == 1
+    and cc.has_type('bool', prefix: '#include <stdbool.h>', args: test_c_args) \
+    and cc.sizeof('bool', prefix: '#include <stdbool.h>', args: test_c_args) == 1
   cdata.set('HAVE__BOOL', 1)
   cdata.set('PG_USE_STDBOOL', 1)
 endif
@@ -1672,11 +1672,11 @@ endforeach
 
 
 if cc.has_function_attribute('visibility:default') and \
-  cc.has_function_attribute('visibility:hidden')
+    cc.has_function_attribute('visibility:hidden')
   cdata.set('HAVE_VISIBILITY_ATTRIBUTE', 1)
 
   # Only newer versions of meson know not to apply gnu_symbol_visibility =
-  # inlineshidden to C code as well... Any either way, we want to put these
+  # inlineshidden to C code as well... And either way, we want to put these
   # flags into exported files (pgxs, .pc files).
   cflags_mod += '-fvisibility=hidden'
   cxxflags_mod += ['-fvisibility=hidden', '-fvisibility-inlines-hidden']
@@ -2283,17 +2283,13 @@ else
   cdata.set('STRERROR_R_INT', false)
 endif
 
-# Check for the locale_t type and find the right header file.  macOS
-# needs xlocale.h; standard is locale.h, but glibc also has an
-# xlocale.h file that we should not use.  MSVC has a replacement
-# defined in src/include/port/win32_port.h.
-if cc.has_type('locale_t', prefix: '#include <locale.h>')
-  cdata.set('HAVE_LOCALE_T', 1)
-elif cc.has_type('locale_t', prefix: '#include <xlocale.h>')
-  cdata.set('HAVE_LOCALE_T', 1)
+# Find the right header file for the locale_t type.  macOS needs xlocale.h;
+# standard is locale.h, but glibc <= 2.25 also had an xlocale.h file that
+# we should not use so we check the standard header first.  MSVC has a
+# replacement defined in src/include/port/win32_port.h.
+if not cc.has_type('locale_t', prefix: '#include <locale.h>') and \
+   cc.has_type('locale_t', prefix: '#include <xlocale.h>')
   cdata.set('LOCALE_T_IN_XLOCALE', 1)
-elif cc.get_id() == 'msvc'
-  cdata.set('HAVE_LOCALE_T', 1)
 endif
 
 # Check if the C compiler understands typeof or a variant.  Define
@@ -2489,13 +2485,6 @@ if cc.has_function('syslog', args: test_c_args) and \
 endif
 
 
-# MSVC has replacements defined in src/include/port/win32_port.h.
-if cc.get_id() == 'msvc'
-  cdata.set('HAVE_WCSTOMBS_L', 1)
-  cdata.set('HAVE_MBSTOWCS_L', 1)
-endif
-
-
 # if prerequisites for unnamed posix semas aren't fulfilled, fall back to sysv
 # semaphores
 if sema_kind == 'unnamed_posix' and \
@@ -2519,17 +2508,6 @@ cdata.set_quoted('PG_VERSION_STR',
 )
 
 
-
-###############################################################
-# Threading
-###############################################################
-
-# XXX: About to rely on thread safety in the autoconf build, so not worth
-# implementing a fallback.
-cdata.set('ENABLE_THREAD_SAFETY', 1)
-
-
-
 ###############################################################
 # NLS / Gettext
 ###############################################################
@@ -2541,9 +2519,9 @@ if not nlsopt.disabled()
   # otherwise there'd be lots of
   # "Gettext not found, all translation (po) targets will be ignored."
   # warnings if not found.
-  msgfmt = find_program('msgfmt', required: nlsopt.enabled(), native: true)
+  msgfmt = find_program('msgfmt', required: nlsopt, native: true)
 
-  # meson 0.59 has this wrapped in dependency('int')
+  # meson 0.59 has this wrapped in dependency('intl')
   if (msgfmt.found() and
       cc.check_header('libintl.h', required: nlsopt,
         args: test_c_args, include_directories: postgres_inc))
@@ -2678,6 +2656,20 @@ gen_export_kwargs = {
   'build_by_default': false,
   'install': false,
 }
+
+
+
+###
+### Helpers for custom targets used across the tree
+###
+
+catalog_pm = files('src/backend/catalog/Catalog.pm')
+perfect_hash_pm = files('src/tools/PerfectHash.pm')
+gen_kwlist_deps = [perfect_hash_pm]
+gen_kwlist_cmd = [
+  perl, '-I', '@SOURCE_ROOT@/src/tools',
+  files('src/tools/gen_keywordlist.pl'),
+  '--output', '@OUTDIR@', '@INPUT@']
 
 
 
@@ -3034,7 +3026,7 @@ meson_install_args = meson_args + ['install'] + {
     'muon': []
 }[meson_impl]
 
-# setup tests should  be run first,
+# setup tests should be run first,
 # so define priority for these
 setup_tests_priority = 100
 test('tmp_install',
@@ -3360,6 +3352,7 @@ if meson.version().version_compare('>=0.57')
     {
       'bison': '@0@ @1@'.format(bison.full_path(), bison_version),
       'dtrace': dtrace,
+      'flex': '@0@ @1@'.format(flex.full_path(), flex_version),
     },
     section: 'Programs',
   )

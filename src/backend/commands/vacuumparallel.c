@@ -8,7 +8,7 @@
  *
  * In a parallel vacuum, we perform both index bulk deletion and index cleanup
  * with parallel worker processes.  Individual indexes are processed by one
- * vacuum process.  ParalleVacuumState contains shared information as well as
+ * vacuum process.  ParallelVacuumState contains shared information as well as
  * the memory space for storing dead items allocated in the DSM segment.  We
  * launch parallel worker processes at the start of parallel index
  * bulk-deletion and index cleanup and once all indexes are processed, the
@@ -30,6 +30,7 @@
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/index.h"
+#include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "optimizer/paths.h"
 #include "pgstat.h"
@@ -631,7 +632,7 @@ parallel_vacuum_process_all_indexes(ParallelVacuumState *pvs, int num_index_scan
 													vacuum));
 	}
 
-	/* Reset the parallel index processing counter */
+	/* Reset the parallel index processing and progress counters */
 	pg_atomic_write_u32(&(pvs->shared->idx), 0);
 
 	/* Setup the shared cost-based vacuum delay and launch workers */
@@ -902,6 +903,12 @@ parallel_vacuum_process_one_index(ParallelVacuumState *pvs, Relation indrel,
 	pvs->status = PARALLEL_INDVAC_STATUS_COMPLETED;
 	pfree(pvs->indname);
 	pvs->indname = NULL;
+
+	/*
+	 * Call the parallel variant of pgstat_progress_incr_param so workers can
+	 * report progress of index vacuum to the leader.
+	 */
+	pgstat_progress_parallel_incr_param(PROGRESS_VACUUM_INDEXES_PROCESSED, 1);
 }
 
 /*

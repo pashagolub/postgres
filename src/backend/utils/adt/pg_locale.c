@@ -96,7 +96,7 @@ char	   *locale_monetary;
 char	   *locale_numeric;
 char	   *locale_time;
 
-int			icu_validation_level = ERROR;
+int			icu_validation_level = WARNING;
 
 /*
  * lc_time localization cache.
@@ -152,6 +152,43 @@ static int32_t uchar_convert(UConverter *converter,
 							 const char *src, int32_t srclen);
 static void icu_set_collation_attributes(UCollator *collator, const char *loc,
 										 UErrorCode *status);
+#endif
+
+/*
+ * POSIX doesn't define _l-variants of these functions, but several systems
+ * have them.  We provide our own replacements here.
+ */
+#ifndef HAVE_MBSTOWCS_L
+static size_t
+mbstowcs_l(wchar_t *dest, const char *src, size_t n, locale_t loc)
+{
+#ifdef WIN32
+	return _mbstowcs_l(dest, src, n, loc);
+#else
+	size_t		result;
+	locale_t	save_locale = uselocale(loc);
+
+	result = mbstowcs(dest, src, n);
+	uselocale(save_locale);
+	return result;
+#endif
+}
+#endif
+#ifndef HAVE_WCSTOMBS_L
+static size_t
+wcstombs_l(char *dest, const wchar_t *src, size_t n, locale_t loc)
+{
+#ifdef WIN32
+	return _wcstombs_l(dest, src, n, loc);
+#else
+	size_t		result;
+	locale_t	save_locale = uselocale(loc);
+
+	result = wcstombs(dest, src, n);
+	uselocale(save_locale);
+	return result;
+#endif
+}
 #endif
 
 /*
@@ -1012,7 +1049,7 @@ search_locale_enum(LPWSTR pStr, DWORD dwFlags, LPARAM lparam)
 	{
 		/*
 		 * If the enumerated locale does not have a hyphen ("en") OR the
-		 * lc_message input does not have an underscore ("English"), we only
+		 * locale_name input does not have an underscore ("English"), we only
 		 * need to compare the <Language> tags.
 		 */
 		if (wcsrchr(pStr, '-') == NULL || wcsrchr(argv[0], '_') == NULL)
@@ -1160,64 +1197,6 @@ IsoLocaleName(const char *winlocname)
 #endif							/* defined(_MSC_VER) */
 
 #endif							/* WIN32 && LC_MESSAGES */
-
-
-/*
- * Detect aging strxfrm() implementations that, in a subset of locales, write
- * past the specified buffer length.  Affected users must update OS packages
- * before using PostgreSQL 9.5 or later.
- *
- * Assume that the bug can come and go from one postmaster startup to another
- * due to physical replication among diverse machines.  Assume that the bug's
- * presence will not change during the life of a particular postmaster.  Given
- * those assumptions, call this no less than once per postmaster startup per
- * LC_COLLATE setting used.  No known-affected system offers strxfrm_l(), so
- * there is no need to consider pg_collation locales.
- */
-void
-check_strxfrm_bug(void)
-{
-	char		buf[32];
-	const int	canary = 0x7F;
-	bool		ok = true;
-
-	/*
-	 * Given a two-byte ASCII string and length limit 7, 8 or 9, Solaris 10
-	 * 05/08 returns 18 and modifies 10 bytes.  It respects limits above or
-	 * below that range.
-	 *
-	 * The bug is present in Solaris 8 as well; it is absent in Solaris 10
-	 * 01/13 and Solaris 11.2.  Affected locales include is_IS.ISO8859-1,
-	 * en_US.UTF-8, en_US.ISO8859-1, and ru_RU.KOI8-R.  Unaffected locales
-	 * include de_DE.UTF-8, de_DE.ISO8859-1, zh_TW.UTF-8, and C.
-	 */
-	buf[7] = canary;
-	(void) strxfrm(buf, "ab", 7);
-	if (buf[7] != canary)
-		ok = false;
-
-	/*
-	 * illumos bug #1594 was present in the source tree from 2010-10-11 to
-	 * 2012-02-01.  Given an ASCII string of any length and length limit 1,
-	 * affected systems ignore the length limit and modify a number of bytes
-	 * one less than the return value.  The problem inputs for this bug do not
-	 * overlap those for the Solaris bug, hence a distinct test.
-	 *
-	 * Affected systems include smartos-20110926T021612Z.  Affected locales
-	 * include en_US.ISO8859-1 and en_US.UTF-8.  Unaffected locales include C.
-	 */
-	buf[1] = canary;
-	(void) strxfrm(buf, "a", 1);
-	if (buf[1] != canary)
-		ok = false;
-
-	if (!ok)
-		ereport(ERROR,
-				(errcode(ERRCODE_SYSTEM_ERROR),
-				 errmsg_internal("strxfrm(), in locale \"%s\", writes past the specified array length",
-								 setlocale(LC_COLLATE, NULL)),
-				 errhint("Apply system library package updates.")));
-}
 
 
 /*
@@ -1478,7 +1457,6 @@ make_icu_collator(const char *iculocstr,
 
 
 /* simple subroutine for reporting errors from newlocale() */
-#ifdef HAVE_LOCALE_T
 static void
 report_newlocale_failure(const char *localename)
 {
@@ -1507,7 +1485,6 @@ report_newlocale_failure(const char *localename)
 			  errdetail("The operating system could not find any locale data for the locale name \"%s\".",
 						localename) : 0)));
 }
-#endif							/* HAVE_LOCALE_T */
 
 bool
 pg_locale_deterministic(pg_locale_t locale)
@@ -1524,10 +1501,6 @@ pg_locale_deterministic(pg_locale_t locale)
  * lifetime of the backend.  Thus, do not free the result with freelocale().
  *
  * As a special optimization, the default/database collation returns 0.
- * Callers should then revert to the non-locale_t-enabled code path.
- * Also, callers should avoid calling this before going down a C/POSIX
- * fastpath, because such a fastpath should work even on platforms without
- * locale_t support in the C library.
  *
  * For simplicity, we always generate COLLATE + CTYPE even though we
  * might only need one of them.  Since this is called only once per session,
@@ -1573,7 +1546,6 @@ pg_newlocale_from_collation(Oid collid)
 
 		if (collform->collprovider == COLLPROVIDER_LIBC)
 		{
-#ifdef HAVE_LOCALE_T
 			const char *collcollate;
 			const char *collctype pg_attribute_unused();
 			locale_t	loc;
@@ -1624,12 +1596,6 @@ pg_newlocale_from_collation(Oid collid)
 			}
 
 			result.info.lt = loc;
-#else							/* not HAVE_LOCALE_T */
-			/* platform that doesn't support locale_t */
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("collation provider LIBC is not supported on this platform")));
-#endif							/* not HAVE_LOCALE_T */
 		}
 		else if (collform->collprovider == COLLPROVIDER_ICU)
 		{
@@ -1846,14 +1812,11 @@ pg_strncoll_libc_win32_utf8(const char *arg1, size_t len1, const char *arg2,
 	((LPWSTR) a2p)[r] = 0;
 
 	errno = 0;
-#ifdef HAVE_LOCALE_T
 	if (locale)
 		result = wcscoll_l((LPWSTR) a1p, (LPWSTR) a2p, locale->info.lt);
 	else
-#endif
 		result = wcscoll((LPWSTR) a1p, (LPWSTR) a2p);
-	if (result == 2147483647)	/* _NLSCMPERROR; missing from mingw
-								 * headers */
+	if (result == 2147483647)	/* _NLSCMPERROR; missing from mingw headers */
 		ereport(ERROR,
 				(errmsg("could not compare Unicode strings: %m")));
 
@@ -1876,27 +1839,21 @@ pg_strncoll_libc_win32_utf8(const char *arg1, size_t len1, const char *arg2,
 static int
 pg_strcoll_libc(const char *arg1, const char *arg2, pg_locale_t locale)
 {
-	int result;
+	int			result;
 
 	Assert(!locale || locale->provider == COLLPROVIDER_LIBC);
 #ifdef WIN32
 	if (GetDatabaseEncoding() == PG_UTF8)
 	{
-		size_t len1 = strlen(arg1);
-		size_t len2 = strlen(arg2);
+		size_t		len1 = strlen(arg1);
+		size_t		len2 = strlen(arg2);
+
 		result = pg_strncoll_libc_win32_utf8(arg1, len1, arg2, len2, locale);
 	}
 	else
 #endif							/* WIN32 */
 	if (locale)
-	{
-#ifdef HAVE_LOCALE_T
 		result = strcoll_l(arg1, arg2, locale->info.lt);
-#else
-		/* shouldn't happen */
-		elog(ERROR, "unsupported collprovider: %c", locale->provider);
-#endif
-	}
 	else
 		result = strcoll(arg1, arg2);
 
@@ -1912,13 +1869,13 @@ static int
 pg_strncoll_libc(const char *arg1, size_t len1, const char *arg2, size_t len2,
 				 pg_locale_t locale)
 {
-	char	 sbuf[TEXTBUFLEN];
-	char	*buf	  = sbuf;
-	size_t	 bufsize1 = len1 + 1;
-	size_t	 bufsize2 = len2 + 1;
-	char	*arg1n;
-	char	*arg2n;
-	int		 result;
+	char		sbuf[TEXTBUFLEN];
+	char	   *buf = sbuf;
+	size_t		bufsize1 = len1 + 1;
+	size_t		bufsize2 = len2 + 1;
+	char	   *arg1n;
+	char	   *arg2n;
+	int			result;
 
 	Assert(!locale || locale->provider == COLLPROVIDER_LIBC);
 
@@ -1964,15 +1921,15 @@ static int
 pg_strncoll_icu_no_utf8(const char *arg1, int32_t len1,
 						const char *arg2, int32_t len2, pg_locale_t locale)
 {
-	char	 sbuf[TEXTBUFLEN];
-	char	*buf = sbuf;
-	int32_t	 ulen1;
-	int32_t	 ulen2;
-	size_t   bufsize1;
-	size_t   bufsize2;
-	UChar	*uchar1,
-			*uchar2;
-	int		 result;
+	char		sbuf[TEXTBUFLEN];
+	char	   *buf = sbuf;
+	int32_t		ulen1;
+	int32_t		ulen2;
+	size_t		bufsize1;
+	size_t		bufsize2;
+	UChar	   *uchar1,
+			   *uchar2;
+	int			result;
 
 	Assert(locale->provider == COLLPROVIDER_ICU);
 #ifdef HAVE_UCOL_STRCOLLUTF8
@@ -2019,7 +1976,7 @@ static int
 pg_strncoll_icu(const char *arg1, int32_t len1, const char *arg2, int32_t len2,
 				pg_locale_t locale)
 {
-	int result;
+	int			result;
 
 	Assert(locale->provider == COLLPROVIDER_ICU);
 
@@ -2100,7 +2057,7 @@ int
 pg_strncoll(const char *arg1, size_t len1, const char *arg2, size_t len2,
 			pg_locale_t locale)
 {
-	int		 result;
+	int			result;
 
 	if (!locale || locale->provider == COLLPROVIDER_LIBC)
 		result = pg_strncoll_libc(arg1, len1, arg2, len2, locale);
@@ -2123,16 +2080,14 @@ pg_strxfrm_libc(char *dest, const char *src, size_t destsize,
 	Assert(!locale || locale->provider == COLLPROVIDER_LIBC);
 
 #ifdef TRUST_STRXFRM
-#ifdef HAVE_LOCALE_T
 	if (locale)
 		return strxfrm_l(dest, src, destsize, locale->info.lt);
 	else
-#endif
 		return strxfrm(dest, src, destsize);
 #else
 	/* shouldn't happen */
 	elog(ERROR, "unsupported collprovider: %c", locale->provider);
-	return 0; /* keep compiler quiet */
+	return 0;					/* keep compiler quiet */
 #endif
 }
 
@@ -2140,10 +2095,10 @@ static size_t
 pg_strnxfrm_libc(char *dest, const char *src, size_t srclen, size_t destsize,
 				 pg_locale_t locale)
 {
-	char	 sbuf[TEXTBUFLEN];
-	char	*buf	 = sbuf;
-	size_t	 bufsize = srclen + 1;
-	size_t	 result;
+	char		sbuf[TEXTBUFLEN];
+	char	   *buf = sbuf;
+	size_t		bufsize = srclen + 1;
+	size_t		result;
 
 	Assert(!locale || locale->provider == COLLPROVIDER_LIBC);
 
@@ -2172,12 +2127,12 @@ static size_t
 pg_strnxfrm_icu(char *dest, const char *src, int32_t srclen, int32_t destsize,
 				pg_locale_t locale)
 {
-	char	 sbuf[TEXTBUFLEN];
-	char	*buf	= sbuf;
-	UChar	*uchar;
-	int32_t	 ulen;
-	size_t   uchar_bsize;
-	Size	 result_bsize;
+	char		sbuf[TEXTBUFLEN];
+	char	   *buf = sbuf;
+	UChar	   *uchar;
+	int32_t		ulen;
+	size_t		uchar_bsize;
+	Size		result_bsize;
 
 	Assert(locale->provider == COLLPROVIDER_ICU);
 
@@ -2219,15 +2174,15 @@ static size_t
 pg_strnxfrm_prefix_icu_no_utf8(char *dest, const char *src, int32_t srclen,
 							   int32_t destsize, pg_locale_t locale)
 {
-	char			 sbuf[TEXTBUFLEN];
-	char			*buf   = sbuf;
-	UCharIterator	 iter;
-	uint32_t		 state[2];
-	UErrorCode		 status;
-	int32_t			 ulen  = -1;
-	UChar			*uchar = NULL;
-	size_t			 uchar_bsize;
-	Size			 result_bsize;
+	char		sbuf[TEXTBUFLEN];
+	char	   *buf = sbuf;
+	UCharIterator iter;
+	uint32_t	state[2];
+	UErrorCode	status;
+	int32_t		ulen = -1;
+	UChar	   *uchar = NULL;
+	size_t		uchar_bsize;
+	Size		result_bsize;
 
 	Assert(locale->provider == COLLPROVIDER_ICU);
 	Assert(GetDatabaseEncoding() != PG_UTF8);
@@ -2267,7 +2222,7 @@ static size_t
 pg_strnxfrm_prefix_icu(char *dest, const char *src, int32_t srclen,
 					   int32_t destsize, pg_locale_t locale)
 {
-	size_t result;
+	size_t		result;
 
 	Assert(locale->provider == COLLPROVIDER_ICU);
 
@@ -2329,7 +2284,7 @@ pg_strxfrm_enabled(pg_locale_t locale)
 		/* shouldn't happen */
 		elog(ERROR, "unsupported collprovider: %c", locale->provider);
 
-	return false; /* keep compiler quiet */
+	return false;				/* keep compiler quiet */
 }
 
 /*
@@ -2349,7 +2304,7 @@ pg_strxfrm_enabled(pg_locale_t locale)
 size_t
 pg_strxfrm(char *dest, const char *src, size_t destsize, pg_locale_t locale)
 {
-	size_t result = 0; /* keep compiler quiet */
+	size_t		result = 0;		/* keep compiler quiet */
 
 	if (!locale || locale->provider == COLLPROVIDER_LIBC)
 		result = pg_strxfrm_libc(dest, src, destsize, locale);
@@ -2386,7 +2341,7 @@ size_t
 pg_strnxfrm(char *dest, size_t destsize, const char *src, size_t srclen,
 			pg_locale_t locale)
 {
-	size_t result = 0; /* keep compiler quiet */
+	size_t		result = 0;		/* keep compiler quiet */
 
 	if (!locale || locale->provider == COLLPROVIDER_LIBC)
 		result = pg_strnxfrm_libc(dest, src, srclen, destsize, locale);
@@ -2416,7 +2371,7 @@ pg_strxfrm_prefix_enabled(pg_locale_t locale)
 		/* shouldn't happen */
 		elog(ERROR, "unsupported collprovider: %c", locale->provider);
 
-	return false; /* keep compiler quiet */
+	return false;				/* keep compiler quiet */
 }
 
 /*
@@ -2436,7 +2391,7 @@ size_t
 pg_strxfrm_prefix(char *dest, const char *src, size_t destsize,
 				  pg_locale_t locale)
 {
-	size_t result = 0; /* keep compiler quiet */
+	size_t		result = 0;		/* keep compiler quiet */
 
 	if (!locale || locale->provider == COLLPROVIDER_LIBC)
 		elog(ERROR, "collprovider '%c' does not support pg_strxfrm_prefix()",
@@ -2473,7 +2428,7 @@ size_t
 pg_strnxfrm_prefix(char *dest, size_t destsize, const char *src,
 				   size_t srclen, pg_locale_t locale)
 {
-	size_t result = 0; /* keep compiler quiet */
+	size_t		result = 0;		/* keep compiler quiet */
 
 	if (!locale || locale->provider == COLLPROVIDER_LIBC)
 		elog(ERROR, "collprovider '%c' does not support pg_strnxfrm_prefix()",
@@ -2526,7 +2481,7 @@ pg_ucol_open(const char *loc_str)
 
 		status = U_ZERO_ERROR;
 		uloc_getLanguage(loc_str, lang, ULOC_LANG_CAPACITY, &status);
-		if (U_FAILURE(status))
+		if (U_FAILURE(status) || status == U_STRING_NOT_TERMINATED_WARNING)
 		{
 			ereport(ERROR,
 					(errmsg("could not get language from locale \"%s\": %s",
@@ -2549,7 +2504,7 @@ pg_ucol_open(const char *loc_str)
 	collator = ucol_open(loc_str, &status);
 	if (U_FAILURE(status))
 		ereport(ERROR,
-				/* use original string for error report */
+		/* use original string for error report */
 				(errmsg("could not open collator for locale \"%s\": %s",
 						orig_str, u_errorName(status))));
 
@@ -2562,7 +2517,7 @@ pg_ucol_open(const char *loc_str)
 		 * Pretend the error came from ucol_open(), for consistent error
 		 * message across ICU versions.
 		 */
-		if (U_FAILURE(status))
+		if (U_FAILURE(status) || status == U_STRING_NOT_TERMINATED_WARNING)
 		{
 			ucol_close(collator);
 			ereport(ERROR,
@@ -2612,6 +2567,7 @@ uchar_length(UConverter *converter, const char *str, int32_t len)
 {
 	UErrorCode	status = U_ZERO_ERROR;
 	int32_t		ulen;
+
 	ulen = ucnv_toUChars(converter, NULL, 0, str, len, &status);
 	if (U_FAILURE(status) && status != U_BUFFER_OVERFLOW_ERROR)
 		ereport(ERROR,
@@ -2629,6 +2585,7 @@ uchar_convert(UConverter *converter, UChar *dest, int32_t destlen,
 {
 	UErrorCode	status = U_ZERO_ERROR;
 	int32_t		ulen;
+
 	status = U_ZERO_ERROR;
 	ulen = ucnv_toUChars(converter, dest, destlen, src, srclen, &status);
 	if (U_FAILURE(status))
@@ -2652,7 +2609,7 @@ uchar_convert(UConverter *converter, UChar *dest, int32_t destlen,
 int32_t
 icu_to_uchar(UChar **buff_uchar, const char *buff, size_t nbytes)
 {
-	int32_t len_uchar;
+	int32_t		len_uchar;
 
 	init_icu_converter();
 
@@ -2697,7 +2654,8 @@ icu_from_uchar(char **result, const UChar *buff_uchar, int32_t len_uchar)
 	status = U_ZERO_ERROR;
 	len_result = ucnv_fromUChars(icu_converter, *result, len_result + 1,
 								 buff_uchar, len_uchar, &status);
-	if (U_FAILURE(status))
+	if (U_FAILURE(status) ||
+		status == U_STRING_NOT_TERMINATED_WARNING)
 		ereport(ERROR,
 				(errmsg("%s failed: %s", "ucnv_fromUChars",
 						u_errorName(status))));
@@ -2739,7 +2697,7 @@ icu_set_collation_attributes(UCollator *collator, const char *loc,
 	icu_locale_id = palloc(len + 1);
 	*status = U_ZERO_ERROR;
 	len = uloc_canonicalize(loc, icu_locale_id, len + 1, status);
-	if (U_FAILURE(*status))
+	if (U_FAILURE(*status) || *status == U_STRING_NOT_TERMINATED_WARNING)
 		return;
 
 	lower_str = asc_tolower(icu_locale_id, strlen(icu_locale_id));
@@ -2823,7 +2781,6 @@ icu_set_collation_attributes(UCollator *collator, const char *loc,
 
 	pfree(lower_str);
 }
-
 #endif
 
 /*
@@ -2839,49 +2796,26 @@ char *
 icu_language_tag(const char *loc_str, int elevel)
 {
 #ifdef USE_ICU
-	UErrorCode	 status;
-	char		 lang[ULOC_LANG_CAPACITY];
-	char		*langtag;
-	size_t		 buflen = 32;	/* arbitrary starting buffer size */
-	const bool	 strict = true;
-
-	status = U_ZERO_ERROR;
-	uloc_getLanguage(loc_str, lang, ULOC_LANG_CAPACITY, &status);
-	if (U_FAILURE(status))
-	{
-		if (elevel > 0)
-			ereport(elevel,
-					(errmsg("could not get language from locale \"%s\": %s",
-							loc_str, u_errorName(status))));
-		return NULL;
-	}
-
-	/* C/POSIX locales aren't handled by uloc_getLanguageTag() */
-	if (strcmp(lang, "c") == 0 || strcmp(lang, "posix") == 0)
-		return pstrdup("en-US-u-va-posix");
+	UErrorCode	status;
+	char	   *langtag;
+	size_t		buflen = 32;	/* arbitrary starting buffer size */
+	const bool	strict = true;
 
 	/*
-	 * A BCP47 language tag doesn't have a clearly-defined upper limit
-	 * (cf. RFC5646 section 4.4). Additionally, in older ICU versions,
+	 * A BCP47 language tag doesn't have a clearly-defined upper limit (cf.
+	 * RFC5646 section 4.4). Additionally, in older ICU versions,
 	 * uloc_toLanguageTag() doesn't always return the ultimate length on the
 	 * first call, necessitating a loop.
 	 */
 	langtag = palloc(buflen);
 	while (true)
 	{
-		int32_t		len;
-
 		status = U_ZERO_ERROR;
-		len = uloc_toLanguageTag(loc_str, langtag, buflen, strict, &status);
+		uloc_toLanguageTag(loc_str, langtag, buflen, strict, &status);
 
-		/*
-		 * If the result fits in the buffer exactly (len == buflen),
-		 * uloc_toLanguageTag() will return success without nul-terminating
-		 * the result. Check for either U_BUFFER_OVERFLOW_ERROR or len >=
-		 * buflen and try again.
-		 */
+		/* try again if the buffer is not large enough */
 		if ((status == U_BUFFER_OVERFLOW_ERROR ||
-			 (U_SUCCESS(status) && len >= buflen)) &&
+			 status == U_STRING_NOT_TERMINATED_WARNING) &&
 			buflen < MaxAllocSize)
 		{
 			buflen = Min(buflen * 2, MaxAllocSize);
@@ -2908,7 +2842,7 @@ icu_language_tag(const char *loc_str, int elevel)
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("ICU is not supported in this build")));
-	return NULL;		/* keep compiler quiet */
+	return NULL;				/* keep compiler quiet */
 #endif							/* not USE_ICU */
 }
 
@@ -2919,11 +2853,11 @@ void
 icu_validate_locale(const char *loc_str)
 {
 #ifdef USE_ICU
-	UCollator	*collator;
-	UErrorCode	 status;
-	char		 lang[ULOC_LANG_CAPACITY];
-	bool		 found	 = false;
-	int			 elevel = icu_validation_level;
+	UCollator  *collator;
+	UErrorCode	status;
+	char		lang[ULOC_LANG_CAPACITY];
+	bool		found = false;
+	int			elevel = icu_validation_level;
 
 	/* no validation */
 	if (elevel < 0)
@@ -2936,30 +2870,30 @@ icu_validate_locale(const char *loc_str)
 	/* validate that we can extract the language */
 	status = U_ZERO_ERROR;
 	uloc_getLanguage(loc_str, lang, ULOC_LANG_CAPACITY, &status);
-	if (U_FAILURE(status))
+	if (U_FAILURE(status) || status == U_STRING_NOT_TERMINATED_WARNING)
 	{
 		ereport(elevel,
 				(errmsg("could not get language from ICU locale \"%s\": %s",
 						loc_str, u_errorName(status)),
-				 errhint("To disable ICU locale validation, set parameter icu_validation_level to DISABLED.")));
+				 errhint("To disable ICU locale validation, set the parameter \"%s\" to \"%s\".",
+						 "icu_validation_level", "disabled")));
 		return;
 	}
 
 	/* check for special language name */
 	if (strcmp(lang, "") == 0 ||
-		strcmp(lang, "root") == 0 || strcmp(lang, "und") == 0 ||
-		strcmp(lang, "c") == 0 || strcmp(lang, "posix") == 0)
+		strcmp(lang, "root") == 0 || strcmp(lang, "und") == 0)
 		found = true;
 
 	/* search for matching language within ICU */
 	for (int32_t i = 0; !found && i < uloc_countAvailable(); i++)
 	{
-		const char	*otherloc = uloc_getAvailable(i);
-		char		 otherlang[ULOC_LANG_CAPACITY];
+		const char *otherloc = uloc_getAvailable(i);
+		char		otherlang[ULOC_LANG_CAPACITY];
 
 		status = U_ZERO_ERROR;
 		uloc_getLanguage(otherloc, otherlang, ULOC_LANG_CAPACITY, &status);
-		if (U_FAILURE(status))
+		if (U_FAILURE(status) || status == U_STRING_NOT_TERMINATED_WARNING)
 			continue;
 
 		if (strcmp(lang, otherlang) == 0)
@@ -2970,7 +2904,8 @@ icu_validate_locale(const char *loc_str)
 		ereport(elevel,
 				(errmsg("ICU locale \"%s\" has unknown language \"%s\"",
 						loc_str, lang),
-				 errhint("To disable ICU locale validation, set parameter icu_validation_level to DISABLED.")));
+				 errhint("To disable ICU locale validation, set the parameter \"%s\" to \"%s\".",
+						 "icu_validation_level", "disabled")));
 
 	/* check that it can be opened */
 	collator = pg_ucol_open(loc_str);
@@ -3035,23 +2970,8 @@ wchar2char(char *to, const wchar_t *from, size_t tolen, pg_locale_t locale)
 	}
 	else
 	{
-#ifdef HAVE_LOCALE_T
-#ifdef HAVE_WCSTOMBS_L
 		/* Use wcstombs_l for nondefault locales */
 		result = wcstombs_l(to, from, tolen, locale->info.lt);
-#else							/* !HAVE_WCSTOMBS_L */
-		/* We have to temporarily set the locale as current ... ugh */
-		locale_t	save_locale = uselocale(locale->info.lt);
-
-		result = wcstombs(to, from, tolen);
-
-		uselocale(save_locale);
-#endif							/* HAVE_WCSTOMBS_L */
-#else							/* !HAVE_LOCALE_T */
-		/* Can't have locale != 0 without HAVE_LOCALE_T */
-		elog(ERROR, "wcstombs_l is not available");
-		result = 0;				/* keep compiler quiet */
-#endif							/* HAVE_LOCALE_T */
 	}
 
 	return result;
@@ -3112,23 +3032,8 @@ char2wchar(wchar_t *to, size_t tolen, const char *from, size_t fromlen,
 		}
 		else
 		{
-#ifdef HAVE_LOCALE_T
-#ifdef HAVE_MBSTOWCS_L
 			/* Use mbstowcs_l for nondefault locales */
 			result = mbstowcs_l(to, str, tolen, locale->info.lt);
-#else							/* !HAVE_MBSTOWCS_L */
-			/* We have to temporarily set the locale as current ... ugh */
-			locale_t	save_locale = uselocale(locale->info.lt);
-
-			result = mbstowcs(to, str, tolen);
-
-			uselocale(save_locale);
-#endif							/* HAVE_MBSTOWCS_L */
-#else							/* !HAVE_LOCALE_T */
-			/* Can't have locale != 0 without HAVE_LOCALE_T */
-			elog(ERROR, "mbstowcs_l is not available");
-			result = 0;			/* keep compiler quiet */
-#endif							/* HAVE_LOCALE_T */
 		}
 
 		pfree(str);

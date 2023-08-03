@@ -55,7 +55,7 @@ static PartitionDesc RelationBuildPartitionDesc(Relation rel,
  * RelationGetPartitionDesc -- get partition descriptor, if relation is partitioned
  *
  * We keep two partdescs in relcache: rd_partdesc includes all partitions
- * (even those being concurrently marked detached), while rd_partdesc_nodetach
+ * (even those being concurrently marked detached), while rd_partdesc_nodetached
  * omits (some of) those.  We store the pg_inherits.xmin value for the latter,
  * to determine whether it can be validly reused in each case, since that
  * depends on the active snapshot.
@@ -183,7 +183,7 @@ RelationBuildPartitionDesc(Relation rel, bool omit_detached)
 		PartitionBoundSpec *boundspec = NULL;
 
 		/* Try fetching the tuple from the catcache, for speed. */
-		tuple = SearchSysCache1(RELOID, inhrelid);
+		tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(inhrelid));
 		if (HeapTupleIsValid(tuple))
 		{
 			Datum		datum;

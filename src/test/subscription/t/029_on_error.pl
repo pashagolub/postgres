@@ -13,7 +13,7 @@ my $offset = 0;
 # Test skipping the transaction. This function must be called after the caller
 # has inserted data that conflicts with the subscriber.  The finish LSN of the
 # error transaction that is used to specify to ALTER SUBSCRIPTION ... SKIP is
-# fetched from the server logs. After executing ALTER SUBSCRITPION ... SKIP, we
+# fetched from the server logs. After executing ALTER SUBSCRIPTION ... SKIP, we
 # check if logical replication can continue working by inserting $nonconflict_data
 # on the publisher.
 sub test_skip_lsn
@@ -91,13 +91,13 @@ $node_subscriber->start;
 $node_publisher->safe_psql(
 	'postgres',
 	qq[
-CREATE TABLE tbl (i INT, t TEXT);
+CREATE TABLE tbl (i INT, t BYTEA);
 INSERT INTO tbl VALUES (1, NULL);
 ]);
 $node_subscriber->safe_psql(
 	'postgres',
 	qq[
-CREATE TABLE tbl (i INT PRIMARY KEY, t TEXT);
+CREATE TABLE tbl (i INT PRIMARY KEY, t BYTEA);
 INSERT INTO tbl VALUES (1, NULL);
 ]);
 
@@ -163,10 +163,10 @@ $node_publisher->safe_psql(
 	'postgres',
 	qq[
 BEGIN;
-INSERT INTO tbl SELECT i, md5(i::text) FROM generate_series(1, 10000) s(i);
+INSERT INTO tbl SELECT i, sha256(i::text::bytea) FROM generate_series(1, 10000) s(i);
 COMMIT;
 ]);
-test_skip_lsn($node_publisher, $node_subscriber, "(4, md5(4::text))",
+test_skip_lsn($node_publisher, $node_subscriber, "(4, sha256(4::text::bytea))",
 	"4", "test skipping stream-commit");
 
 $result = $node_subscriber->safe_psql('postgres',

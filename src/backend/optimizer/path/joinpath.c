@@ -24,6 +24,7 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
+#include "optimizer/restrictinfo.h"
 #include "utils/typcache.h"
 
 /* Hook for plugins to get control in add_paths_to_joinrel() */
@@ -130,6 +131,7 @@ add_paths_to_joinrel(PlannerInfo *root,
 {
 	JoinPathExtraData extra;
 	bool		mergejoin_allowed = true;
+	bool		consider_join_pushdown = false;
 	ListCell   *lc;
 	Relids		joinrelids;
 
@@ -322,12 +324,24 @@ add_paths_to_joinrel(PlannerInfo *root,
 							 jointype, &extra);
 
 	/*
+	 * createplan.c does not currently support handling of pseudoconstant
+	 * clauses assigned to joins pushed down by extensions; check if the
+	 * restrictlist has such clauses, and if so, disallow pushing down joins.
+	 */
+	if ((joinrel->fdwroutine &&
+		 joinrel->fdwroutine->GetForeignJoinPaths) ||
+		set_join_pathlist_hook)
+		consider_join_pushdown = !has_pseudoconstant_clauses(root,
+															 restrictlist);
+
+	/*
 	 * 5. If inner and outer relations are foreign tables (or joins) belonging
 	 * to the same server and assigned to the same user to check access
 	 * permissions as, give the FDW a chance to push down joins.
 	 */
 	if (joinrel->fdwroutine &&
-		joinrel->fdwroutine->GetForeignJoinPaths)
+		joinrel->fdwroutine->GetForeignJoinPaths &&
+		consider_join_pushdown)
 		joinrel->fdwroutine->GetForeignJoinPaths(root, joinrel,
 												 outerrel, innerrel,
 												 jointype, &extra);
@@ -335,7 +349,8 @@ add_paths_to_joinrel(PlannerInfo *root,
 	/*
 	 * 6. Finally, give extensions a chance to manipulate the path list.
 	 */
-	if (set_join_pathlist_hook)
+	if (set_join_pathlist_hook &&
+		consider_join_pushdown)
 		set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
 							   jointype, &extra);
 }
@@ -421,12 +436,15 @@ have_unsafe_outer_join_ref(PlannerInfo *root,
 
 /*
  * paraminfo_get_equal_hashops
- *		Determine if param_info and innerrel's lateral_vars can be hashed.
- *		Returns true the hashing is possible, otherwise return false.
+ *		Determine if the clauses in param_info and innerrel's lateral_vars
+ *		can be hashed.
+ *		Returns true if hashing is possible, otherwise false.
  *
- * Additionally we also collect the outer exprs and the hash operators for
- * each parameter to innerrel.  These set in 'param_exprs', 'operators' and
- * 'binary_mode' when we return true.
+ * Additionally, on success we collect the outer expressions and the
+ * appropriate equality operators for each hashable parameter to innerrel.
+ * These are returned in parallel lists in *param_exprs and *operators.
+ * We also set *binary_mode to indicate whether strict binary matching is
+ * required.
  */
 static bool
 paraminfo_get_equal_hashops(PlannerInfo *root, ParamPathInfo *param_info,
@@ -441,6 +459,7 @@ paraminfo_get_equal_hashops(PlannerInfo *root, ParamPathInfo *param_info,
 	*operators = NIL;
 	*binary_mode = false;
 
+	/* Add join clauses from param_info to the hash key */
 	if (param_info != NULL)
 	{
 		List	   *clauses = param_info->ppi_clauses;
@@ -510,7 +529,7 @@ paraminfo_get_equal_hashops(PlannerInfo *root, ParamPathInfo *param_info,
 		Node	   *expr = (Node *) lfirst(lc);
 		TypeCacheEntry *typentry;
 
-		/* Reject if there are any volatile functions */
+		/* Reject if there are any volatile functions in PHVs */
 		if (contain_volatile_functions(expr))
 		{
 			list_free(*operators);
@@ -521,7 +540,7 @@ paraminfo_get_equal_hashops(PlannerInfo *root, ParamPathInfo *param_info,
 		typentry = lookup_type_cache(exprType(expr),
 									 TYPECACHE_HASH_PROC | TYPECACHE_EQ_OPR);
 
-		/* can't use a memoize node without a valid hash equals operator */
+		/* can't use memoize without a valid hash proc and equals operator */
 		if (!OidIsValid(typentry->hash_proc) || !OidIsValid(typentry->eq_opr))
 		{
 			list_free(*operators);
@@ -693,6 +712,17 @@ try_nestloop_path(PlannerInfo *root,
 	Relids		outerrelids;
 	Relids		inner_paramrels = PATH_REQ_OUTER(inner_path);
 	Relids		outer_paramrels = PATH_REQ_OUTER(outer_path);
+
+	/*
+	 * If we are forming an outer join at this join, it's nonsensical to use
+	 * an input path that uses the outer join as part of its parameterization.
+	 * (This can happen despite our join order restrictions, since those apply
+	 * to what is in an input relation not what its parameters are.)
+	 */
+	if (extra->sjinfo->ojrelid != 0 &&
+		(bms_is_member(extra->sjinfo->ojrelid, inner_paramrels) ||
+		 bms_is_member(extra->sjinfo->ojrelid, outer_paramrels)))
+		return;
 
 	/*
 	 * Paths are parameterized by top-level parents, so run parameterization
@@ -905,6 +935,17 @@ try_mergejoin_path(PlannerInfo *root,
 	}
 
 	/*
+	 * If we are forming an outer join at this join, it's nonsensical to use
+	 * an input path that uses the outer join as part of its parameterization.
+	 * (This can happen despite our join order restrictions, since those apply
+	 * to what is in an input relation not what its parameters are.)
+	 */
+	if (extra->sjinfo->ojrelid != 0 &&
+		(bms_is_member(extra->sjinfo->ojrelid, PATH_REQ_OUTER(inner_path)) ||
+		 bms_is_member(extra->sjinfo->ojrelid, PATH_REQ_OUTER(outer_path))))
+		return;
+
+	/*
 	 * Check to see if proposed path is still parameterized, and reject if the
 	 * parameterization wouldn't be sensible.
 	 */
@@ -1049,6 +1090,17 @@ try_hashjoin_path(PlannerInfo *root,
 {
 	Relids		required_outer;
 	JoinCostWorkspace workspace;
+
+	/*
+	 * If we are forming an outer join at this join, it's nonsensical to use
+	 * an input path that uses the outer join as part of its parameterization.
+	 * (This can happen despite our join order restrictions, since those apply
+	 * to what is in an input relation not what its parameters are.)
+	 */
+	if (extra->sjinfo->ojrelid != 0 &&
+		(bms_is_member(extra->sjinfo->ojrelid, PATH_REQ_OUTER(inner_path)) ||
+		 bms_is_member(extra->sjinfo->ojrelid, PATH_REQ_OUTER(outer_path))))
+		return;
 
 	/*
 	 * Check to see if proposed path is still parameterized, and reject if the

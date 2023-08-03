@@ -85,7 +85,7 @@ GetCurrentLSN(void)
 }
 
 /*
- * Intialize WAL reader and identify first valid LSN.
+ * Initialize WAL reader and identify first valid LSN.
  */
 static XLogReaderState *
 InitXLogReaderState(XLogRecPtr lsn)
@@ -252,8 +252,8 @@ GetWALBlockInfo(FunctionCallInfo fcinfo, XLogReaderState *record,
 	int			block_id;
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	RmgrData	desc;
-	const char	*record_type;
-	StringInfoData	rec_desc;
+	const char *record_type;
+	StringInfoData rec_desc;
 
 	Assert(XLogRecHasAnyBlockRefs(record));
 

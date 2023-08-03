@@ -16,7 +16,7 @@ if strip_bin.found()
       strip_version.stdout().contains('GNU strip') or
       strip_version.stderr().contains('GNU strip'))
     working_strip = true
-    strip_static_cmd = strip_cmd + ['-x']
+    strip_static_cmd = strip_cmd + ['--strip-unneeded']
     strip_shared_cmd = strip_cmd + ['--strip-unneeded']
   elif host_system == 'darwin'
     working_strip = true
@@ -52,7 +52,6 @@ pgxs_kv = {
   'abs_top_builddir': meson.build_root(),
   'abs_top_srcdir': meson.source_root(),
 
-  'enable_thread_safety': 'yes',
   'enable_rpath': get_option('rpath') ? 'yes' : 'no',
   'enable_nls': libintl.found() ? 'yes' : 'no',
   'enable_tap_tests': tap_tests_enabled ? 'yes' : 'no',

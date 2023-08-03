@@ -23,6 +23,7 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
 #include "optimizer/planner.h"
+#include "optimizer/subselect.h"
 #include "optimizer/tlist.h"
 #include "parser/parse_relation.h"
 #include "tcop/utility.h"
@@ -42,9 +43,7 @@ typedef struct
 	int			varno;			/* RT index of Var */
 	AttrNumber	varattno;		/* attr number of Var */
 	AttrNumber	resno;			/* TLE position of Var */
-#ifdef USE_ASSERT_CHECKING
 	Bitmapset  *varnullingrels; /* Var's varnullingrels */
-#endif
 } tlist_vinfo;
 
 typedef struct
@@ -348,29 +347,6 @@ set_plan_references(PlannerInfo *root, Plan *plan)
 			palloc0(list_length(glob->subplans) * sizeof(bool));
 		root->isUsedSubplan = (bool *)
 			palloc0(list_length(glob->subplans) * sizeof(bool));
-	}
-
-	/* Also fix up the information in PartitionPruneInfos. */
-	foreach(lc, root->partPruneInfos)
-	{
-		PartitionPruneInfo *pruneinfo = lfirst(lc);
-		ListCell   *l;
-
-		pruneinfo->root_parent_relids =
-			offset_relid_set(pruneinfo->root_parent_relids, rtoffset);
-		foreach(l, pruneinfo->prune_infos)
-		{
-			List	   *prune_infos = lfirst(l);
-			ListCell   *l2;
-
-			foreach(l2, prune_infos)
-			{
-				PartitionedRelPruneInfo *pinfo = lfirst(l2);
-
-				/* RT index of the table to which the pinfo belongs. */
-				pinfo->rtindex += rtoffset;
-			}
-		}
 	}
 
 	/* Now fix the Plan tree */
@@ -1544,19 +1520,30 @@ clean_up_removed_plan_level(Plan *parent, Plan *child)
 {
 	/*
 	 * We have to be sure we don't lose any initplans, so move any that were
-	 * attached to the parent plan to the child.  If we do move any, the child
-	 * is no longer parallel-safe.
+	 * attached to the parent plan to the child.  If any are parallel-unsafe,
+	 * the child is no longer parallel-safe.  As a cosmetic matter, also add
+	 * the initplans' run costs to the child's costs.
 	 */
 	if (parent->initPlan)
-		child->parallel_safe = false;
+	{
+		Cost		initplan_cost;
+		bool		unsafe_initplans;
 
-	/*
-	 * Attach plans this way so that parent's initplans are processed before
-	 * any pre-existing initplans of the child.  Probably doesn't matter, but
-	 * let's preserve the ordering just in case.
-	 */
-	child->initPlan = list_concat(parent->initPlan,
-								  child->initPlan);
+		SS_compute_initplan_cost(parent->initPlan,
+								 &initplan_cost, &unsafe_initplans);
+		child->startup_cost += initplan_cost;
+		child->total_cost += initplan_cost;
+		if (unsafe_initplans)
+			child->parallel_safe = false;
+
+		/*
+		 * Attach plans this way so that parent's initplans are processed
+		 * before any pre-existing initplans of the child.  Probably doesn't
+		 * matter, but let's preserve the ordering just in case.
+		 */
+		child->initPlan = list_concat(parent->initPlan,
+									  child->initPlan);
+	}
 
 	/*
 	 * We also have to transfer the parent's column labeling info into the
@@ -1729,29 +1716,6 @@ set_customscan_references(PlannerInfo *root,
 }
 
 /*
- * register_partpruneinfo
- *		Subroutine for set_append_references and set_mergeappend_references
- *
- * Add the PartitionPruneInfo from root->partPruneInfos at the given index
- * into PlannerGlobal->partPruneInfos and return its index there.
- */
-static int
-register_partpruneinfo(PlannerInfo *root, int part_prune_index)
-{
-	PlannerGlobal  *glob = root->glob;
-	PartitionPruneInfo *pruneinfo;
-
-	Assert(part_prune_index >= 0 &&
-		   part_prune_index < list_length(root->partPruneInfos));
-	pruneinfo = list_nth_node(PartitionPruneInfo, root->partPruneInfos,
-							  part_prune_index);
-
-	glob->partPruneInfos = lappend(glob->partPruneInfos, pruneinfo);
-
-	return list_length(glob->partPruneInfos) - 1;
-}
-
-/*
  * set_append_references
  *		Do set_plan_references processing on an Append
  *
@@ -1803,12 +1767,21 @@ set_append_references(PlannerInfo *root,
 
 	aplan->apprelids = offset_relid_set(aplan->apprelids, rtoffset);
 
-	/*
-	 * Add PartitionPruneInfo, if any, to PlannerGlobal and update the index.
-	 */
-	if (aplan->part_prune_index >= 0)
-		aplan->part_prune_index =
-			register_partpruneinfo(root, aplan->part_prune_index);
+	if (aplan->part_prune_info)
+	{
+		foreach(l, aplan->part_prune_info->prune_infos)
+		{
+			List	   *prune_infos = lfirst(l);
+			ListCell   *l2;
+
+			foreach(l2, prune_infos)
+			{
+				PartitionedRelPruneInfo *pinfo = lfirst(l2);
+
+				pinfo->rtindex += rtoffset;
+			}
+		}
+	}
 
 	/* We don't need to recurse to lefttree or righttree ... */
 	Assert(aplan->plan.lefttree == NULL);
@@ -1870,12 +1843,21 @@ set_mergeappend_references(PlannerInfo *root,
 
 	mplan->apprelids = offset_relid_set(mplan->apprelids, rtoffset);
 
-	/*
-	 * Add PartitionPruneInfo, if any, to PlannerGlobal and update the index.
-	 */
-	if (mplan->part_prune_index >= 0)
-		mplan->part_prune_index =
-			register_partpruneinfo(root, mplan->part_prune_index);
+	if (mplan->part_prune_info)
+	{
+		foreach(l, mplan->part_prune_info->prune_infos)
+		{
+			List	   *prune_infos = lfirst(l);
+			ListCell   *l2;
+
+			foreach(l2, prune_infos)
+			{
+				PartitionedRelPruneInfo *pinfo = lfirst(l2);
+
+				pinfo->rtindex += rtoffset;
+			}
+		}
+	}
 
 	/* We don't need to recurse to lefttree or righttree ... */
 	Assert(mplan->plan.lefttree == NULL);
@@ -2211,22 +2193,14 @@ fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context)
 	if (IsA(node, Aggref))
 	{
 		Aggref	   *aggref = (Aggref *) node;
+		Param	   *aggparam;
 
 		/* See if the Aggref should be replaced by a Param */
-		if (context->root->minmax_aggs != NIL &&
-			list_length(aggref->args) == 1)
+		aggparam = find_minmax_agg_replacement_param(context->root, aggref);
+		if (aggparam != NULL)
 		{
-			TargetEntry *curTarget = (TargetEntry *) linitial(aggref->args);
-			ListCell   *lc;
-
-			foreach(lc, context->root->minmax_aggs)
-			{
-				MinMaxAggInfo *mminfo = (MinMaxAggInfo *) lfirst(lc);
-
-				if (mminfo->aggfnoid == aggref->aggfnoid &&
-					equal(mminfo->target, curTarget->expr))
-					return (Node *) copyObject(mminfo->param);
-			}
+			/* Make a copy of the Param for paranoia's sake */
+			return (Node *) copyObject(aggparam);
 		}
 		/* If no match, just fall through to process it normally */
 	}
@@ -2319,9 +2293,11 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 			 * the outer-join level at which they are used, Vars seen in the
 			 * NestLoopParam expression may have nullingrels that are just a
 			 * subset of those in the Vars actually available from the outer
-			 * side.  Not checking this exactly is a bit grotty, but the work
-			 * needed to make things match up perfectly seems well out of
-			 * proportion to the value.
+			 * side.  (Lateral references can also cause this, as explained in
+			 * the comments for identify_current_nestloop_params.)  Not
+			 * checking this exactly is a bit grotty, but the work needed to
+			 * make things match up perfectly seems well out of proportion to
+			 * the value.
 			 */
 			nlp->paramval = (Var *) fix_upper_expr(root,
 												   (Node *) nlp->paramval,
@@ -2710,9 +2686,7 @@ build_tlist_index(List *tlist)
 			vinfo->varno = var->varno;
 			vinfo->varattno = var->varattno;
 			vinfo->resno = tle->resno;
-#ifdef USE_ASSERT_CHECKING
 			vinfo->varnullingrels = var->varnullingrels;
-#endif
 			vinfo++;
 		}
 		else if (tle->expr && IsA(tle->expr, PlaceHolderVar))
@@ -2765,9 +2739,7 @@ build_tlist_index_other_vars(List *tlist, int ignore_rel)
 				vinfo->varno = var->varno;
 				vinfo->varattno = var->varattno;
 				vinfo->resno = tle->resno;
-#ifdef USE_ASSERT_CHECKING
 				vinfo->varnullingrels = var->varnullingrels;
-#endif
 				vinfo++;
 			}
 		}
@@ -2814,7 +2786,7 @@ search_indexed_tlist_for_var(Var *var, indexed_tlist *itlist,
 			Var		   *newvar = copyVar(var);
 
 			/*
-			 * Assert that we kept all the nullingrels machinations straight.
+			 * Verify that we kept all the nullingrels machinations straight.
 			 *
 			 * XXX we skip the check for system columns and whole-row Vars.
 			 * That's because such Vars might be row identity Vars, which are
@@ -2827,12 +2799,16 @@ search_indexed_tlist_for_var(Var *var, indexed_tlist *itlist,
 			 * columns, it seems unlikely that a bug in nullingrels logic
 			 * would affect only system columns.)
 			 */
-			Assert(varattno <= 0 ||
-				   (nrm_match == NRM_SUBSET ?
-					bms_is_subset(var->varnullingrels, vinfo->varnullingrels) :
-					nrm_match == NRM_SUPERSET ?
-					bms_is_subset(vinfo->varnullingrels, var->varnullingrels) :
-					bms_equal(vinfo->varnullingrels, var->varnullingrels)));
+			if (!(varattno <= 0 ||
+				  (nrm_match == NRM_SUBSET ?
+				   bms_is_subset(var->varnullingrels, vinfo->varnullingrels) :
+				   nrm_match == NRM_SUPERSET ?
+				   bms_is_subset(vinfo->varnullingrels, var->varnullingrels) :
+				   bms_equal(vinfo->varnullingrels, var->varnullingrels))))
+				elog(ERROR, "wrong varnullingrels %s (expected %s) for Var %d/%d",
+					 bmsToString(var->varnullingrels),
+					 bmsToString(vinfo->varnullingrels),
+					 varno, varattno);
 
 			newvar->varno = newvarno;
 			newvar->varattno = vinfo->resno;
@@ -2879,12 +2855,16 @@ search_indexed_tlist_for_phv(PlaceHolderVar *phv,
 			if (phv->phid != subphv->phid)
 				continue;
 
-			/* Assert that we kept all the nullingrels machinations straight */
-			Assert(nrm_match == NRM_SUBSET ?
-				   bms_is_subset(phv->phnullingrels, subphv->phnullingrels) :
-				   nrm_match == NRM_SUPERSET ?
-				   bms_is_subset(subphv->phnullingrels, phv->phnullingrels) :
-				   bms_equal(subphv->phnullingrels, phv->phnullingrels));
+			/* Verify that we kept all the nullingrels machinations straight */
+			if (!(nrm_match == NRM_SUBSET ?
+				  bms_is_subset(phv->phnullingrels, subphv->phnullingrels) :
+				  nrm_match == NRM_SUPERSET ?
+				  bms_is_subset(subphv->phnullingrels, phv->phnullingrels) :
+				  bms_equal(subphv->phnullingrels, phv->phnullingrels)))
+				elog(ERROR, "wrong phnullingrels %s (expected %s) for PlaceHolderVar %d",
+					 bmsToString(phv->phnullingrels),
+					 bmsToString(subphv->phnullingrels),
+					 phv->phid);
 
 			/* Found a matching subplan output expression */
 			newvar = makeVarFromTargetEntry(newvarno, tle);
@@ -3249,22 +3229,14 @@ fix_upper_expr_mutator(Node *node, fix_upper_expr_context *context)
 	if (IsA(node, Aggref))
 	{
 		Aggref	   *aggref = (Aggref *) node;
+		Param	   *aggparam;
 
 		/* See if the Aggref should be replaced by a Param */
-		if (context->root->minmax_aggs != NIL &&
-			list_length(aggref->args) == 1)
+		aggparam = find_minmax_agg_replacement_param(context->root, aggref);
+		if (aggparam != NULL)
 		{
-			TargetEntry *curTarget = (TargetEntry *) linitial(aggref->args);
-			ListCell   *lc;
-
-			foreach(lc, context->root->minmax_aggs)
-			{
-				MinMaxAggInfo *mminfo = (MinMaxAggInfo *) lfirst(lc);
-
-				if (mminfo->aggfnoid == aggref->aggfnoid &&
-					equal(mminfo->target, curTarget->expr))
-					return (Node *) copyObject(mminfo->param);
-			}
+			/* Make a copy of the Param for paranoia's sake */
+			return (Node *) copyObject(aggparam);
 		}
 		/* If no match, just fall through to process it normally */
 	}
@@ -3418,6 +3390,38 @@ set_windowagg_runcondition_references(PlannerInfo *root,
 
 	return newlist;
 }
+
+/*
+ * find_minmax_agg_replacement_param
+ *		If the given Aggref is one that we are optimizing into a subquery
+ *		(cf. planagg.c), then return the Param that should replace it.
+ *		Else return NULL.
+ *
+ * This is exported so that SS_finalize_plan can use it before setrefs.c runs.
+ * Note that it will not find anything until we have built a Plan from a
+ * MinMaxAggPath, as root->minmax_aggs will never be filled otherwise.
+ */
+Param *
+find_minmax_agg_replacement_param(PlannerInfo *root, Aggref *aggref)
+{
+	if (root->minmax_aggs != NIL &&
+		list_length(aggref->args) == 1)
+	{
+		TargetEntry *curTarget = (TargetEntry *) linitial(aggref->args);
+		ListCell   *lc;
+
+		foreach(lc, root->minmax_aggs)
+		{
+			MinMaxAggInfo *mminfo = (MinMaxAggInfo *) lfirst(lc);
+
+			if (mminfo->aggfnoid == aggref->aggfnoid &&
+				equal(mminfo->target, curTarget->expr))
+				return mminfo->param;
+		}
+	}
+	return NULL;
+}
+
 
 /*****************************************************************************
  *					QUERY DEPENDENCY MANAGEMENT
