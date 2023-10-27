@@ -228,7 +228,7 @@ static const FormData_pg_attribute a6 = {
 	.attislocal = true,
 };
 
-static const FormData_pg_attribute *SysAtt[] = {&a1, &a2, &a3, &a4, &a5, &a6};
+static const FormData_pg_attribute *const SysAtt[] = {&a1, &a2, &a3, &a4, &a5, &a6};
 
 /*
  * This function returns a Form_pg_attribute pointer for a system attribute.
@@ -2533,7 +2533,7 @@ AddRelationNewConstraints(Relation rel,
 			 * update its catalog status and we're done.
 			 */
 			if (AdjustNotNullInheritance1(RelationGetRelid(rel), colnum,
-										  cdef->inhcount))
+										  cdef->inhcount, cdef->is_no_inherit))
 				continue;
 
 			/*
@@ -2830,6 +2830,17 @@ AddRelationNotNullConstraints(Relation rel, List *constraints,
 
 			if (old->attnum == attnum)
 			{
+				/*
+				 * If we get a constraint from the parent, having a local NO
+				 * INHERIT one doesn't work.
+				 */
+				if (constr->is_no_inherit)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATATYPE_MISMATCH),
+							 errmsg("cannot define not-null constraint on column \"%s\" with NO INHERIT",
+									strVal(linitial(constr->keys))),
+							 errdetail("The column has an inherited not-null constraint.")));
+
 				inhcount++;
 				old_notnulls = foreach_delete_current(old_notnulls, lc2);
 			}

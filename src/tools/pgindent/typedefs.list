@@ -367,6 +367,7 @@ CatalogId
 CatalogIdMapEntry
 CatalogIndexState
 ChangeVarNodes_context
+ReplaceVarnoContext
 CheckPoint
 CheckPointStmt
 CheckpointStatsData
@@ -545,6 +546,7 @@ DR_printtup
 DR_sqlfunction
 DR_transientrel
 DWORD
+DataDirSyncMethod
 DataDumperPtr
 DataPageDeleteStack
 DatabaseInfo
@@ -1502,6 +1504,8 @@ LogicalRepTyp
 LogicalRepWorker
 LogicalRepWorkerType
 LogicalRewriteMappingData
+LogicalSlotInfo
+LogicalSlotInfoArr
 LogicalTape
 LogicalTapeSet
 LsnReadQueue
@@ -1659,8 +1663,6 @@ OffsetVarNodes_context
 Oid
 OidOptions
 OkeysState
-OldSnapshotControlData
-OldSnapshotTimeMapping
 OldToNewMapping
 OldToNewMappingData
 OnCommitAction
@@ -2152,6 +2154,7 @@ ProjectionPath
 PromptInterruptContext
 ProtocolVersion
 PrsStorage
+PruneResult
 PruneState
 PruneStepResult
 PsqlScanCallbacks
@@ -2252,6 +2255,7 @@ ReadLocalXLogPageNoWaitPrivate
 ReadReplicationSlotCmd
 ReassignOwnedStmt
 RecheckForeignScan_function
+RecordCacheArrayEntry
 RecordCacheEntry
 RecordCompareData
 RecordIOData
@@ -2472,6 +2476,7 @@ SeenRelsEntry
 SelectLimit
 SelectStmt
 Selectivity
+SelfJoinCandidate
 SemTPadded
 SemiAntiJoinFactors
 SeqScan
@@ -2970,6 +2975,7 @@ VolatileFunctionStatus
 Vsrt
 WAIT_ORDER
 WALAvailability
+WalInsertClass
 WALInsertLock
 WALInsertLockPadded
 WALOpenSegment
@@ -3015,6 +3021,7 @@ WalSnd
 WalSndCtlData
 WalSndSendDataCallback
 WalSndState
+WalSyncMethod
 WalTimeSample
 WalUsage
 WalWriteMethod
@@ -3198,6 +3205,7 @@ bbstreamer_tar_archiver
 bbstreamer_tar_parser
 bbstreamer_zstd_frame
 bgworker_main_type
+bh_node_type
 binaryheap
 binaryheap_comparator
 bitmapword
@@ -3831,6 +3839,7 @@ unicodeStyleColumnFormat
 unicodeStyleFormat
 unicodeStyleRowFormat
 unicode_linestyle
+UniqueRelInfo
 unit_conversion
 unlogged_relation_entry
 utf_local_conversion_func

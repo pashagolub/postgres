@@ -62,7 +62,7 @@ typedef enum TrackFunctionsLevel
 {
 	TRACK_FUNC_OFF,
 	TRACK_FUNC_PL,
-	TRACK_FUNC_ALL
+	TRACK_FUNC_ALL,
 }			TrackFunctionsLevel;
 
 typedef enum PgStat_FetchConsistency
@@ -79,7 +79,7 @@ typedef enum SessionEndType
 	DISCONNECT_NORMAL,
 	DISCONNECT_CLIENT_EOF,
 	DISCONNECT_FATAL,
-	DISCONNECT_KILLED
+	DISCONNECT_KILLED,
 } SessionEndType;
 
 /* ----------
@@ -265,8 +265,6 @@ typedef struct PgStat_CheckpointerStats
 	PgStat_Counter checkpoint_write_time;	/* times in milliseconds */
 	PgStat_Counter checkpoint_sync_time;
 	PgStat_Counter buf_written_checkpoints;
-	PgStat_Counter buf_written_backend;
-	PgStat_Counter buf_fsync_backend;
 } PgStat_CheckpointerStats;
 
 

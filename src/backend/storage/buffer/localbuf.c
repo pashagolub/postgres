@@ -360,7 +360,7 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 						relpath(bmr.smgr->smgr_rlocator, fork),
 						MaxBlockNumber)));
 
-	for (int i = 0; i < extend_by; i++)
+	for (uint32 i = 0; i < extend_by; i++)
 	{
 		int			victim_buf_id;
 		BufferDesc *victim_buf_hdr;
@@ -416,7 +416,7 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 	pgstat_count_io_op_time(IOOBJECT_TEMP_RELATION, IOCONTEXT_NORMAL, IOOP_EXTEND,
 							io_start, extend_by);
 
-	for (int i = 0; i < extend_by; i++)
+	for (uint32 i = 0; i < extend_by; i++)
 	{
 		Buffer		buf = buffers[i];
 		BufferDesc *buf_hdr;
@@ -431,7 +431,7 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 
 	*extended_by = extend_by;
 
-	pgBufferUsage.temp_blks_written += extend_by;
+	pgBufferUsage.local_blks_written += extend_by;
 
 	return first_block;
 }

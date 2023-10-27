@@ -48,6 +48,7 @@ LIBS += $(PTHREAD_LIBS)
 OBJS_COMMON = \
 	archive.o \
 	base64.o \
+	binaryheap.o \
 	checksum_helper.o \
 	compression.o \
 	config_info.o \
@@ -138,6 +139,13 @@ uninstall:
 libpgcommon.a: $(OBJS_FRONTEND)
 	rm -f $@
 	$(AR) $(AROPT) $@ $^
+
+#
+# Files in libpgcommon.a should use/export the "xxx_private" versions
+# of pg_char_to_encoding() and friends.
+#
+$(OBJS_FRONTEND): CPPFLAGS += -DUSE_PRIVATE_ENCODING_FUNCS
+
 
 #
 # Shared library versions of object files

@@ -117,7 +117,8 @@ typedef enum pgssVersion
 	PGSS_V1_3,
 	PGSS_V1_8,
 	PGSS_V1_9,
-	PGSS_V1_10
+	PGSS_V1_10,
+	PGSS_V1_11,
 } pgssVersion;
 
 typedef enum pgssStoreKind
@@ -179,8 +180,14 @@ typedef struct Counters
 	int64		local_blks_written; /* # of local disk blocks written */
 	int64		temp_blks_read; /* # of temp blocks read */
 	int64		temp_blks_written;	/* # of temp blocks written */
-	double		blk_read_time;	/* time spent reading blocks, in msec */
-	double		blk_write_time; /* time spent writing blocks, in msec */
+	double		shared_blk_read_time;	/* time spent reading shared blocks,
+										 * in msec */
+	double		shared_blk_write_time;	/* time spent writing shared blocks,
+										 * in msec */
+	double		local_blk_read_time;	/* time spent reading local blocks, in
+										 * msec */
+	double		local_blk_write_time;	/* time spent writing local blocks, in
+										 * msec */
 	double		temp_blk_read_time; /* time spent reading temp blocks, in msec */
 	double		temp_blk_write_time;	/* time spent writing temp blocks, in
 										 * msec */
@@ -192,6 +199,10 @@ typedef struct Counters
 	double		jit_generation_time;	/* total time to generate jit code */
 	int64		jit_inlining_count; /* number of times inlining time has been
 									 * > 0 */
+	double		jit_deform_time;	/* total time to deform tuples in jit code */
+	int64		jit_deform_count;	/* number of times deform time has been >
+									 * 0 */
+
 	double		jit_inlining_time;	/* total time to inline jit code */
 	int64		jit_optimization_count; /* number of times optimization time
 										 * has been > 0 */
@@ -271,7 +282,7 @@ typedef enum
 {
 	PGSS_TRACK_NONE,			/* track no statements */
 	PGSS_TRACK_TOP,				/* only top level statements */
-	PGSS_TRACK_ALL				/* all statements, including nested ones */
+	PGSS_TRACK_ALL,				/* all statements, including nested ones */
 }			PGSSTrackLevel;
 
 static const struct config_enum_entry track_options[] =
@@ -312,6 +323,7 @@ PG_FUNCTION_INFO_V1(pg_stat_statements_1_3);
 PG_FUNCTION_INFO_V1(pg_stat_statements_1_8);
 PG_FUNCTION_INFO_V1(pg_stat_statements_1_9);
 PG_FUNCTION_INFO_V1(pg_stat_statements_1_10);
+PG_FUNCTION_INFO_V1(pg_stat_statements_1_11);
 PG_FUNCTION_INFO_V1(pg_stat_statements);
 PG_FUNCTION_INFO_V1(pg_stat_statements_info);
 
@@ -1385,8 +1397,10 @@ pgss_store(const char *query, uint64 queryId,
 		e->counters.local_blks_written += bufusage->local_blks_written;
 		e->counters.temp_blks_read += bufusage->temp_blks_read;
 		e->counters.temp_blks_written += bufusage->temp_blks_written;
-		e->counters.blk_read_time += INSTR_TIME_GET_MILLISEC(bufusage->blk_read_time);
-		e->counters.blk_write_time += INSTR_TIME_GET_MILLISEC(bufusage->blk_write_time);
+		e->counters.shared_blk_read_time += INSTR_TIME_GET_MILLISEC(bufusage->shared_blk_read_time);
+		e->counters.shared_blk_write_time += INSTR_TIME_GET_MILLISEC(bufusage->shared_blk_write_time);
+		e->counters.local_blk_read_time += INSTR_TIME_GET_MILLISEC(bufusage->local_blk_read_time);
+		e->counters.local_blk_write_time += INSTR_TIME_GET_MILLISEC(bufusage->local_blk_write_time);
 		e->counters.temp_blk_read_time += INSTR_TIME_GET_MILLISEC(bufusage->temp_blk_read_time);
 		e->counters.temp_blk_write_time += INSTR_TIME_GET_MILLISEC(bufusage->temp_blk_write_time);
 		e->counters.usage += USAGE_EXEC(total_time);
@@ -1397,6 +1411,10 @@ pgss_store(const char *query, uint64 queryId,
 		{
 			e->counters.jit_functions += jitusage->created_functions;
 			e->counters.jit_generation_time += INSTR_TIME_GET_MILLISEC(jitusage->generation_counter);
+
+			if (INSTR_TIME_GET_MILLISEC(jitusage->deform_counter))
+				e->counters.jit_deform_count++;
+			e->counters.jit_deform_time += INSTR_TIME_GET_MILLISEC(jitusage->deform_counter);
 
 			if (INSTR_TIME_GET_MILLISEC(jitusage->inlining_counter))
 				e->counters.jit_inlining_count++;
@@ -1460,7 +1478,8 @@ pg_stat_statements_reset(PG_FUNCTION_ARGS)
 #define PG_STAT_STATEMENTS_COLS_V1_8	32
 #define PG_STAT_STATEMENTS_COLS_V1_9	33
 #define PG_STAT_STATEMENTS_COLS_V1_10	43
-#define PG_STAT_STATEMENTS_COLS			43	/* maximum of above */
+#define PG_STAT_STATEMENTS_COLS_V1_11	47
+#define PG_STAT_STATEMENTS_COLS			47	/* maximum of above */
 
 /*
  * Retrieve statement statistics.
@@ -1472,6 +1491,16 @@ pg_stat_statements_reset(PG_FUNCTION_ARGS)
  * expected API version is identified by embedding it in the C name of the
  * function.  Unfortunately we weren't bright enough to do that for 1.1.
  */
+Datum
+pg_stat_statements_1_11(PG_FUNCTION_ARGS)
+{
+	bool		showtext = PG_GETARG_BOOL(0);
+
+	pg_stat_statements_internal(fcinfo, PGSS_V1_11, showtext);
+
+	return (Datum) 0;
+}
+
 Datum
 pg_stat_statements_1_10(PG_FUNCTION_ARGS)
 {
@@ -1600,6 +1629,10 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 			break;
 		case PG_STAT_STATEMENTS_COLS_V1_10:
 			if (api_version != PGSS_V1_10)
+				elog(ERROR, "incorrect number of output arguments");
+			break;
+		case PG_STAT_STATEMENTS_COLS_V1_11:
+			if (api_version != PGSS_V1_11)
 				elog(ERROR, "incorrect number of output arguments");
 			break;
 		default:
@@ -1798,8 +1831,13 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 		values[i++] = Int64GetDatumFast(tmp.temp_blks_written);
 		if (api_version >= PGSS_V1_1)
 		{
-			values[i++] = Float8GetDatumFast(tmp.blk_read_time);
-			values[i++] = Float8GetDatumFast(tmp.blk_write_time);
+			values[i++] = Float8GetDatumFast(tmp.shared_blk_read_time);
+			values[i++] = Float8GetDatumFast(tmp.shared_blk_write_time);
+		}
+		if (api_version >= PGSS_V1_11)
+		{
+			values[i++] = Float8GetDatumFast(tmp.local_blk_read_time);
+			values[i++] = Float8GetDatumFast(tmp.local_blk_write_time);
 		}
 		if (api_version >= PGSS_V1_10)
 		{
@@ -1834,6 +1872,11 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 			values[i++] = Int64GetDatumFast(tmp.jit_emission_count);
 			values[i++] = Float8GetDatumFast(tmp.jit_emission_time);
 		}
+		if (api_version >= PGSS_V1_11)
+		{
+			values[i++] = Int64GetDatumFast(tmp.jit_deform_count);
+			values[i++] = Float8GetDatumFast(tmp.jit_deform_time);
+		}
 
 		Assert(i == (api_version == PGSS_V1_0 ? PG_STAT_STATEMENTS_COLS_V1_0 :
 					 api_version == PGSS_V1_1 ? PG_STAT_STATEMENTS_COLS_V1_1 :
@@ -1842,6 +1885,7 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 					 api_version == PGSS_V1_8 ? PG_STAT_STATEMENTS_COLS_V1_8 :
 					 api_version == PGSS_V1_9 ? PG_STAT_STATEMENTS_COLS_V1_9 :
 					 api_version == PGSS_V1_10 ? PG_STAT_STATEMENTS_COLS_V1_10 :
+					 api_version == PGSS_V1_11 ? PG_STAT_STATEMENTS_COLS_V1_11 :
 					 -1 /* fail if you forget to update this assert */ ));
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);

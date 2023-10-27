@@ -38,7 +38,7 @@ typedef enum
 	LOGSTMT_NONE,				/* log no statements */
 	LOGSTMT_DDL,				/* log data definition statements */
 	LOGSTMT_MOD,				/* log modification statements, plus DDL */
-	LOGSTMT_ALL					/* log all statements */
+	LOGSTMT_ALL,				/* log all statements */
 } LogStmtLevel;
 
 extern PGDLLIMPORT int log_statement;
@@ -70,8 +70,7 @@ extern void die(SIGNAL_ARGS);
 extern void quickdie(SIGNAL_ARGS) pg_attribute_noreturn();
 extern void StatementCancelHandler(SIGNAL_ARGS);
 extern void FloatExceptionHandler(SIGNAL_ARGS) pg_attribute_noreturn();
-extern void RecoveryConflictInterrupt(ProcSignalReason reason); /* called from SIGUSR1
-																 * handler */
+extern void HandleRecoveryConflictInterrupt(ProcSignalReason reason);
 extern void ProcessClientReadInterrupt(bool blocked);
 extern void ProcessClientWriteInterrupt(bool blocked);
 

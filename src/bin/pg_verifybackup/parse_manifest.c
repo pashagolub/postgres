@@ -34,7 +34,7 @@ typedef enum
 	JM_EXPECT_THIS_WAL_RANGE_FIELD,
 	JM_EXPECT_THIS_WAL_RANGE_VALUE,
 	JM_EXPECT_MANIFEST_CHECKSUM_VALUE,
-	JM_EXPECT_EOF
+	JM_EXPECT_EOF,
 } JsonManifestSemanticState;
 
 /*
@@ -47,7 +47,7 @@ typedef enum
 	JMFF_SIZE,
 	JMFF_LAST_MODIFIED,
 	JMFF_CHECKSUM_ALGORITHM,
-	JMFF_CHECKSUM
+	JMFF_CHECKSUM,
 } JsonManifestFileField;
 
 /*
@@ -57,7 +57,7 @@ typedef enum
 {
 	JMWRF_TIMELINE,
 	JMWRF_START_LSN,
-	JMWRF_END_LSN
+	JMWRF_END_LSN,
 } JsonManifestWALRangeField;
 
 /*
@@ -130,7 +130,7 @@ json_parse_manifest(JsonManifestParseContext *context, char *buffer,
 	parse.saw_version_field = false;
 
 	/* Create a JSON lexing context. */
-	lex = makeJsonLexContextCstringLen(buffer, size, PG_UTF8, true);
+	lex = makeJsonLexContextCstringLen(NULL, buffer, size, PG_UTF8, true);
 
 	/* Set up semantic actions. */
 	sem.semstate = &parse;
@@ -153,6 +153,8 @@ json_parse_manifest(JsonManifestParseContext *context, char *buffer,
 
 	/* Verify the manifest checksum. */
 	verify_manifest_checksum(&parse, buffer, size);
+
+	freeJsonLexContext(lex);
 }
 
 /*

@@ -26,7 +26,7 @@ typedef enum
 	INDEX_CREATE_SET_READY,
 	INDEX_CREATE_SET_VALID,
 	INDEX_DROP_CLEAR_VALID,
-	INDEX_DROP_SET_DEAD
+	INDEX_DROP_SET_DEAD,
 } IndexStateFlagsAction;
 
 /* options for REINDEX */
@@ -78,6 +78,7 @@ extern Oid	index_create(Relation heapRelation,
 						 Oid tableSpaceId,
 						 const Oid *collationIds,
 						 const Oid *opclassIds,
+						 const Datum *opclassOptions,
 						 const int16 *coloptions,
 						 Datum reloptions,
 						 bits16 flags,

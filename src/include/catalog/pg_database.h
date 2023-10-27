@@ -49,6 +49,9 @@ CATALOG(pg_database,1262,DatabaseRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_OID
 	/* new connections allowed? */
 	bool		datallowconn;
 
+	/* database has login event triggers? */
+	bool		dathasloginevt;
+
 	/*
 	 * Max connections allowed. Negative values have special meaning, see
 	 * DATCONNLIMIT_* defines below.
@@ -94,8 +97,8 @@ typedef FormData_pg_database *Form_pg_database;
 
 DECLARE_TOAST_WITH_MACRO(pg_database, 4177, 4178, PgDatabaseToastTable, PgDatabaseToastIndex);
 
-DECLARE_UNIQUE_INDEX(pg_database_datname_index, 2671, DatabaseNameIndexId, on pg_database using btree(datname name_ops));
-DECLARE_UNIQUE_INDEX_PKEY(pg_database_oid_index, 2672, DatabaseOidIndexId, on pg_database using btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_database_datname_index, 2671, DatabaseNameIndexId, pg_database, btree(datname name_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_database_oid_index, 2672, DatabaseOidIndexId, pg_database, btree(oid oid_ops));
 
 /*
  * pg_database.dat contains an entry for template1, but not for the template0

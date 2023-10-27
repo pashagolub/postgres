@@ -955,7 +955,7 @@ ExtendBufferedRelTo(BufferManagerRelation bmr,
 		current_size = first_block + extended_by;
 		Assert(num_pages != 0 || current_size >= extend_to);
 
-		for (int i = 0; i < extended_by; i++)
+		for (uint32 i = 0; i < extended_by; i++)
 		{
 			if (first_block + i != extend_to - 1)
 				ReleaseBuffer(buffers[i]);
@@ -1938,7 +1938,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 * This needs to happen before we extend the relation, because as soon as
 	 * we do, other backends can start to read in those pages.
 	 */
-	for (int i = 0; i < extend_by; i++)
+	for (uint32 i = 0; i < extend_by; i++)
 	{
 		Buffer		victim_buf = buffers[i];
 		BufferDesc *victim_buf_hdr = GetBufferDescriptor(victim_buf - 1);
@@ -2070,7 +2070,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 							io_start, extend_by);
 
 	/* Set BM_VALID, terminate IO, and wake up any waiters */
-	for (int i = 0; i < extend_by; i++)
+	for (uint32 i = 0; i < extend_by; i++)
 	{
 		Buffer		buf = buffers[i];
 		BufferDesc *buf_hdr = GetBufferDescriptor(buf - 1);
@@ -2096,6 +2096,65 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	*extended_by = extend_by;
 
 	return first_block;
+}
+
+/*
+ * BufferIsExclusiveLocked
+ *
+ *      Checks if buffer is exclusive-locked.
+ *
+ * Buffer must be pinned.
+ */
+bool
+BufferIsExclusiveLocked(Buffer buffer)
+{
+	BufferDesc *bufHdr;
+
+	if (BufferIsLocal(buffer))
+	{
+		int			bufid = -buffer - 1;
+
+		bufHdr = GetLocalBufferDescriptor(bufid);
+	}
+	else
+	{
+		bufHdr = GetBufferDescriptor(buffer - 1);
+	}
+
+	Assert(BufferIsPinned(buffer));
+	return LWLockHeldByMeInMode(BufferDescriptorGetContentLock(bufHdr),
+								LW_EXCLUSIVE);
+}
+
+/*
+ * BufferIsDirty
+ *
+ *		Checks if buffer is already dirty.
+ *
+ * Buffer must be pinned and exclusive-locked.  (Without an exclusive lock,
+ * the result may be stale before it's returned.)
+ */
+bool
+BufferIsDirty(Buffer buffer)
+{
+	BufferDesc *bufHdr;
+
+	if (BufferIsLocal(buffer))
+	{
+		int			bufid = -buffer - 1;
+
+		bufHdr = GetLocalBufferDescriptor(bufid);
+	}
+	else
+	{
+		bufHdr = GetBufferDescriptor(buffer - 1);
+	}
+
+	Assert(BufferIsPinned(buffer));
+	Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(bufHdr),
+								LW_EXCLUSIVE));
+
+	return pg_atomic_read_u32(&bufHdr->state) & BM_DIRTY;
 }
 
 /*
@@ -4923,8 +4982,8 @@ LockBufferForCleanup(Buffer buffer)
 }
 
 /*
- * Check called from RecoveryConflictInterrupt handler when Startup
- * process requests cancellation of all pin holders that are blocking it.
+ * Check called from ProcessRecoveryConflictInterrupts() when Startup process
+ * requests cancellation of all pin holders that are blocking it.
  */
 bool
 HoldingBufferPinThatDelaysRecovery(void)
@@ -5574,21 +5633,4 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 							IOOP_WRITEBACK, io_start, wb_context->nr_pending);
 
 	wb_context->nr_pending = 0;
-}
-
-
-/*
- * Implement slower/larger portions of TestForOldSnapshot
- *
- * Smaller/faster portions are put inline, but the entire set of logic is too
- * big for that.
- */
-void
-TestForOldSnapshot_impl(Snapshot snapshot, Relation relation)
-{
-	if (RelationAllowsEarlyPruning(relation)
-		&& (snapshot)->whenTaken < GetOldSnapshotThresholdTimestamp())
-		ereport(ERROR,
-				(errcode(ERRCODE_SNAPSHOT_TOO_OLD),
-				 errmsg("snapshot too old")));
 }

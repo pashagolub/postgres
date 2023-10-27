@@ -35,7 +35,7 @@ typedef enum
 {
 	ETCS_NEEDS_REBUILD,
 	ETCS_REBUILD_STARTED,
-	ETCS_VALID
+	ETCS_VALID,
 } EventTriggerCacheStateType;
 
 typedef struct
@@ -167,6 +167,8 @@ BuildEventTriggerCache(void)
 			event = EVT_SQLDrop;
 		else if (strcmp(evtevent, "table_rewrite") == 0)
 			event = EVT_TableRewrite;
+		else if (strcmp(evtevent, "login") == 0)
+			event = EVT_Login;
 		else
 			continue;
 

@@ -94,6 +94,7 @@
 #include "access/xlogrecovery.h"
 #include "catalog/pg_control.h"
 #include "common/file_perm.h"
+#include "common/file_utils.h"
 #include "common/ip.h"
 #include "common/pg_prng.h"
 #include "common/string.h"
@@ -226,7 +227,8 @@ int			ReservedConnections;
 
 /* The socket(s) we're listening to. */
 #define MAXLISTEN	64
-static pgsocket ListenSocket[MAXLISTEN];
+static int	NumListenSockets = 0;
+static pgsocket *ListenSockets = NULL;
 
 /* still more option variables */
 bool		EnableSSL = false;
@@ -260,7 +262,7 @@ typedef enum
 	STARTUP_NOT_RUNNING,
 	STARTUP_RUNNING,
 	STARTUP_SIGNALED,			/* we sent it a SIGQUIT or SIGKILL */
-	STARTUP_CRASHED
+	STARTUP_CRASHED,
 } StartupStatusEnum;
 
 static StartupStatusEnum StartupStatus = STARTUP_NOT_RUNNING;
@@ -330,7 +332,7 @@ typedef enum
 	PM_SHUTDOWN_2,				/* waiting for archiver and walsenders to
 								 * finish */
 	PM_WAIT_DEAD_END,			/* waiting for dead_end children to exit */
-	PM_NO_CHILDREN				/* all important children have exited */
+	PM_NO_CHILDREN,				/* all important children have exited */
 } PMState;
 
 static PMState pmState = PM_INIT;
@@ -587,7 +589,6 @@ PostmasterMain(int argc, char *argv[])
 	int			status;
 	char	   *userDoption = NULL;
 	bool		listen_addr_saved = false;
-	int			i;
 	char	   *output_config_variable = NULL;
 
 	InitProcessGlobals();
@@ -1176,12 +1177,10 @@ PostmasterMain(int argc, char *argv[])
 	/*
 	 * Establish input sockets.
 	 *
-	 * First, mark them all closed, and set up an on_proc_exit function that's
-	 * charged with closing the sockets again at postmaster shutdown.
+	 * First set up an on_proc_exit function that's charged with closing the
+	 * sockets again at postmaster shutdown.
 	 */
-	for (i = 0; i < MAXLISTEN; i++)
-		ListenSocket[i] = PGINVALID_SOCKET;
-
+	ListenSockets = palloc(MAXLISTEN * sizeof(pgsocket));
 	on_proc_exit(CloseServerPorts, 0);
 
 	if (ListenAddresses)
@@ -1212,12 +1211,16 @@ PostmasterMain(int argc, char *argv[])
 				status = StreamServerPort(AF_UNSPEC, NULL,
 										  (unsigned short) PostPortNumber,
 										  NULL,
-										  ListenSocket, MAXLISTEN);
+										  ListenSockets,
+										  &NumListenSockets,
+										  MAXLISTEN);
 			else
 				status = StreamServerPort(AF_UNSPEC, curhost,
 										  (unsigned short) PostPortNumber,
 										  NULL,
-										  ListenSocket, MAXLISTEN);
+										  ListenSockets,
+										  &NumListenSockets,
+										  MAXLISTEN);
 
 			if (status == STATUS_OK)
 			{
@@ -1245,7 +1248,7 @@ PostmasterMain(int argc, char *argv[])
 
 #ifdef USE_BONJOUR
 	/* Register for Bonjour only if we opened TCP socket(s) */
-	if (enable_bonjour && ListenSocket[0] != PGINVALID_SOCKET)
+	if (enable_bonjour && NumListenSockets > 0)
 	{
 		DNSServiceErrorType err;
 
@@ -1309,7 +1312,9 @@ PostmasterMain(int argc, char *argv[])
 			status = StreamServerPort(AF_UNIX, NULL,
 									  (unsigned short) PostPortNumber,
 									  socketdir,
-									  ListenSocket, MAXLISTEN);
+									  ListenSockets,
+									  &NumListenSockets,
+									  MAXLISTEN);
 
 			if (status == STATUS_OK)
 			{
@@ -1335,7 +1340,7 @@ PostmasterMain(int argc, char *argv[])
 	/*
 	 * check that we have some socket to listen on
 	 */
-	if (ListenSocket[0] == PGINVALID_SOCKET)
+	if (NumListenSockets == 0)
 		ereport(FATAL,
 				(errmsg("no socket created for listening")));
 
@@ -1483,14 +1488,9 @@ CloseServerPorts(int status, Datum arg)
 	 * before we remove the postmaster.pid lockfile; otherwise there's a race
 	 * condition if a new postmaster wants to re-use the TCP port number.
 	 */
-	for (i = 0; i < MAXLISTEN; i++)
-	{
-		if (ListenSocket[i] != PGINVALID_SOCKET)
-		{
-			StreamClose(ListenSocket[i]);
-			ListenSocket[i] = PGINVALID_SOCKET;
-		}
-	}
+	for (i = 0; i < NumListenSockets; i++)
+		StreamClose(ListenSockets[i]);
+	NumListenSockets = 0;
 
 	/*
 	 * Next, remove any filesystem entries for Unix sockets.  To avoid race
@@ -1691,29 +1691,19 @@ DetermineSleepTime(void)
 static void
 ConfigurePostmasterWaitSet(bool accept_connections)
 {
-	int			nsockets;
-
 	if (pm_wait_set)
 		FreeWaitEventSet(pm_wait_set);
 	pm_wait_set = NULL;
 
-	/* How many server sockets do we need to wait for? */
-	nsockets = 0;
-	if (accept_connections)
-	{
-		while (nsockets < MAXLISTEN &&
-			   ListenSocket[nsockets] != PGINVALID_SOCKET)
-			++nsockets;
-	}
-
-	pm_wait_set = CreateWaitEventSet(CurrentMemoryContext, 1 + nsockets);
+	pm_wait_set = CreateWaitEventSet(CurrentMemoryContext,
+									 accept_connections ? (1 + NumListenSockets) : 1);
 	AddWaitEventToSet(pm_wait_set, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch,
 					  NULL);
 
 	if (accept_connections)
 	{
-		for (int i = 0; i < nsockets; i++)
-			AddWaitEventToSet(pm_wait_set, WL_SOCKET_ACCEPT, ListenSocket[i],
+		for (int i = 0; i < NumListenSockets; i++)
+			AddWaitEventToSet(pm_wait_set, WL_SOCKET_ACCEPT, ListenSockets[i],
 							  NULL, NULL);
 	}
 }
@@ -2291,49 +2281,6 @@ retry1:
 	 */
 	MemoryContextSwitchTo(oldcontext);
 
-	/*
-	 * If we're going to reject the connection due to database state, say so
-	 * now instead of wasting cycles on an authentication exchange. (This also
-	 * allows a pg_ping utility to be written.)
-	 */
-	switch (port->canAcceptConnections)
-	{
-		case CAC_STARTUP:
-			ereport(FATAL,
-					(errcode(ERRCODE_CANNOT_CONNECT_NOW),
-					 errmsg("the database system is starting up")));
-			break;
-		case CAC_NOTCONSISTENT:
-			if (EnableHotStandby)
-				ereport(FATAL,
-						(errcode(ERRCODE_CANNOT_CONNECT_NOW),
-						 errmsg("the database system is not yet accepting connections"),
-						 errdetail("Consistent recovery state has not been yet reached.")));
-			else
-				ereport(FATAL,
-						(errcode(ERRCODE_CANNOT_CONNECT_NOW),
-						 errmsg("the database system is not accepting connections"),
-						 errdetail("Hot standby mode is disabled.")));
-			break;
-		case CAC_SHUTDOWN:
-			ereport(FATAL,
-					(errcode(ERRCODE_CANNOT_CONNECT_NOW),
-					 errmsg("the database system is shutting down")));
-			break;
-		case CAC_RECOVERY:
-			ereport(FATAL,
-					(errcode(ERRCODE_CANNOT_CONNECT_NOW),
-					 errmsg("the database system is in recovery mode")));
-			break;
-		case CAC_TOOMANY:
-			ereport(FATAL,
-					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
-					 errmsg("sorry, too many clients already")));
-			break;
-		case CAC_OK:
-			break;
-	}
-
 	return STATUS_OK;
 }
 
@@ -2575,14 +2522,14 @@ ClosePostmasterPorts(bool am_syslogger)
 	 * EXEC_BACKEND mode.
 	 */
 #ifndef EXEC_BACKEND
-	for (int i = 0; i < MAXLISTEN; i++)
+	if (ListenSockets)
 	{
-		if (ListenSocket[i] != PGINVALID_SOCKET)
-		{
-			StreamClose(ListenSocket[i]);
-			ListenSocket[i] = PGINVALID_SOCKET;
-		}
+		for (int i = 0; i < NumListenSockets; i++)
+			StreamClose(ListenSockets[i]);
+		pfree(ListenSockets);
 	}
+	NumListenSockets = 0;
+	ListenSockets = NULL;
 #endif
 
 	/*
@@ -3331,7 +3278,7 @@ CleanupBackgroundWorker(int pid,
 		 */
 		if (rw->rw_backend->bgworker_notify)
 			BackgroundWorkerStopNotifications(rw->rw_pid);
-		free(rw->rw_backend);
+		pfree(rw->rw_backend);
 		rw->rw_backend = NULL;
 		rw->rw_pid = 0;
 		rw->rw_child_slot = 0;
@@ -3424,7 +3371,7 @@ CleanupBackend(int pid,
 				BackgroundWorkerStopNotifications(bp->pid);
 			}
 			dlist_delete(iter.cur);
-			free(bp);
+			pfree(bp);
 			break;
 		}
 	}
@@ -3480,7 +3427,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 #ifdef EXEC_BACKEND
 			ShmemBackendArrayRemove(rw->rw_backend);
 #endif
-			free(rw->rw_backend);
+			pfree(rw->rw_backend);
 			rw->rw_backend = NULL;
 			rw->rw_pid = 0;
 			rw->rw_child_slot = 0;
@@ -3517,7 +3464,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 #endif
 			}
 			dlist_delete(iter.cur);
-			free(bp);
+			pfree(bp);
 			/* Keep looping so we can signal remaining backends */
 		}
 		else
@@ -4093,7 +4040,7 @@ BackendStartup(Port *port)
 	 * Create backend data structure.  Better before the fork() so we can
 	 * handle failure cleanly.
 	 */
-	bn = (Backend *) malloc(sizeof(Backend));
+	bn = (Backend *) palloc_extended(sizeof(Backend), MCXT_ALLOC_NO_OOM);
 	if (!bn)
 	{
 		ereport(LOG,
@@ -4109,7 +4056,7 @@ BackendStartup(Port *port)
 	 */
 	if (!RandomCancelKey(&MyCancelKey))
 	{
-		free(bn);
+		pfree(bn);
 		ereport(LOG,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("could not generate random cancel key")));
@@ -4139,8 +4086,6 @@ BackendStartup(Port *port)
 	pid = fork_process();
 	if (pid == 0)				/* child */
 	{
-		free(bn);
-
 		/* Detangle from postmaster */
 		InitPostmasterChild();
 
@@ -4171,7 +4116,7 @@ BackendStartup(Port *port)
 
 		if (!bn->dead_end)
 			(void) ReleasePostmasterChildSlot(bn->child_slot);
-		free(bn);
+		pfree(bn);
 		errno = save_errno;
 		ereport(LOG,
 				(errmsg("could not fork new process for connection: %m")));
@@ -4371,6 +4316,49 @@ BackendInitialize(Port *port)
 	 * packet).
 	 */
 	status = ProcessStartupPacket(port, false, false);
+
+	/*
+	 * If we're going to reject the connection due to database state, say so
+	 * now instead of wasting cycles on an authentication exchange. (This also
+	 * allows a pg_ping utility to be written.)
+	 */
+	switch (port->canAcceptConnections)
+	{
+		case CAC_STARTUP:
+			ereport(FATAL,
+					(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+					 errmsg("the database system is starting up")));
+			break;
+		case CAC_NOTCONSISTENT:
+			if (EnableHotStandby)
+				ereport(FATAL,
+						(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+						 errmsg("the database system is not yet accepting connections"),
+						 errdetail("Consistent recovery state has not been yet reached.")));
+			else
+				ereport(FATAL,
+						(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+						 errmsg("the database system is not accepting connections"),
+						 errdetail("Hot standby mode is disabled.")));
+			break;
+		case CAC_SHUTDOWN:
+			ereport(FATAL,
+					(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+					 errmsg("the database system is shutting down")));
+			break;
+		case CAC_RECOVERY:
+			ereport(FATAL,
+					(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+					 errmsg("the database system is in recovery mode")));
+			break;
+		case CAC_TOOMANY:
+			ereport(FATAL,
+					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
+					 errmsg("sorry, too many clients already")));
+			break;
+		case CAC_OK:
+			break;
+	}
 
 	/*
 	 * Disable the timeout, and prevent SIGTERM again.
@@ -4994,7 +4982,7 @@ SubPostmasterMain(int argc, char *argv[])
 		shmem_slot = atoi(argv[1] + 15);
 		MyBgworkerEntry = BackgroundWorkerEntry(shmem_slot);
 
-		StartBackgroundWorker();
+		BackgroundWorkerMain();
 	}
 	if (strcmp(argv[1], "--forklog") == 0)
 	{
@@ -5434,7 +5422,7 @@ StartAutovacuumWorker(void)
 			return;
 		}
 
-		bn = (Backend *) malloc(sizeof(Backend));
+		bn = (Backend *) palloc_extended(sizeof(Backend), MCXT_ALLOC_NO_OOM);
 		if (bn)
 		{
 			bn->cancel_key = MyCancelKey;
@@ -5461,7 +5449,7 @@ StartAutovacuumWorker(void)
 			 * logged by StartAutoVacWorker
 			 */
 			(void) ReleasePostmasterChildSlot(bn->child_slot);
-			free(bn);
+			pfree(bn);
 		}
 		else
 			ereport(LOG,
@@ -5574,6 +5562,14 @@ void
 BackgroundWorkerInitializeConnection(const char *dbname, const char *username, uint32 flags)
 {
 	BackgroundWorker *worker = MyBgworkerEntry;
+	bits32		init_flags = 0; /* never honor session_preload_libraries */
+
+	/* ignore datallowconn? */
+	if (flags & BGWORKER_BYPASS_ALLOWCONN)
+		init_flags |= INIT_PG_OVERRIDE_ALLOW_CONNS;
+	/* ignore rolcanlogin? */
+	if (flags & BGWORKER_BYPASS_ROLELOGINCHECK)
+		init_flags |= INIT_PG_OVERRIDE_ROLE_LOGIN;
 
 	/* XXX is this the right errcode? */
 	if (!(worker->bgw_flags & BGWORKER_BACKEND_DATABASE_CONNECTION))
@@ -5583,8 +5579,7 @@ BackgroundWorkerInitializeConnection(const char *dbname, const char *username, u
 
 	InitPostgres(dbname, InvalidOid,	/* database to connect to */
 				 username, InvalidOid,	/* role to connect as */
-				 false,			/* never honor session_preload_libraries */
-				 (flags & BGWORKER_BYPASS_ALLOWCONN) != 0,	/* ignore datallowconn? */
+				 init_flags,
 				 NULL);			/* no out_dbname */
 
 	/* it had better not gotten out of "init" mode yet */
@@ -5601,6 +5596,14 @@ void
 BackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid, uint32 flags)
 {
 	BackgroundWorker *worker = MyBgworkerEntry;
+	bits32		init_flags = 0; /* never honor session_preload_libraries */
+
+	/* ignore datallowconn? */
+	if (flags & BGWORKER_BYPASS_ALLOWCONN)
+		init_flags |= INIT_PG_OVERRIDE_ALLOW_CONNS;
+	/* ignore rolcanlogin? */
+	if (flags & BGWORKER_BYPASS_ROLELOGINCHECK)
+		init_flags |= INIT_PG_OVERRIDE_ROLE_LOGIN;
 
 	/* XXX is this the right errcode? */
 	if (!(worker->bgw_flags & BGWORKER_BACKEND_DATABASE_CONNECTION))
@@ -5610,8 +5613,7 @@ BackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid, uint32 flags)
 
 	InitPostgres(NULL, dboid,	/* database to connect to */
 				 NULL, useroid, /* role to connect as */
-				 false,			/* never honor session_preload_libraries */
-				 (flags & BGWORKER_BYPASS_ALLOWCONN) != 0,	/* ignore datallowconn? */
+				 init_flags,
 				 NULL);			/* no out_dbname */
 
 	/* it had better not gotten out of "init" mode yet */
@@ -5706,7 +5708,7 @@ do_start_bgworker(RegisteredBgWorker *rw)
 			/* undo what assign_backendlist_entry did */
 			ReleasePostmasterChildSlot(rw->rw_child_slot);
 			rw->rw_child_slot = 0;
-			free(rw->rw_backend);
+			pfree(rw->rw_backend);
 			rw->rw_backend = NULL;
 			/* mark entry as crashed, so we'll try again later */
 			rw->rw_crashed_at = GetCurrentTimestamp();
@@ -5733,7 +5735,7 @@ do_start_bgworker(RegisteredBgWorker *rw)
 			MemoryContextDelete(PostmasterContext);
 			PostmasterContext = NULL;
 
-			StartBackgroundWorker();
+			BackgroundWorkerMain();
 
 			exit(1);			/* should not get here */
 			break;
@@ -5832,7 +5834,7 @@ assign_backendlist_entry(RegisteredBgWorker *rw)
 		return false;
 	}
 
-	bn = malloc(sizeof(Backend));
+	bn = palloc_extended(sizeof(Backend), MCXT_ALLOC_NO_OOM);
 	if (bn == NULL)
 	{
 		ereport(LOG,

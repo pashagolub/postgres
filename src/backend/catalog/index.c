@@ -74,7 +74,6 @@
 #include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "utils/builtins.h"
-#include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
@@ -721,6 +720,7 @@ index_create(Relation heapRelation,
 			 Oid tableSpaceId,
 			 const Oid *collationIds,
 			 const Oid *opclassIds,
+			 const Datum *opclassOptions,
 			 const int16 *coloptions,
 			 Datum reloptions,
 			 bits16 flags,
@@ -1016,7 +1016,7 @@ index_create(Relation heapRelation,
 	/*
 	 * append ATTRIBUTE tuples for the index
 	 */
-	AppendAttributeTuples(indexRelation, indexInfo->ii_OpclassOptions);
+	AppendAttributeTuples(indexRelation, opclassOptions);
 
 	/* ----------------
 	 *	  update pg_index
@@ -1224,10 +1224,10 @@ index_create(Relation heapRelation,
 	indexRelation->rd_index->indnkeyatts = indexInfo->ii_NumIndexKeyAttrs;
 
 	/* Validate opclass-specific options */
-	if (indexInfo->ii_OpclassOptions)
+	if (opclassOptions)
 		for (i = 0; i < indexInfo->ii_NumIndexKeyAttrs; i++)
 			(void) index_opclass_options(indexRelation, i + 1,
-										 indexInfo->ii_OpclassOptions[i],
+										 opclassOptions[i],
 										 true);
 
 	/*
@@ -1291,7 +1291,8 @@ index_concurrently_create_copy(Relation heapRelation, Oid oldIndexId,
 				classTuple;
 	Datum		indclassDatum,
 				colOptionDatum,
-				optionDatum;
+				reloptionsDatum;
+	Datum	   *opclassOptions;
 	oidvector  *indclass;
 	int2vector *indcoloptions;
 	bool		isnull;
@@ -1325,12 +1326,12 @@ index_concurrently_create_copy(Relation heapRelation, Oid oldIndexId,
 											Anum_pg_index_indoption);
 	indcoloptions = (int2vector *) DatumGetPointer(colOptionDatum);
 
-	/* Fetch options of index if any */
+	/* Fetch reloptions of index if any */
 	classTuple = SearchSysCache1(RELOID, ObjectIdGetDatum(oldIndexId));
 	if (!HeapTupleIsValid(classTuple))
 		elog(ERROR, "cache lookup failed for relation %u", oldIndexId);
-	optionDatum = SysCacheGetAttr(RELOID, classTuple,
-								  Anum_pg_class_reloptions, &isnull);
+	reloptionsDatum = SysCacheGetAttr(RELOID, classTuple,
+									  Anum_pg_class_reloptions, &isnull);
 
 	/*
 	 * Fetch the list of expressions and predicates directly from the
@@ -1393,14 +1394,10 @@ index_concurrently_create_copy(Relation heapRelation, Oid oldIndexId,
 		newInfo->ii_IndexAttrNumbers[i] = oldInfo->ii_IndexAttrNumbers[i];
 	}
 
-	/* Extract opclass parameters for each attribute, if any */
-	if (oldInfo->ii_OpclassOptions != NULL)
-	{
-		newInfo->ii_OpclassOptions = palloc0(sizeof(Datum) *
-											 newInfo->ii_NumIndexAttrs);
-		for (int i = 0; i < newInfo->ii_NumIndexAttrs; i++)
-			newInfo->ii_OpclassOptions[i] = get_attoptions(oldIndexId, i + 1);
-	}
+	/* Extract opclass options for each attribute */
+	opclassOptions = palloc0(sizeof(Datum) * newInfo->ii_NumIndexAttrs);
+	for (int i = 0; i < newInfo->ii_NumIndexAttrs; i++)
+		opclassOptions[i] = get_attoptions(oldIndexId, i + 1);
 
 	/*
 	 * Now create the new index.
@@ -1421,8 +1418,9 @@ index_concurrently_create_copy(Relation heapRelation, Oid oldIndexId,
 							  tablespaceOid,
 							  indexRelation->rd_indcollation,
 							  indclass->values,
+							  opclassOptions,
 							  indcoloptions->values,
-							  optionDatum,
+							  reloptionsDatum,
 							  INDEX_CREATE_SKIP_BUILD | INDEX_CREATE_CONCURRENT,
 							  0,
 							  true, /* allow table to be a system catalog? */
@@ -2465,8 +2463,6 @@ BuildIndexInfo(Relation index)
 								 &ii->ii_ExclusionStrats);
 	}
 
-	ii->ii_OpclassOptions = RelationGetIndexRawAttOptions(index);
-
 	return ii;
 }
 
@@ -2560,7 +2556,7 @@ CompareIndexInfo(const IndexInfo *info1, const IndexInfo *info2,
 
 	/*
 	 * and columns match through the attribute map (actual attribute numbers
-	 * might differ!)  Note that this implies that index columns that are
+	 * might differ!)  Note that this checks that index columns that are
 	 * expressions appear in the same positions.  We will next compare the
 	 * expressions themselves.
 	 */
@@ -2569,13 +2565,22 @@ CompareIndexInfo(const IndexInfo *info1, const IndexInfo *info2,
 		if (attmap->maplen < info2->ii_IndexAttrNumbers[i])
 			elog(ERROR, "incorrect attribute map");
 
-		/* ignore expressions at this stage */
-		if ((info1->ii_IndexAttrNumbers[i] != InvalidAttrNumber) &&
-			(attmap->attnums[info2->ii_IndexAttrNumbers[i] - 1] !=
-			 info1->ii_IndexAttrNumbers[i]))
-			return false;
+		/* ignore expressions for now (but check their collation/opfamily) */
+		if (!(info1->ii_IndexAttrNumbers[i] == InvalidAttrNumber &&
+			  info2->ii_IndexAttrNumbers[i] == InvalidAttrNumber))
+		{
+			/* fail if just one index has an expression in this column */
+			if (info1->ii_IndexAttrNumbers[i] == InvalidAttrNumber ||
+				info2->ii_IndexAttrNumbers[i] == InvalidAttrNumber)
+				return false;
 
-		/* collation and opfamily is not valid for including columns */
+			/* both are columns, so check for match after mapping */
+			if (attmap->attnums[info2->ii_IndexAttrNumbers[i] - 1] !=
+				info1->ii_IndexAttrNumbers[i])
+				return false;
+		}
+
+		/* collation and opfamily are not valid for included columns */
 		if (i >= info1->ii_NumIndexKeyAttrs)
 			continue;
 
@@ -3048,12 +3053,11 @@ index_build(Relation heapRelation,
 	/*
 	 * If we found any potentially broken HOT chains, mark the index as not
 	 * being usable until the current transaction is below the event horizon.
-	 * See src/backend/access/heap/README.HOT for discussion.  Also set this
-	 * if early pruning/vacuuming is enabled for the heap relation.  While it
-	 * might become safe to use the index earlier based on actual cleanup
-	 * activity and other active transactions, the test for that would be much
-	 * more complex and would require some form of blocking, so keep it simple
-	 * and fast by just using the current transaction.
+	 * See src/backend/access/heap/README.HOT for discussion.  While it might
+	 * become safe to use the index earlier based on actual cleanup activity
+	 * and other active transactions, the test for that would be much more
+	 * complex and would require some form of blocking, so keep it simple and
+	 * fast by just using the current transaction.
 	 *
 	 * However, when reindexing an existing index, we should do nothing here.
 	 * Any HOT chains that are broken with respect to the index must predate
@@ -3065,7 +3069,7 @@ index_build(Relation heapRelation,
 	 *
 	 * We also need not set indcheckxmin during a concurrent index build,
 	 * because we won't set indisvalid true until all transactions that care
-	 * about the broken HOT chains or early pruning/vacuuming are gone.
+	 * about the broken HOT chains are gone.
 	 *
 	 * Therefore, this code path can only be taken during non-concurrent
 	 * CREATE INDEX.  Thus the fact that heap_update will set the pg_index
@@ -3074,7 +3078,7 @@ index_build(Relation heapRelation,
 	 * about any concurrent readers of the tuple; no other transaction can see
 	 * it yet.
 	 */
-	if ((indexInfo->ii_BrokenHotChain || EarlyPruningEnabled(heapRelation)) &&
+	if (indexInfo->ii_BrokenHotChain &&
 		!isreindex &&
 		!indexInfo->ii_Concurrent)
 	{
@@ -3759,11 +3763,6 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 	 * reindexing pg_index itself, we must not try to update tuples in it.
 	 * pg_index's indexes should always have these flags in their clean state,
 	 * so that won't happen.
-	 *
-	 * If early pruning/vacuuming is enabled for the heap relation, the
-	 * usability horizon must be advanced to the current transaction on every
-	 * build or rebuild.  pg_index is OK in this regard because catalog tables
-	 * are not subject to early cleanup.
 	 */
 	if (!skipped_constraint)
 	{
@@ -3771,7 +3770,6 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 		HeapTuple	indexTuple;
 		Form_pg_index indexForm;
 		bool		index_bad;
-		bool		early_pruning_enabled = EarlyPruningEnabled(heapRelation);
 
 		pg_index = table_open(IndexRelationId, RowExclusiveLock);
 
@@ -3785,12 +3783,11 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 					 !indexForm->indisready ||
 					 !indexForm->indislive);
 		if (index_bad ||
-			(indexForm->indcheckxmin && !indexInfo->ii_BrokenHotChain) ||
-			early_pruning_enabled)
+			(indexForm->indcheckxmin && !indexInfo->ii_BrokenHotChain))
 		{
-			if (!indexInfo->ii_BrokenHotChain && !early_pruning_enabled)
+			if (!indexInfo->ii_BrokenHotChain)
 				indexForm->indcheckxmin = false;
-			else if (index_bad || early_pruning_enabled)
+			else if (index_bad)
 				indexForm->indcheckxmin = true;
 			indexForm->indisvalid = true;
 			indexForm->indisready = true;

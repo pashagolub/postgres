@@ -774,10 +774,7 @@ LogicalParallelApplyLoop(shm_mq_handle *mqh)
 			if (len == 0)
 				elog(ERROR, "invalid message length");
 
-			s.cursor = 0;
-			s.maxlen = -1;
-			s.data = (char *) data;
-			s.len = len;
+			initReadOnlyStringInfo(&s, data, len);
 
 			/*
 			 * The first byte of messages sent from leader apply worker to
@@ -1160,7 +1157,7 @@ pa_send_data(ParallelApplyWorkerInfo *winfo, Size nbytes, const void *data)
 	 * We don't try to send data to parallel worker for 'immediate' mode. This
 	 * is primarily used for testing purposes.
 	 */
-	if (unlikely(logical_replication_mode == LOGICAL_REP_MODE_IMMEDIATE))
+	if (unlikely(debug_logical_replication_streaming == DEBUG_LOGICAL_REP_STREAMING_IMMEDIATE))
 		return false;
 
 /*

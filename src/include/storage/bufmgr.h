@@ -35,7 +35,7 @@ typedef enum BufferAccessStrategyType
 	BAS_BULKREAD,				/* Large read-only scan (hint bit updates are
 								 * ok) */
 	BAS_BULKWRITE,				/* Large multi-block write (e.g. COPY IN) */
-	BAS_VACUUM					/* VACUUM */
+	BAS_VACUUM,					/* VACUUM */
 } BufferAccessStrategyType;
 
 /* Possible modes for ReadBufferExtended() */
@@ -47,7 +47,7 @@ typedef enum
 	RBM_ZERO_AND_CLEANUP_LOCK,	/* Like RBM_ZERO_AND_LOCK, but locks the page
 								 * in "cleanup" mode */
 	RBM_ZERO_ON_ERROR,			/* Read, but return an all-zeros page on error */
-	RBM_NORMAL_NO_LOG			/* Don't log page as invalid during WAL
+	RBM_NORMAL_NO_LOG,			/* Don't log page as invalid during WAL
 								 * replay; otherwise same as RBM_NORMAL */
 } ReadBufferMode;
 
@@ -179,6 +179,8 @@ extern Buffer ReadBufferWithoutRelcache(RelFileLocator rlocator,
 										bool permanent);
 extern void ReleaseBuffer(Buffer buffer);
 extern void UnlockReleaseBuffer(Buffer buffer);
+extern bool BufferIsExclusiveLocked(Buffer buffer);
+extern bool BufferIsDirty(Buffer buffer);
 extern void MarkBufferDirty(Buffer buffer);
 extern void IncrBufferRefCount(Buffer buffer);
 extern void CheckBufferIsPinnedOnce(Buffer buffer);
@@ -249,8 +251,6 @@ extern bool HoldingBufferPinThatDelaysRecovery(void);
 extern void AbortBufferIO(Buffer buffer);
 
 extern bool BgBufferSync(struct WritebackContext *wb_context);
-
-extern void TestForOldSnapshot_impl(Snapshot snapshot, Relation relation);
 
 /* in buf_init.c */
 extern void InitBufferPool(void);
@@ -347,45 +347,11 @@ BufferGetPageSize(Buffer buffer)
 /*
  * BufferGetPage
  *		Returns the page associated with a buffer.
- *
- * When this is called as part of a scan, there may be a need for a nearby
- * call to TestForOldSnapshot().  See the definition of that for details.
  */
 static inline Page
 BufferGetPage(Buffer buffer)
 {
 	return (Page) BufferGetBlock(buffer);
-}
-
-/*
- * Check whether the given snapshot is too old to have safely read the given
- * page from the given table.  If so, throw a "snapshot too old" error.
- *
- * This test generally needs to be performed after every BufferGetPage() call
- * that is executed as part of a scan.  It is not needed for calls made for
- * modifying the page (for example, to position to the right place to insert a
- * new index tuple or for vacuuming).  It may also be omitted where calls to
- * lower-level functions will have already performed the test.
- *
- * Note that a NULL snapshot argument is allowed and causes a fast return
- * without error; this is to support call sites which can be called from
- * either scans or index modification areas.
- *
- * For best performance, keep the tests that are fastest and/or most likely to
- * exclude a page from old snapshot testing near the front.
- */
-static inline void
-TestForOldSnapshot(Snapshot snapshot, Relation relation, Page page)
-{
-	Assert(relation != NULL);
-
-	if (old_snapshot_threshold >= 0
-		&& (snapshot) != NULL
-		&& ((snapshot)->snapshot_type == SNAPSHOT_MVCC
-			|| (snapshot)->snapshot_type == SNAPSHOT_TOAST)
-		&& !XLogRecPtrIsInvalid((snapshot)->lsn)
-		&& PageGetLSN(page) > (snapshot)->lsn)
-		TestForOldSnapshot_impl(snapshot, relation);
 }
 
 #endif							/* FRONTEND */

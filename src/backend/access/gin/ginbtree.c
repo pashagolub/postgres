@@ -78,7 +78,7 @@ ginTraverseLock(Buffer buffer, bool searchMode)
  */
 GinBtreeStack *
 ginFindLeafPage(GinBtree btree, bool searchMode,
-				bool rootConflictCheck, Snapshot snapshot)
+				bool rootConflictCheck)
 {
 	GinBtreeStack *stack;
 
@@ -100,7 +100,6 @@ ginFindLeafPage(GinBtree btree, bool searchMode,
 		stack->off = InvalidOffsetNumber;
 
 		page = BufferGetPage(stack->buffer);
-		TestForOldSnapshot(snapshot, btree->index, page);
 
 		access = ginTraverseLock(stack->buffer, searchMode);
 
@@ -127,7 +126,6 @@ ginFindLeafPage(GinBtree btree, bool searchMode,
 			stack->buffer = ginStepRight(stack->buffer, btree->index, access);
 			stack->blkno = rightlink;
 			page = BufferGetPage(stack->buffer);
-			TestForOldSnapshot(snapshot, btree->index, page);
 
 			if (!searchMode && GinPageIsIncompleteSplit(page))
 				ginFinishSplit(btree, stack, false, NULL);
@@ -389,24 +387,22 @@ ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
 		START_CRIT_SECTION();
 
 		if (RelationNeedsWAL(btree->index) && !btree->isBuild)
-		{
 			XLogBeginInsert();
-			XLogRegisterBuffer(0, stack->buffer, REGBUF_STANDARD);
-			if (BufferIsValid(childbuf))
-				XLogRegisterBuffer(1, childbuf, REGBUF_STANDARD);
-		}
 
-		/* Perform the page update, and register any extra WAL data */
+		/*
+		 * Perform the page update, dirty and register stack->buffer, and
+		 * register any extra WAL data.
+		 */
 		btree->execPlaceToPage(btree, stack->buffer, stack,
 							   insertdata, updateblkno, ptp_workspace);
-
-		MarkBufferDirty(stack->buffer);
 
 		/* An insert to an internal page finishes the split of the child. */
 		if (BufferIsValid(childbuf))
 		{
 			GinPageGetOpaque(childpage)->flags &= ~GIN_INCOMPLETE_SPLIT;
 			MarkBufferDirty(childbuf);
+			if (RelationNeedsWAL(btree->index) && !btree->isBuild)
+				XLogRegisterBuffer(1, childbuf, REGBUF_STANDARD);
 		}
 
 		if (RelationNeedsWAL(btree->index) && !btree->isBuild)
