@@ -3,7 +3,7 @@
  *
  *	database server functions
  *
- *	Copyright (c) 2010-2023, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2025, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/server.c
  */
 
@@ -252,7 +252,10 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	if (GET_MAJOR_VERSION(cluster->major_version) >= 1700)
 		appendPQExpBufferStr(&pgoptions, " -c max_slot_wal_keep_size=-1");
 
-	/* Use -b to disable autovacuum. */
+	/*
+	 * Use -b to disable autovacuum and logical replication launcher
+	 * (effective in PG17 or later for the latter).
+	 */
 	snprintf(cmd, sizeof(cmd),
 			 "\"%s/pg_ctl\" -w -l \"%s/%s\" -D \"%s\" -o \"-p %d -b%s %s%s\" start",
 			 cluster->bindir,

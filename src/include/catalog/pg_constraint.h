@@ -4,7 +4,7 @@
  *	  definition of the "constraint" system catalog (pg_constraint)
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_constraint.h
@@ -51,6 +51,7 @@ CATALOG(pg_constraint,2606,ConstraintRelationId)
 	char		contype;		/* constraint type; see codes below */
 	bool		condeferrable;	/* deferrable constraint? */
 	bool		condeferred;	/* deferred by default? */
+	bool		conenforced;	/* enforced constraint? */
 	bool		convalidated;	/* constraint has been validated? */
 
 	/*
@@ -107,6 +108,12 @@ CATALOG(pg_constraint,2606,ConstraintRelationId)
 	/* Has a local definition and cannot be inherited */
 	bool		connoinherit;
 
+	/*
+	 * For primary keys, unique constraints, and foreign keys, signifies the
+	 * last column uses overlaps instead of equals.
+	 */
+	bool		conperiod;
+
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 
 	/*
@@ -121,20 +128,22 @@ CATALOG(pg_constraint,2606,ConstraintRelationId)
 	int16		confkey[1];
 
 	/*
-	 * If a foreign key, the OIDs of the PK = FK equality operators for each
-	 * column of the constraint
+	 * If a foreign key, the OIDs of the PK = FK equality/overlap operators
+	 * for each column of the constraint
 	 */
 	Oid			conpfeqop[1] BKI_LOOKUP(pg_operator);
 
 	/*
-	 * If a foreign key, the OIDs of the PK = PK equality operators for each
-	 * column of the constraint (i.e., equality for the referenced columns)
+	 * If a foreign key, the OIDs of the PK = PK equality/overlap operators
+	 * for each column of the constraint (i.e., equality for the referenced
+	 * columns)
 	 */
 	Oid			conppeqop[1] BKI_LOOKUP(pg_operator);
 
 	/*
-	 * If a foreign key, the OIDs of the FK = FK equality operators for each
-	 * column of the constraint (i.e., equality for the referencing columns)
+	 * If a foreign key, the OIDs of the FK = FK equality/overlap operators
+	 * for each column of the constraint (i.e., equality for the referencing
+	 * columns)
 	 */
 	Oid			conffeqop[1] BKI_LOOKUP(pg_operator);
 
@@ -146,7 +155,8 @@ CATALOG(pg_constraint,2606,ConstraintRelationId)
 
 	/*
 	 * If an exclusion constraint, the OIDs of the exclusion operators for
-	 * each column of the constraint
+	 * each column of the constraint.  Also set for unique constraints/primary
+	 * keys using WITHOUT OVERLAPS.
 	 */
 	Oid			conexclop[1] BKI_LOOKUP(pg_operator);
 
@@ -171,6 +181,8 @@ DECLARE_UNIQUE_INDEX(pg_constraint_conrelid_contypid_conname_index, 2665, Constr
 DECLARE_INDEX(pg_constraint_contypid_index, 2666, ConstraintTypidIndexId, pg_constraint, btree(contypid oid_ops));
 DECLARE_UNIQUE_INDEX_PKEY(pg_constraint_oid_index, 2667, ConstraintOidIndexId, pg_constraint, btree(oid oid_ops));
 DECLARE_INDEX(pg_constraint_conparentid_index, 2579, ConstraintParentIndexId, pg_constraint, btree(conparentid oid_ops));
+
+MAKE_SYSCACHE(CONSTROID, pg_constraint_oid_index, 16);
 
 /* conkey can contain zero (InvalidAttrNumber) if a whole-row Var is used */
 DECLARE_ARRAY_FOREIGN_KEY_OPT((conrelid, conkey), pg_attribute, (attrelid, attnum));
@@ -211,6 +223,7 @@ extern Oid	CreateConstraintEntry(const char *constraintName,
 								  char constraintType,
 								  bool isDeferrable,
 								  bool isDeferred,
+								  bool isEnforced,
 								  bool isValidated,
 								  Oid parentConstrId,
 								  Oid relId,
@@ -234,8 +247,9 @@ extern Oid	CreateConstraintEntry(const char *constraintName,
 								  Node *conExpr,
 								  const char *conBin,
 								  bool conIsLocal,
-								  int conInhCount,
+								  int16 conInhCount,
 								  bool conNoInherit,
+								  bool conPeriod,
 								  bool is_internal);
 
 extern bool ConstraintNameIsUsed(ConstraintCategory conCat, Oid objId,
@@ -247,11 +261,12 @@ extern char *ChooseConstraintName(const char *name1, const char *name2,
 
 extern HeapTuple findNotNullConstraintAttnum(Oid relid, AttrNumber attnum);
 extern HeapTuple findNotNullConstraint(Oid relid, const char *colname);
+extern HeapTuple findDomainNotNullConstraint(Oid typid);
 extern AttrNumber extractNotNullColumn(HeapTuple constrTup);
-extern bool AdjustNotNullInheritance1(Oid relid, AttrNumber attnum, int count,
-									  bool is_no_inherit);
-extern void AdjustNotNullInheritance(Oid relid, Bitmapset *columns, int count);
-extern List *RelationGetNotNullConstraints(Oid relid, bool cooked);
+extern bool AdjustNotNullInheritance(Oid relid, AttrNumber attnum,
+									 bool is_local, bool is_no_inherit);
+extern List *RelationGetNotNullConstraints(Oid relid, bool cooked,
+										   bool include_noinh);
 
 extern void RemoveConstraintById(Oid conId);
 extern void RenameConstraintById(Oid conId, const char *newname);
@@ -273,6 +288,9 @@ extern void DeconstructFkConstraintRow(HeapTuple tuple, int *numfks,
 									   AttrNumber *conkey, AttrNumber *confkey,
 									   Oid *pf_eq_oprs, Oid *pp_eq_oprs, Oid *ff_eq_oprs,
 									   int *num_fk_del_set_cols, AttrNumber *fk_del_set_cols);
+extern void FindFKPeriodOpers(Oid opclass,
+							  Oid *containedbyoperoid,
+							  Oid *aggedcontainedbyoperoid);
 
 extern bool check_functional_grouping(Oid relid,
 									  Index varno, Index varlevelsup,

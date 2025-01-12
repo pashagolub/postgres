@@ -3,7 +3,7 @@
  * nodeSeqscan.c
  *	  Support routines for sequential scans of relations.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -29,7 +29,7 @@
 
 #include "access/relscan.h"
 #include "access/tableam.h"
-#include "executor/execdebug.h"
+#include "executor/executor.h"
 #include "executor/nodeSeqscan.h"
 #include "utils/rel.h"
 

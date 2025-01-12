@@ -14,7 +14,7 @@
  * See src/backend/utils/misc/README for more information.
  *
  *
- * Copyright (c) 2000-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2025, PostgreSQL Global Development Group
  * Written by Peter Eisentraut <peter_e@gmx.net>.
  *
  * IDENTIFICATION
@@ -25,6 +25,7 @@
 #include "postgres.h"
 
 #include <limits.h>
+#include <math.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -35,6 +36,8 @@
 #include "catalog/pg_parameter_acl.h"
 #include "guc_internal.h"
 #include "libpq/pqformat.h"
+#include "libpq/protocol.h"
+#include "miscadmin.h"
 #include "parser/scansup.h"
 #include "port/pg_bitutils.h"
 #include "storage/fd.h"
@@ -42,10 +45,8 @@
 #include "storage/shmem.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
-#include "utils/backend_status.h"
 #include "utils/builtins.h"
 #include "utils/conffiles.h"
-#include "utils/float.h"
 #include "utils/guc_tables.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
@@ -66,6 +67,12 @@
  */
 #define REALTYPE_PRECISION 17
 
+/*
+ * Safe search path when executing code as the table owner, such as during
+ * maintenance operations.
+ */
+#define GUC_SAFE_SEARCH_PATH "pg_catalog, pg_temp"
+
 static int	GUC_check_errcode_value;
 
 static List *reserved_class_prefix = NIL;
@@ -74,9 +81,6 @@ static List *reserved_class_prefix = NIL;
 char	   *GUC_check_errmsg_string;
 char	   *GUC_check_errdetail_string;
 char	   *GUC_check_errhint_string;
-
-/* Kluge: for speed, we examine this GUC variable's value directly */
-extern bool in_hot_standby_guc;
 
 
 /*
@@ -186,6 +190,7 @@ static const unit_conversion time_unit_conversion_table[] =
 static const char *const map_old_guc_names[] = {
 	"sort_mem", "work_mem",
 	"vacuum_mem", "maintenance_work_mem",
+	"ssl_ecdh_curve", "ssl_groups",
 	NULL
 };
 
@@ -1282,10 +1287,10 @@ find_option(const char *name, bool create_placeholders, bool skip_errors,
 static int
 guc_var_compare(const void *a, const void *b)
 {
-	const struct config_generic *confa = *(struct config_generic *const *) a;
-	const struct config_generic *confb = *(struct config_generic *const *) b;
+	const char *namea = **(const char **const *) a;
+	const char *nameb = **(const char **const *) b;
 
-	return guc_name_compare(confa->name, confb->name);
+	return guc_name_compare(namea, nameb);
 }
 
 /*
@@ -1473,7 +1478,9 @@ check_GUC_init(struct config_generic *gconf)
 			{
 				struct config_string *conf = (struct config_string *) gconf;
 
-				if (*conf->variable != NULL && strcmp(*conf->variable, conf->boot_val) != 0)
+				if (*conf->variable != NULL &&
+					(conf->boot_val == NULL ||
+					 strcmp(*conf->variable, conf->boot_val) != 0))
 				{
 					elog(LOG, "GUC (PGC_STRING) %s, boot_val=%s, C-var=%s",
 						 conf->gen.name, conf->boot_val ? conf->boot_val : "<null>", *conf->variable);
@@ -1790,10 +1797,9 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 
 	if (configdir && stat(configdir, &stat_buf) != 0)
 	{
-		write_stderr("%s: could not access directory \"%s\": %s\n",
+		write_stderr("%s: could not access directory \"%s\": %m\n",
 					 progname,
-					 configdir,
-					 strerror(errno));
+					 configdir);
 		if (errno == ENOENT)
 			write_stderr("Run initdb or pg_basebackup to initialize a PostgreSQL data directory.\n");
 		return false;
@@ -1842,8 +1848,8 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 	 */
 	if (stat(ConfigFileName, &stat_buf) != 0)
 	{
-		write_stderr("%s: could not access the server configuration file \"%s\": %s\n",
-					 progname, ConfigFileName, strerror(errno));
+		write_stderr("%s: could not access the server configuration file \"%s\": %m\n",
+					 progname, ConfigFileName);
 		free(configdir);
 		return false;
 	}
@@ -2229,6 +2235,19 @@ int
 NewGUCNestLevel(void)
 {
 	return ++GUCNestLevel;
+}
+
+/*
+ * Set search_path to a fixed value for maintenance operations. No effect
+ * during bootstrap, when the search_path is already set to a fixed value and
+ * cannot be changed.
+ */
+void
+RestrictSearchPath(void)
+{
+	if (!IsBootstrapProcessingMode())
+		set_config_option("search_path", GUC_SAFE_SEARCH_PATH, PGC_USERSET,
+						  PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 }
 
 /*
@@ -3097,7 +3116,6 @@ config_enum_get_options(struct config_enum *record, const char *prefix,
  * and also calls any check hook the parameter may have.
  *
  * record: GUC variable's info record
- * name: variable name (should match the record of course)
  * value: proposed value, as a string
  * source: identifies source of value (check hooks may need this)
  * elevel: level to log any error reports at
@@ -3109,7 +3127,7 @@ config_enum_get_options(struct config_enum *record, const char *prefix,
  */
 static bool
 parse_and_validate_value(struct config_generic *record,
-						 const char *name, const char *value,
+						 const char *value,
 						 GucSource source, int elevel,
 						 union config_var_val *newval, void **newextra)
 {
@@ -3124,7 +3142,7 @@ parse_and_validate_value(struct config_generic *record,
 					ereport(elevel,
 							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 							 errmsg("parameter \"%s\" requires a Boolean value",
-									name)));
+									conf->gen.name)));
 					return false;
 				}
 
@@ -3144,7 +3162,7 @@ parse_and_validate_value(struct config_generic *record,
 					ereport(elevel,
 							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 							 errmsg("invalid value for parameter \"%s\": \"%s\"",
-									name, value),
+									conf->gen.name, value),
 							 hintmsg ? errhint("%s", _(hintmsg)) : 0));
 					return false;
 				}
@@ -3152,15 +3170,20 @@ parse_and_validate_value(struct config_generic *record,
 				if (newval->intval < conf->min || newval->intval > conf->max)
 				{
 					const char *unit = get_config_unit_name(conf->gen.flags);
+					const char *unitspace;
+
+					if (unit)
+						unitspace = " ";
+					else
+						unit = unitspace = "";
 
 					ereport(elevel,
 							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("%d%s%s is outside the valid range for parameter \"%s\" (%d .. %d)",
-									newval->intval,
-									unit ? " " : "",
-									unit ? unit : "",
-									name,
-									conf->min, conf->max)));
+							 errmsg("%d%s%s is outside the valid range for parameter \"%s\" (%d%s%s .. %d%s%s)",
+									newval->intval, unitspace, unit,
+									conf->gen.name,
+									conf->min, unitspace, unit,
+									conf->max, unitspace, unit)));
 					return false;
 				}
 
@@ -3180,7 +3203,7 @@ parse_and_validate_value(struct config_generic *record,
 					ereport(elevel,
 							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 							 errmsg("invalid value for parameter \"%s\": \"%s\"",
-									name, value),
+									conf->gen.name, value),
 							 hintmsg ? errhint("%s", _(hintmsg)) : 0));
 					return false;
 				}
@@ -3188,15 +3211,20 @@ parse_and_validate_value(struct config_generic *record,
 				if (newval->realval < conf->min || newval->realval > conf->max)
 				{
 					const char *unit = get_config_unit_name(conf->gen.flags);
+					const char *unitspace;
+
+					if (unit)
+						unitspace = " ";
+					else
+						unit = unitspace = "";
 
 					ereport(elevel,
 							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("%g%s%s is outside the valid range for parameter \"%s\" (%g .. %g)",
-									newval->realval,
-									unit ? " " : "",
-									unit ? unit : "",
-									name,
-									conf->min, conf->max)));
+							 errmsg("%g%s%s is outside the valid range for parameter \"%s\" (%g%s%s .. %g%s%s)",
+									newval->realval, unitspace, unit,
+									conf->gen.name,
+									conf->min, unitspace, unit,
+									conf->max, unitspace, unit)));
 					return false;
 				}
 
@@ -3250,7 +3278,7 @@ parse_and_validate_value(struct config_generic *record,
 					ereport(elevel,
 							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 							 errmsg("invalid value for parameter \"%s\": \"%s\"",
-									name, value),
+									conf->gen.name, value),
 							 hintmsg ? errhint("%s", _(hintmsg)) : 0));
 
 					if (hintmsg)
@@ -3296,10 +3324,12 @@ parse_and_validate_value(struct config_generic *record,
  *
  * Return value:
  *	+1: the value is valid and was successfully applied.
- *	0:	the name or value is invalid (but see below).
- *	-1: the value was not applied because of context, priority, or changeVal.
+ *	0:	the name or value is invalid, or it's invalid to try to set
+ *		this GUC now; but elevel was less than ERROR (see below).
+ *	-1: no error detected, but the value was not applied, either
+ *		because changeVal is false or there is some overriding setting.
  *
- * If there is an error (non-existing option, invalid value) then an
+ * If there is an error (non-existing option, invalid value, etc) then an
  * ereport(ERROR) is thrown *unless* this is called for a source for which
  * we don't want an ERROR (currently, those are defaults, the config file,
  * and per-database or per-user settings, as well as callers who specify
@@ -3327,10 +3357,10 @@ set_config_option(const char *name, const char *value,
 	else
 		srole = BOOTSTRAP_SUPERUSERID;
 
-	return set_config_option_ext(name, value,
-								 context, source, srole,
-								 action, changeVal, elevel,
-								 is_reload);
+	return set_config_with_handle(name, NULL, value,
+								  context, source, srole,
+								  action, changeVal, elevel,
+								  is_reload);
 }
 
 /*
@@ -3353,6 +3383,30 @@ set_config_option_ext(const char *name, const char *value,
 					  GucContext context, GucSource source, Oid srole,
 					  GucAction action, bool changeVal, int elevel,
 					  bool is_reload)
+{
+	return set_config_with_handle(name, NULL, value,
+								  context, source, srole,
+								  action, changeVal, elevel,
+								  is_reload);
+}
+
+
+/*
+ * set_config_with_handle: sets option `name' to given value.
+ *
+ * This API adds the ability to pass a 'handle' argument, which can be
+ * obtained by the caller from get_config_handle().  NULL has no effect,
+ * but a non-null value avoids the need to search the GUC tables.
+ *
+ * This should be used by callers which repeatedly set the same config
+ * option(s), and want to avoid the overhead of a hash lookup each time.
+ */
+int
+set_config_with_handle(const char *name, config_handle *handle,
+					   const char *value,
+					   GucContext context, GucSource source, Oid srole,
+					   GucAction action, bool changeVal, int elevel,
+					   bool is_reload)
 {
 	struct config_generic *record;
 	union config_var_val newval_union;
@@ -3379,6 +3433,16 @@ set_config_option_ext(const char *name, const char *value,
 			elevel = ERROR;
 	}
 
+	/* if handle is specified, no need to look up option */
+	if (!handle)
+	{
+		record = find_option(name, true, false, elevel);
+		if (record == NULL)
+			return 0;
+	}
+	else
+		record = handle;
+
 	/*
 	 * GUC_ACTION_SAVE changes are acceptable during a parallel operation,
 	 * because the current worker will also pop the change.  We're probably
@@ -3386,16 +3450,19 @@ set_config_option_ext(const char *name, const char *value,
 	 * body should observe the change, and peer workers do not share in the
 	 * execution of a function call started by this worker.
 	 *
+	 * Also allow normal setting if the GUC is marked GUC_ALLOW_IN_PARALLEL.
+	 *
 	 * Other changes might need to affect other workers, so forbid them.
 	 */
-	if (IsInParallelMode() && changeVal && action != GUC_ACTION_SAVE)
+	if (IsInParallelMode() && changeVal && action != GUC_ACTION_SAVE &&
+		(record->flags & GUC_ALLOW_IN_PARALLEL) == 0)
+	{
 		ereport(elevel,
 				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
-				 errmsg("cannot set parameters during a parallel operation")));
-
-	record = find_option(name, true, false, elevel);
-	if (record == NULL)
+				 errmsg("parameter \"%s\" cannot be set during a parallel operation",
+						record->name)));
 		return 0;
+	}
 
 	/*
 	 * Check if the option can be set at this time. See guc.h for the precise
@@ -3409,7 +3476,7 @@ set_config_option_ext(const char *name, const char *value,
 				ereport(elevel,
 						(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
 						 errmsg("parameter \"%s\" cannot be changed",
-								name)));
+								record->name)));
 				return 0;
 			}
 			break;
@@ -3432,7 +3499,7 @@ set_config_option_ext(const char *name, const char *value,
 				ereport(elevel,
 						(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
 						 errmsg("parameter \"%s\" cannot be changed without restarting the server",
-								name)));
+								record->name)));
 				return 0;
 			}
 			break;
@@ -3442,7 +3509,7 @@ set_config_option_ext(const char *name, const char *value,
 				ereport(elevel,
 						(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
 						 errmsg("parameter \"%s\" cannot be changed now",
-								name)));
+								record->name)));
 				return 0;
 			}
 
@@ -3462,14 +3529,14 @@ set_config_option_ext(const char *name, const char *value,
 				 */
 				AclResult	aclresult;
 
-				aclresult = pg_parameter_aclcheck(name, srole, ACL_SET);
+				aclresult = pg_parameter_aclcheck(record->name, srole, ACL_SET);
 				if (aclresult != ACLCHECK_OK)
 				{
 					/* No granted privilege */
 					ereport(elevel,
 							(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 							 errmsg("permission denied to set parameter \"%s\"",
-									name)));
+									record->name)));
 					return 0;
 				}
 			}
@@ -3486,6 +3553,10 @@ set_config_option_ext(const char *name, const char *value,
 				 * backends.  This is a tad klugy, but necessary because we
 				 * don't re-read the config file during backend start.
 				 *
+				 * However, if changeVal is false then plow ahead anyway since
+				 * we are trying to find out if the value is potentially good,
+				 * not actually use it.
+				 *
 				 * In EXEC_BACKEND builds, this works differently: we load all
 				 * non-default settings from the CONFIG_EXEC_PARAMS file
 				 * during backend start.  In that case we must accept
@@ -3496,7 +3567,7 @@ set_config_option_ext(const char *name, const char *value,
 				 * started it. is_reload will be true when either situation
 				 * applies.
 				 */
-				if (IsUnderPostmaster && !is_reload)
+				if (IsUnderPostmaster && changeVal && !is_reload)
 					return -1;
 			}
 			else if (context != PGC_POSTMASTER &&
@@ -3507,7 +3578,7 @@ set_config_option_ext(const char *name, const char *value,
 				ereport(elevel,
 						(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
 						 errmsg("parameter \"%s\" cannot be set after connection start",
-								name)));
+								record->name)));
 				return 0;
 			}
 			break;
@@ -3520,14 +3591,14 @@ set_config_option_ext(const char *name, const char *value,
 				 */
 				AclResult	aclresult;
 
-				aclresult = pg_parameter_aclcheck(name, srole, ACL_SET);
+				aclresult = pg_parameter_aclcheck(record->name, srole, ACL_SET);
 				if (aclresult != ACLCHECK_OK)
 				{
 					/* No granted privilege */
 					ereport(elevel,
 							(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 							 errmsg("permission denied to set parameter \"%s\"",
-									name)));
+									record->name)));
 					return 0;
 				}
 			}
@@ -3566,7 +3637,7 @@ set_config_option_ext(const char *name, const char *value,
 			ereport(elevel,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("cannot set parameter \"%s\" within security-definer function",
-							name)));
+							record->name)));
 			return 0;
 		}
 		if (InSecurityRestrictedOperation())
@@ -3574,7 +3645,7 @@ set_config_option_ext(const char *name, const char *value,
 			ereport(elevel,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("cannot set parameter \"%s\" within security-restricted operation",
-							name)));
+							record->name)));
 			return 0;
 		}
 	}
@@ -3586,7 +3657,7 @@ set_config_option_ext(const char *name, const char *value,
 		{
 			ereport(elevel,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("parameter \"%s\" cannot be reset", name)));
+					 errmsg("parameter \"%s\" cannot be reset", record->name)));
 			return 0;
 		}
 		if (action == GUC_ACTION_SAVE)
@@ -3594,7 +3665,7 @@ set_config_option_ext(const char *name, const char *value,
 			ereport(elevel,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("parameter \"%s\" cannot be set locally in functions",
-							name)));
+							record->name)));
 			return 0;
 		}
 	}
@@ -3620,7 +3691,7 @@ set_config_option_ext(const char *name, const char *value,
 		if (changeVal && !makeDefault)
 		{
 			elog(DEBUG3, "\"%s\": setting ignored because previous source is higher priority",
-				 name);
+				 record->name);
 			return -1;
 		}
 		changeVal = false;
@@ -3639,7 +3710,7 @@ set_config_option_ext(const char *name, const char *value,
 
 				if (value)
 				{
-					if (!parse_and_validate_value(record, name, value,
+					if (!parse_and_validate_value(record, value,
 												  source, elevel,
 												  &newval_union, &newextra))
 						return 0;
@@ -3672,7 +3743,7 @@ set_config_option_ext(const char *name, const char *value,
 						ereport(elevel,
 								(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
 								 errmsg("parameter \"%s\" cannot be changed without restarting the server",
-										name)));
+										conf->gen.name)));
 						return 0;
 					}
 					record->status &= ~GUC_PENDING_RESTART;
@@ -3737,7 +3808,7 @@ set_config_option_ext(const char *name, const char *value,
 
 				if (value)
 				{
-					if (!parse_and_validate_value(record, name, value,
+					if (!parse_and_validate_value(record, value,
 												  source, elevel,
 												  &newval_union, &newextra))
 						return 0;
@@ -3770,7 +3841,7 @@ set_config_option_ext(const char *name, const char *value,
 						ereport(elevel,
 								(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
 								 errmsg("parameter \"%s\" cannot be changed without restarting the server",
-										name)));
+										conf->gen.name)));
 						return 0;
 					}
 					record->status &= ~GUC_PENDING_RESTART;
@@ -3835,7 +3906,7 @@ set_config_option_ext(const char *name, const char *value,
 
 				if (value)
 				{
-					if (!parse_and_validate_value(record, name, value,
+					if (!parse_and_validate_value(record, value,
 												  source, elevel,
 												  &newval_union, &newextra))
 						return 0;
@@ -3868,7 +3939,7 @@ set_config_option_ext(const char *name, const char *value,
 						ereport(elevel,
 								(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
 								 errmsg("parameter \"%s\" cannot be changed without restarting the server",
-										name)));
+										conf->gen.name)));
 						return 0;
 					}
 					record->status &= ~GUC_PENDING_RESTART;
@@ -3928,12 +3999,15 @@ set_config_option_ext(const char *name, const char *value,
 		case PGC_STRING:
 			{
 				struct config_string *conf = (struct config_string *) record;
+				GucContext	orig_context = context;
+				GucSource	orig_source = source;
+				Oid			orig_srole = srole;
 
 #define newval (newval_union.stringval)
 
 				if (value)
 				{
-					if (!parse_and_validate_value(record, name, value,
+					if (!parse_and_validate_value(record, value,
 												  source, elevel,
 												  &newval_union, &newextra))
 						return 0;
@@ -3992,7 +4066,7 @@ set_config_option_ext(const char *name, const char *value,
 						ereport(elevel,
 								(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
 								 errmsg("parameter \"%s\" cannot be changed without restarting the server",
-										name)));
+										conf->gen.name)));
 						return 0;
 					}
 					record->status &= ~GUC_PENDING_RESTART;
@@ -4013,6 +4087,44 @@ set_config_option_ext(const char *name, const char *value,
 					set_guc_source(&conf->gen, source);
 					conf->gen.scontext = context;
 					conf->gen.srole = srole;
+
+					/*
+					 * Ugly hack: during SET session_authorization, forcibly
+					 * do SET ROLE NONE with the same context/source/etc, so
+					 * that the effects will have identical lifespan.  This is
+					 * required by the SQL spec, and it's not possible to do
+					 * it within the variable's check hook or assign hook
+					 * because our APIs for those don't pass enough info.
+					 * However, don't do it if is_reload: in that case we
+					 * expect that if "role" isn't supposed to be default, it
+					 * has been or will be set by a separate reload action.
+					 *
+					 * Also, for the call from InitializeSessionUserId with
+					 * source == PGC_S_OVERRIDE, use PGC_S_DYNAMIC_DEFAULT for
+					 * "role"'s source, so that it's still possible to set
+					 * "role" from pg_db_role_setting entries.  (See notes in
+					 * InitializeSessionUserId before changing this.)
+					 *
+					 * A fine point: for RESET session_authorization, we do
+					 * "RESET role" not "SET ROLE NONE" (by passing down NULL
+					 * rather than "none" for the value).  This would have the
+					 * same effects in typical cases, but if the reset value
+					 * of "role" is not "none" it seems better to revert to
+					 * that.
+					 */
+					if (!is_reload &&
+						strcmp(conf->gen.name, "session_authorization") == 0)
+						(void) set_config_with_handle("role", NULL,
+													  value ? "none" : NULL,
+													  orig_context,
+													  (orig_source == PGC_S_OVERRIDE)
+													  ? PGC_S_DYNAMIC_DEFAULT
+													  : orig_source,
+													  orig_srole,
+													  action,
+													  true,
+													  elevel,
+													  false);
 				}
 
 				if (makeDefault)
@@ -4062,7 +4174,7 @@ set_config_option_ext(const char *name, const char *value,
 
 				if (value)
 				{
-					if (!parse_and_validate_value(record, name, value,
+					if (!parse_and_validate_value(record, value,
 												  source, elevel,
 												  &newval_union, &newextra))
 						return 0;
@@ -4095,7 +4207,7 @@ set_config_option_ext(const char *name, const char *value,
 						ereport(elevel,
 								(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
 								 errmsg("parameter \"%s\" cannot be changed without restarting the server",
-										name)));
+										conf->gen.name)));
 						return 0;
 					}
 					record->status &= ~GUC_PENDING_RESTART;
@@ -4165,6 +4277,22 @@ set_config_option_ext(const char *name, const char *value,
 
 
 /*
+ * Retrieve a config_handle for the given name, suitable for calling
+ * set_config_with_handle(). Only return handle to permanent GUC.
+ */
+config_handle *
+get_config_handle(const char *name)
+{
+	struct config_generic *gen = find_option(name, false, false, 0);
+
+	if (gen && ((gen->flags & GUC_CUSTOM_PLACEHOLDER) == 0))
+		return gen;
+
+	return NULL;
+}
+
+
+/*
  * Set the fields for source file and line number the setting came from.
  */
 static void
@@ -4213,8 +4341,7 @@ SetConfigOption(const char *name, const char *value,
 /*
  * Fetch the current value of the option `name', as a string.
  *
- * If the option doesn't exist, return NULL if missing_ok is true (NOTE that
- * this cannot be distinguished from a string variable with a NULL value!),
+ * If the option doesn't exist, return NULL if missing_ok is true,
  * otherwise throw an ereport and don't return.
  *
  * If restrict_privileged is true, we also enforce that only superusers and
@@ -4257,7 +4384,8 @@ GetConfigOption(const char *name, bool missing_ok, bool restrict_privileged)
 			return buffer;
 
 		case PGC_STRING:
-			return *((struct config_string *) record)->variable;
+			return *((struct config_string *) record)->variable ?
+				*((struct config_string *) record)->variable : "";
 
 		case PGC_ENUM:
 			return config_enum_lookup_by_value((struct config_enum *) record,
@@ -4304,7 +4432,8 @@ GetConfigOptionResetString(const char *name)
 			return buffer;
 
 		case PGC_STRING:
-			return ((struct config_string *) record)->reset_val;
+			return ((struct config_string *) record)->reset_val ?
+				((struct config_string *) record)->reset_val : "";
 
 		case PGC_ENUM:
 			return config_enum_lookup_by_value((struct config_enum *) record,
@@ -4491,6 +4620,11 @@ AlterSystemSetConfigFile(AlterSystemStmt *altersysstmt)
 	 */
 	name = altersysstmt->setstmt->name;
 
+	if (!AllowAlterSystem)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("ALTER SYSTEM is not allowed in this environment")));
+
 	switch (altersysstmt->setstmt->kind)
 	{
 		case VAR_SET_VALUE:
@@ -4567,7 +4701,7 @@ AlterSystemSetConfigFile(AlterSystemStmt *altersysstmt)
 				union config_var_val newval;
 				void	   *newextra = NULL;
 
-				if (!parse_and_validate_value(record, name, value,
+				if (!parse_and_validate_value(record, value,
 											  PGC_S_FILE, ERROR,
 											  &newval, &newextra))
 					ereport(ERROR,
@@ -5255,7 +5389,14 @@ get_explain_guc_options(int *num)
 				{
 					struct config_string *lconf = (struct config_string *) conf;
 
-					modified = (strcmp(lconf->boot_val, *(lconf->variable)) != 0);
+					if (lconf->boot_val == NULL &&
+						*lconf->variable == NULL)
+						modified = false;
+					else if (lconf->boot_val == NULL ||
+							 *lconf->variable == NULL)
+						modified = true;
+					else
+						modified = (strcmp(lconf->boot_val, *(lconf->variable)) != 0);
 				}
 				break;
 
@@ -5482,7 +5623,8 @@ write_one_nondefault_variable(FILE *fp, struct config_generic *gconf)
 			{
 				struct config_string *conf = (struct config_string *) gconf;
 
-				fprintf(fp, "%s", *conf->variable);
+				if (*conf->variable)
+					fprintf(fp, "%s", *conf->variable);
 			}
 			break;
 
@@ -5684,12 +5826,6 @@ can_skip_gucvar(struct config_generic *gconf)
 	 * mechanisms (if indeed they aren't compile-time constants).  So we may
 	 * always skip these.
 	 *
-	 * Role must be handled specially because its current value can be an
-	 * invalid value (for instance, if someone dropped the role since we set
-	 * it).  So if we tried to serialize it normally, we might get a failure.
-	 * We skip it here, and use another mechanism to ensure the worker has the
-	 * right value.
-	 *
 	 * For all other GUCs, we skip if the GUC has its compiled-in default
 	 * value (i.e., source == PGC_S_DEFAULT).  On the leader side, this means
 	 * we don't send GUCs that have their default values, which typically
@@ -5698,8 +5834,8 @@ can_skip_gucvar(struct config_generic *gconf)
 	 * comments in RestoreGUCState for more info.
 	 */
 	return gconf->context == PGC_POSTMASTER ||
-		gconf->context == PGC_INTERNAL || gconf->source == PGC_S_DEFAULT ||
-		strcmp(gconf->name, "role") == 0;
+		gconf->context == PGC_INTERNAL ||
+		gconf->source == PGC_S_DEFAULT;
 }
 
 /*

@@ -5,11 +5,14 @@
 
 #include <ctype.h>
 
+#include "catalog/pg_collation_d.h"
 #include "catalog/pg_type.h"
+#include "common/int.h"
 #include "lib/qunique.h"
 #include "miscadmin.h"
 #include "trgm.h"
 #include "tsearch/ts_locale.h"
+#include "utils/formatting.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -302,7 +305,7 @@ generate_trgm_only(trgm *trg, char *str, int slen, TrgmBound *bounds)
 	while ((bword = find_word(eword, slen - (eword - str), &eword, &charlen)) != NULL)
 	{
 #ifdef IGNORECASE
-		bword = lowerstr_with_len(bword, eword - bword);
+		bword = str_tolower(bword, eword - bword, DEFAULT_COLLATION_OID);
 		bytelen = strlen(bword);
 #else
 		bytelen = eword - bword;
@@ -433,12 +436,7 @@ comp_ptrgm(const void *v1, const void *v2)
 	if (cmp != 0)
 		return cmp;
 
-	if (p1->index < p2->index)
-		return -1;
-	else if (p1->index == p2->index)
-		return 0;
-	else
-		return 1;
+	return pg_cmp_s32(p1->index, p2->index);
 }
 
 /*
@@ -903,7 +901,7 @@ generate_wildcard_trgm(const char *str, int slen)
 									  buf, &bytelen, &charlen)) != NULL)
 	{
 #ifdef IGNORECASE
-		buf2 = lowerstr_with_len(buf, bytelen);
+		buf2 = str_tolower(buf, bytelen, DEFAULT_COLLATION_OID);
 		bytelen = strlen(buf2);
 #else
 		buf2 = buf;

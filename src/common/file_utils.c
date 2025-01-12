@@ -5,7 +5,7 @@
  * Assorted utility functions to work on files.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/common/file_utils.c
@@ -28,6 +28,7 @@
 #ifdef FRONTEND
 #include "common/logging.h"
 #endif
+#include "common/relpath.h"
 #include "port/pg_iovec.h"
 
 #ifdef FRONTEND
@@ -105,7 +106,7 @@ sync_pgdata(const char *pg_data,
 	/* handle renaming of pg_xlog to pg_wal in post-10 clusters */
 	snprintf(pg_wal, MAXPGPATH, "%s/%s", pg_data,
 			 serverVersion < MINIMUM_VERSION_FOR_PG_WAL ? "pg_xlog" : "pg_wal");
-	snprintf(pg_tblspc, MAXPGPATH, "%s/pg_tblspc", pg_data);
+	snprintf(pg_tblspc, MAXPGPATH, "%s/%s", pg_data, PG_TBLSPC_DIR);
 
 	/*
 	 * If pg_wal is a symlink, we'll need to recurse into it separately,
@@ -582,6 +583,52 @@ get_dirent_type(const char *path,
 }
 
 /*
+ * Compute what remains to be done after a possibly partial vectored read or
+ * write.  The part of 'source' beginning after 'transferred' bytes is copied
+ * to 'destination', and its length is returned.  'source' and 'destination'
+ * may point to the same array, for in-place adjustment.  A return value of
+ * zero indicates completion (for callers without a cheaper way to know that).
+ */
+int
+compute_remaining_iovec(struct iovec *destination,
+						const struct iovec *source,
+						int iovcnt,
+						size_t transferred)
+{
+	Assert(iovcnt > 0);
+
+	/* Skip wholly transferred iovecs. */
+	while (source->iov_len <= transferred)
+	{
+		transferred -= source->iov_len;
+		source++;
+		iovcnt--;
+
+		/* All iovecs transferred? */
+		if (iovcnt == 0)
+		{
+			/*
+			 * We don't expect the kernel to transfer more than we asked it
+			 * to, or something is out of sync.
+			 */
+			Assert(transferred == 0);
+			return 0;
+		}
+	}
+
+	/* Copy the remaining iovecs to the front of the array. */
+	if (source != destination)
+		memmove(destination, source, sizeof(*source) * iovcnt);
+
+	/* Adjust leading iovec, which may have been partially transferred. */
+	Assert(destination->iov_len > transferred);
+	destination->iov_base = (char *) destination->iov_base + transferred;
+	destination->iov_len -= transferred;
+
+	return iovcnt;
+}
+
+/*
  * pg_pwritev_with_retry
  *
  * Convenience wrapper for pg_pwritev() that retries on partial write.  If an
@@ -601,7 +648,7 @@ pg_pwritev_with_retry(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 		return -1;
 	}
 
-	for (;;)
+	do
 	{
 		/* Write as much as we can. */
 		part = pg_pwritev(fd, iov, iovcnt, offset);
@@ -616,33 +663,14 @@ pg_pwritev_with_retry(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 		sum += part;
 		offset += part;
 
-		/* Step over iovecs that are done. */
-		while (iovcnt > 0 && iov->iov_len <= part)
-		{
-			part -= iov->iov_len;
-			++iov;
-			--iovcnt;
-		}
-
-		/* Are they all done? */
-		if (iovcnt == 0)
-		{
-			/* We don't expect the kernel to write more than requested. */
-			Assert(part == 0);
-			break;
-		}
-
 		/*
-		 * Move whatever's left to the front of our mutable copy and adjust
-		 * the leading iovec.
+		 * See what is left.  On the first loop we used the caller's array,
+		 * but in later loops we'll use our local copy that we are allowed to
+		 * mutate.
 		 */
-		Assert(iovcnt > 0);
-		memmove(iov_copy, iov, sizeof(*iov) * iovcnt);
-		Assert(iov->iov_len > part);
-		iov_copy[0].iov_base = (char *) iov_copy[0].iov_base + part;
-		iov_copy[0].iov_len -= part;
+		iovcnt = compute_remaining_iovec(iov_copy, iov, iovcnt, part);
 		iov = iov_copy;
-	}
+	} while (iovcnt > 0);
 
 	return sum;
 }

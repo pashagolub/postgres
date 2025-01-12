@@ -4,7 +4,7 @@
  *	  header file for integrated autovacuum daemon
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/postmaster/autovacuum.h
@@ -28,6 +28,7 @@ typedef enum
 
 /* GUC variables */
 extern PGDLLIMPORT bool autovacuum_start_daemon;
+extern PGDLLIMPORT int autovacuum_worker_slots;
 extern PGDLLIMPORT int autovacuum_max_workers;
 extern PGDLLIMPORT int autovacuum_work_mem;
 extern PGDLLIMPORT int autovacuum_naptime;
@@ -49,26 +50,15 @@ extern PGDLLIMPORT int Log_autovacuum_min_duration;
 
 /* Status inquiry functions */
 extern bool AutoVacuumingActive(void);
-extern bool IsAutoVacuumLauncherProcess(void);
-extern bool IsAutoVacuumWorkerProcess(void);
 
-#define IsAnyAutoVacuumProcess() \
-	(IsAutoVacuumLauncherProcess() || IsAutoVacuumWorkerProcess())
-
-/* Functions to start autovacuum process, called from postmaster */
+/* called from postmaster at server startup */
 extern void autovac_init(void);
-extern int	StartAutoVacLauncher(void);
-extern int	StartAutoVacWorker(void);
 
 /* called from postmaster when a worker could not be forked */
 extern void AutoVacWorkerFailed(void);
 
-#ifdef EXEC_BACKEND
-extern void AutoVacLauncherMain(int argc, char *argv[]) pg_attribute_noreturn();
-extern void AutoVacWorkerMain(int argc, char *argv[]) pg_attribute_noreturn();
-extern void AutovacuumWorkerIAm(void);
-extern void AutovacuumLauncherIAm(void);
-#endif
+extern void AutoVacLauncherMain(char *startup_data, size_t startup_data_len) pg_attribute_noreturn();
+extern void AutoVacWorkerMain(char *startup_data, size_t startup_data_len) pg_attribute_noreturn();
 
 extern bool AutoVacuumRequestWork(AutoVacuumWorkItemType type,
 								  Oid relationId, BlockNumber blkno);

@@ -3,7 +3,7 @@
  * jsonapi.h
  *	  Declarations for JSON API support.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/common/jsonapi.h
@@ -13,8 +13,6 @@
 
 #ifndef JSONAPI_H
 #define JSONAPI_H
-
-#include "lib/stringinfo.h"
 
 typedef enum JsonTokenType
 {
@@ -36,6 +34,9 @@ typedef enum JsonTokenType
 typedef enum JsonParseErrorType
 {
 	JSON_SUCCESS,
+	JSON_INCOMPLETE,
+	JSON_INVALID_LEXER_TYPE,
+	JSON_NESTING_TOO_DEEP,
 	JSON_ESCAPING_INVALID,
 	JSON_ESCAPING_REQUIRED,
 	JSON_EXPECTED_ARRAY_FIRST,
@@ -48,6 +49,7 @@ typedef enum JsonParseErrorType
 	JSON_EXPECTED_OBJECT_NEXT,
 	JSON_EXPECTED_STRING,
 	JSON_INVALID_TOKEN,
+	JSON_OUT_OF_MEMORY,
 	JSON_UNICODE_CODE_POINT_ZERO,
 	JSON_UNICODE_ESCAPE_FORMAT,
 	JSON_UNICODE_HIGH_ESCAPE,
@@ -57,6 +59,19 @@ typedef enum JsonParseErrorType
 	JSON_SEM_ACTION_FAILED,		/* error should already be reported */
 } JsonParseErrorType;
 
+/* Parser state private to jsonapi.c */
+typedef struct JsonParserStack JsonParserStack;
+typedef struct JsonIncrementalState JsonIncrementalState;
+
+/*
+ * Don't depend on the internal type header for strval; if callers need access
+ * then they can include the appropriate header themselves.
+ */
+#ifdef JSONAPI_USE_PQEXPBUFFER
+#define jsonapi_StrValType PQExpBufferData
+#else
+#define jsonapi_StrValType StringInfoData
+#endif
 
 /*
  * All the fields in this structure should be treated as read-only.
@@ -71,24 +86,36 @@ typedef enum JsonParseErrorType
  * AFTER the end of the token, i.e. where there would be a nul byte
  * if we were using nul-terminated strings.
  *
+ * The prev_token_terminator field should not be used when incremental is
+ * true, as the previous token might have started in a previous piece of input,
+ * and thus it can't be used in any pointer arithmetic or other operations in
+ * conjunction with token_start.
+ *
  * JSONLEX_FREE_STRUCT/STRVAL are used to drive freeJsonLexContext.
+ * JSONLEX_CTX_OWNS_TOKENS is used by setJsonLexContextOwnsTokens.
  */
 #define JSONLEX_FREE_STRUCT			(1 << 0)
 #define JSONLEX_FREE_STRVAL			(1 << 1)
+#define JSONLEX_CTX_OWNS_TOKENS		(1 << 2)
 typedef struct JsonLexContext
 {
-	char	   *input;
-	int			input_length;
+	const char *input;
+	size_t		input_length;
 	int			input_encoding;
-	char	   *token_start;
-	char	   *token_terminator;
-	char	   *prev_token_terminator;
+	const char *token_start;
+	const char *token_terminator;
+	const char *prev_token_terminator;
+	bool		incremental;
 	JsonTokenType token_type;
 	int			lex_level;
 	bits32		flags;
 	int			line_number;	/* line number, starting from 1 */
-	char	   *line_start;		/* where that line starts within input */
-	StringInfo	strval;
+	const char *line_start;		/* where that line starts within input */
+	JsonParserStack *pstack;
+	JsonIncrementalState *inc_state;
+	bool		need_escapes;
+	struct jsonapi_StrValType *strval;	/* only used if need_escapes == true */
+	struct jsonapi_StrValType *errormsg;
 } JsonLexContext;
 
 typedef JsonParseErrorType (*json_struct_action) (void *state);
@@ -105,9 +132,10 @@ typedef JsonParseErrorType (*json_scalar_action) (void *state, char *token, Json
  * to doing a pure parse with no side-effects, and is therefore exactly
  * what the json input routines do.
  *
- * The 'fname' and 'token' strings passed to these actions are palloc'd.
- * They are not free'd or used further by the parser, so the action function
- * is free to do what it wishes with them.
+ * By default, the 'fname' and 'token' strings passed to these actions are
+ * palloc'd.  They are not free'd or used further by the parser, so the action
+ * function is free to do what it wishes with them. This behavior may be
+ * modified by setJsonLexContextOwnsTokens().
  *
  * All action functions return JsonParseErrorType.  If the result isn't
  * JSON_SUCCESS, the parse is abandoned and that error code is returned.
@@ -138,10 +166,16 @@ typedef struct JsonSemAction
  * does nothing and just continues.
  */
 extern JsonParseErrorType pg_parse_json(JsonLexContext *lex,
-										JsonSemAction *sem);
+										const JsonSemAction *sem);
+
+extern JsonParseErrorType pg_parse_json_incremental(JsonLexContext *lex,
+													const JsonSemAction *sem,
+													const char *json,
+													size_t len,
+													bool is_last);
 
 /* the null action object used for pure validation */
-extern PGDLLIMPORT JsonSemAction nullSemAction;
+extern PGDLLIMPORT const JsonSemAction nullSemAction;
 
 /*
  * json_count_array_elements performs a fast secondary parse to determine the
@@ -171,10 +205,39 @@ extern JsonParseErrorType json_count_array_elements(JsonLexContext *lex,
  * cleanup.
  */
 extern JsonLexContext *makeJsonLexContextCstringLen(JsonLexContext *lex,
-													char *json,
-													int len,
+													const char *json,
+													size_t len,
 													int encoding,
 													bool need_escapes);
+
+/*
+ * make a JsonLexContext suitable for incremental parsing.
+ * the string chunks will be handed to pg_parse_json_incremental,
+ * so there's no need for them here.
+ */
+extern JsonLexContext *makeJsonLexContextIncremental(JsonLexContext *lex,
+													 int encoding,
+													 bool need_escapes);
+
+/*
+ * Sets whether tokens passed to semantic action callbacks are owned by the
+ * context (in which case, the callback must duplicate the tokens for long-term
+ * storage) or by the callback (in which case, the callback must explicitly
+ * free tokens to avoid leaks).
+ *
+ * By default, this setting is false: the callback owns the tokens that are
+ * passed to it (and if parsing fails between the two object-field callbacks,
+ * the field name token will likely leak). If set to true, tokens will be freed
+ * by the lexer after the callback completes.
+ *
+ * Setting this to true is important for long-lived clients (such as libpq)
+ * that must not leak memory during a parse failure. For a server backend using
+ * memory contexts, or a client application which will exit on parse failure,
+ * this setting is less critical.
+ */
+extern void setJsonLexContextOwnsTokens(JsonLexContext *lex,
+										bool owned_by_context);
+
 extern void freeJsonLexContext(JsonLexContext *lex);
 
 /* lex one token */
@@ -188,6 +251,6 @@ extern char *json_errdetail(JsonParseErrorType error, JsonLexContext *lex);
  *
  * str argument does not need to be nul-terminated.
  */
-extern bool IsValidJsonNumber(const char *str, int len);
+extern bool IsValidJsonNumber(const char *str, size_t len);
 
 #endif							/* JSONAPI_H */

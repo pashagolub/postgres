@@ -673,6 +673,7 @@ create temp table datetimes(
 );
 
 insert into datetimes values
+(0, '10:00', '10:00 BST', '-infinity', '-infinity', '-infinity'),
 (1, '11:00', '11:00 BST', '1 year', '2000-10-19 10:23:54+01', '2000-10-19 10:23:54'),
 (2, '12:00', '12:00 BST', '2 years', '2001-10-19 10:23:54+01', '2001-10-19 10:23:54'),
 (3, '13:00', '13:00 BST', '3 years', '2001-10-19 10:23:54+01', '2001-10-19 10:23:54'),
@@ -682,7 +683,8 @@ insert into datetimes values
 (7, '17:00', '17:00 BST', '7 years', '2005-10-19 10:23:54+01', '2005-10-19 10:23:54'),
 (8, '18:00', '18:00 BST', '8 years', '2006-10-19 10:23:54+01', '2006-10-19 10:23:54'),
 (9, '19:00', '19:00 BST', '9 years', '2007-10-19 10:23:54+01', '2007-10-19 10:23:54'),
-(10, '20:00', '20:00 BST', '10 years', '2008-10-19 10:23:54+01', '2008-10-19 10:23:54');
+(10, '20:00', '20:00 BST', '10 years', '2008-10-19 10:23:54+01', '2008-10-19 10:23:54'),
+(11, '21:00', '21:00 BST', 'infinity', 'infinity', 'infinity');
 
 select id, f_time, first_value(id) over w, last_value(id) over w
 from datetimes
@@ -694,6 +696,32 @@ from datetimes
 window w as (order by f_time desc range between
              '70 min' preceding and '2 hours' following);
 
+select id, f_time, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_time desc range between
+             '-70 min' preceding and '2 hours' following);  -- error, negative offset disallowed
+
+select id, f_time, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_time range between
+             'infinity'::interval preceding and 'infinity'::interval following);
+
+select id, f_time, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_time range between
+             'infinity'::interval preceding and 'infinity'::interval preceding);
+
+select id, f_time, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_time range between
+             'infinity'::interval following and 'infinity'::interval following);
+
+select id, f_time, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_time range between
+             '-infinity'::interval following and
+             'infinity'::interval following);  -- error, negative offset disallowed
+
 select id, f_timetz, first_value(id) over w, last_value(id) over w
 from datetimes
 window w as (order by f_timetz range between
@@ -703,6 +731,32 @@ select id, f_timetz, first_value(id) over w, last_value(id) over w
 from datetimes
 window w as (order by f_timetz desc range between
              '70 min' preceding and '2 hours' following);
+
+select id, f_timetz, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_timetz desc range between
+             '70 min' preceding and '-2 hours' following);  -- error, negative offset disallowed
+
+select id, f_timetz, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_timetz range between
+             'infinity'::interval preceding and 'infinity'::interval following);
+
+select id, f_timetz, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_timetz range between
+             'infinity'::interval preceding and 'infinity'::interval preceding);
+
+select id, f_timetz, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_timetz range between
+             'infinity'::interval following and 'infinity'::interval following);
+
+select id, f_timetz, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_timetz range between
+             'infinity'::interval following and
+             '-infinity'::interval following);  -- error, negative offset disallowed
 
 select id, f_interval, first_value(id) over w, last_value(id) over w
 from datetimes
@@ -714,6 +768,32 @@ from datetimes
 window w as (order by f_interval desc range between
              '1 year' preceding and '1 year' following);
 
+select id, f_interval, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_interval desc range between
+             '-1 year' preceding and '1 year' following);  -- error, negative offset disallowed
+
+select id, f_interval, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_interval range between
+             'infinity'::interval preceding and 'infinity'::interval following);
+
+select id, f_interval, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_interval range between
+             'infinity'::interval preceding and 'infinity'::interval preceding);
+
+select id, f_interval, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_interval range between
+             'infinity'::interval following and 'infinity'::interval following);
+
+select id, f_interval, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_interval range between
+             '-infinity'::interval following and
+             'infinity'::interval following);  -- error, negative offset disallowed
+
 select id, f_timestamptz, first_value(id) over w, last_value(id) over w
 from datetimes
 window w as (order by f_timestamptz range between
@@ -724,6 +804,32 @@ from datetimes
 window w as (order by f_timestamptz desc range between
              '1 year' preceding and '1 year' following);
 
+select id, f_timestamptz, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_timestamptz desc range between
+             '1 year' preceding and '-1 year' following);  -- error, negative offset disallowed
+
+select id, f_timestamptz, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_timestamptz range between
+             'infinity'::interval preceding and 'infinity'::interval following);
+
+select id, f_timestamptz, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_timestamptz range between
+             'infinity'::interval preceding and 'infinity'::interval preceding);
+
+select id, f_timestamptz, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_timestamptz range between
+             'infinity'::interval following and 'infinity'::interval following);
+
+select id, f_timestamptz, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_timestamptz range between
+             '-infinity'::interval following and
+             'infinity'::interval following);  -- error, negative offset disallowed
+
 select id, f_timestamp, first_value(id) over w, last_value(id) over w
 from datetimes
 window w as (order by f_timestamp range between
@@ -733,6 +839,32 @@ select id, f_timestamp, first_value(id) over w, last_value(id) over w
 from datetimes
 window w as (order by f_timestamp desc range between
              '1 year' preceding and '1 year' following);
+
+select id, f_timestamp, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_timestamp desc range between
+             '-1 year' preceding and '1 year' following);  -- error, negative offset disallowed
+
+select id, f_timestamp, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_timestamp range between
+             'infinity'::interval preceding and 'infinity'::interval following);
+
+select id, f_timestamp, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_timestamp range between
+             'infinity'::interval preceding and 'infinity'::interval preceding);
+
+select id, f_timestamp, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_timestamp range between
+             'infinity'::interval following and 'infinity'::interval following);
+
+select id, f_timestamp, first_value(id) over w, last_value(id) over w
+from datetimes
+window w as (order by f_timestamp range between
+             '-infinity'::interval following and
+             'infinity'::interval following);  -- error, negative offset disallowed
 
 -- RANGE offset PRECEDING/FOLLOWING error cases
 select sum(salary) over (order by enroll_date, salary range between '1 year'::interval preceding and '2 years'::interval following
@@ -1213,6 +1345,13 @@ SELECT * FROM
    FROM empsalary) emp
 WHERE c = 1;
 
+-- Try another case with a WindowFunc with a byref return type
+SELECT * FROM
+  (SELECT row_number() OVER (PARTITION BY salary) AS rn,
+          lead(depname) OVER (PARTITION BY salary) || ' Department' AS n_dep
+   FROM empsalary) emp
+WHERE rn < 1;
+
 -- Some more complex cases with multiple window clauses
 EXPLAIN (COSTS OFF)
 SELECT * FROM
@@ -1235,6 +1374,23 @@ SELECT * FROM
           ntile(2) OVER (PARTITION BY depname) nt -- w2
    FROM empsalary
 ) e WHERE rn <= 1 AND c1 <= 3 AND nt < 2;
+
+-- Ensure we remove references to reduced outer joins as nulling rels in run
+-- conditions
+EXPLAIN (COSTS OFF)
+SELECT 1 FROM
+  (SELECT ntile(e2.salary) OVER (PARTITION BY e1.depname) AS c
+   FROM empsalary e1 LEFT JOIN empsalary e2 ON TRUE
+   WHERE e1.empno = e2.empno) s
+WHERE s.c = 1;
+
+-- Ensure the run condition optimization is used in cases where the WindowFunc
+-- has a Var from another query level
+EXPLAIN (COSTS OFF)
+SELECT 1 FROM
+  (SELECT ntile(s1.x) OVER () AS c
+   FROM (SELECT (SELECT 1) AS x) AS s1) s
+WHERE s.c = 1;
 
 -- Tests to ensure we don't push down the run condition when it's not valid to
 -- do so.
@@ -1590,6 +1746,39 @@ SELECT i,AVG(v::numeric) OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND UNBOUNDED
 
 SELECT i,AVG(v::interval) OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
   FROM (VALUES(1,'1 sec'),(2,'2 sec'),(3,NULL),(4,NULL)) t(i,v);
+
+-- moving aggregates over infinite intervals
+SELECT  x
+        ,avg(x) OVER(ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING ) as curr_next_avg
+        ,avg(x) OVER(ROWS BETWEEN 1 PRECEDING AND CURRENT ROW ) as prev_curr_avg
+        ,sum(x) OVER(ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING ) as curr_next_sum
+        ,sum(x) OVER(ROWS BETWEEN 1 PRECEDING AND CURRENT ROW ) as prev_curr_sum
+FROM (VALUES (NULL::interval),
+               ('infinity'::interval),
+               ('-2147483648 days -2147483648 months -9223372036854775807 usecs'), -- extreme interval value
+               ('-infinity'::interval),
+               ('2147483647 days 2147483647 months 9223372036854775806 usecs'), -- extreme interval value
+               ('infinity'::interval),
+               ('6 days'::interval),
+               ('7 days'::interval),
+               (NULL::interval),
+               ('-infinity'::interval)) v(x);
+
+--should fail.
+SELECT x, avg(x) OVER(ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING)
+FROM (VALUES (NULL::interval),
+               ('3 days'::interval),
+               ('infinity'::timestamptz - now()),
+               ('6 days'::interval),
+               ('-infinity'::interval)) v(x);
+
+--should fail.
+SELECT x, sum(x) OVER(ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING)
+FROM (VALUES (NULL::interval),
+               ('3 days'::interval),
+               ('infinity'::timestamptz - now()),
+               ('6 days'::interval),
+               ('-infinity'::interval)) v(x);
 
 SELECT i,SUM(v::smallint) OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
   FROM (VALUES(1,1),(2,2),(3,NULL),(4,NULL)) t(i,v);

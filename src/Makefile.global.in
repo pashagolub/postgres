@@ -19,11 +19,11 @@
 #
 # Meta configuration
 
-standard_targets = all install installdirs uninstall distprep clean distclean maintainer-clean coverage check checkprep installcheck init-po update-po
+standard_targets = all install installdirs uninstall clean distclean coverage check checkprep installcheck init-po update-po
 # these targets should recurse even into subdirectories not being built:
-standard_always_targets = distprep clean distclean maintainer-clean
+standard_always_targets = clean distclean
 
-.PHONY: $(standard_targets) install-strip html man installcheck-parallel update-unicode
+.PHONY: $(standard_targets) maintainer-clean install-strip html man installcheck-parallel update-unicode
 
 # make `all' the default target
 all:
@@ -34,6 +34,8 @@ all:
 
 # Never delete any intermediate files automatically.
 .SECONDARY:
+
+maintainer-clean: distclean
 
 # PostgreSQL version number
 VERSION = @PACKAGE_VERSION@
@@ -73,8 +75,6 @@ srcdir = $(top_srcdir)/$(subdir)
 VPATH = $(srcdir)
 endif
 endif # not PGXS
-
-vpathsearch = `for f in $(addsuffix /$(1),$(subst :, ,. $(VPATH))); do test -r $$f && echo $$f && break; done`
 
 
 ##########################################################################
@@ -201,6 +201,7 @@ enable_nls	= @enable_nls@
 enable_debug	= @enable_debug@
 enable_dtrace	= @enable_dtrace@
 enable_coverage	= @enable_coverage@
+enable_injection_points = @enable_injection_points@
 enable_tap_tests	= @enable_tap_tests@
 
 python_includespec	= @python_includespec@
@@ -263,6 +264,7 @@ CFLAGS_UNROLL_LOOPS = @CFLAGS_UNROLL_LOOPS@
 CFLAGS_VECTORIZE = @CFLAGS_VECTORIZE@
 CFLAGS_CRC = @CFLAGS_CRC@
 PERMIT_DECLARATION_AFTER_STATEMENT = @PERMIT_DECLARATION_AFTER_STATEMENT@
+PERMIT_MISSING_VARIABLE_DECLARATIONS = @PERMIT_MISSING_VARIABLE_DECLARATIONS@
 CXXFLAGS = @CXXFLAGS@
 
 LLVM_CPPFLAGS = @LLVM_CPPFLAGS@
@@ -319,12 +321,8 @@ X = @EXEEXT@
 
 # Perl
 
-ifneq (@PERL@,)
-    # quoted to protect pathname with spaces
-    PERL		= '@PERL@'
-else
-    PERL		= $(missing) perl
-endif
+# quoted to protect pathname with spaces
+PERL		= '@PERL@'
 perl_archlibexp		= @perl_archlibexp@
 perl_privlibexp		= @perl_privlibexp@
 perl_includespec	= @perl_includespec@
@@ -362,7 +360,7 @@ DOWNLOAD = wget -O $@ --no-use-server-timestamps
 UNICODE_VERSION = 15.1.0
 
 # Pick a release from here: <http://cldr.unicode.org/index/downloads>
-CLDR_VERSION = 43
+CLDR_VERSION = 45
 
 
 # Tree-wide build support
@@ -425,7 +423,7 @@ ifeq ($(MAKELEVEL),0)
 	$(MAKE) -C '$(top_builddir)' DESTDIR='$(abs_top_builddir)'/tmp_install install >'$(abs_top_builddir)'/tmp_install/log/install.log 2>&1
 	$(MAKE) -j1 $(if $(CHECKPREP_TOP),-C $(CHECKPREP_TOP),) checkprep >>'$(abs_top_builddir)'/tmp_install/log/install.log 2>&1
 
-	$(with_temp_install) initdb -A trust -N --no-instructions --no-locale '$(abs_top_builddir)'/tmp_install/initdb-template >>'$(abs_top_builddir)'/tmp_install/log/initdb-template.log 2>&1
+	$(with_temp_install) initdb --auth trust --no-sync --no-instructions --lc-messages=C --no-clean '$(abs_top_builddir)'/tmp_install/initdb-template >>'$(abs_top_builddir)'/tmp_install/log/initdb-template.log 2>&1
 endif
 endif
 endif
@@ -642,6 +640,16 @@ submake-libpgfeutils: | submake-generated-headers
 #
 # Testing support
 
+# Store any configure-time setting for PG_TEST_EXTRA, but let environment
+# variables override it to maintain the historical behavior of the tests.
+# (Standard `=` assignment would require devs to use a commandline option.)
+# This is skipped in PGXS mode to keep the setting from escaping into other
+# projects' builds.
+ifndef PGXS
+PG_TEST_EXTRA ?= @PG_TEST_EXTRA@
+export PG_TEST_EXTRA
+endif
+
 ifneq ($(USE_MODULE_DB),)
   PL_TESTDB = pl_regression_$(NAME)
   ifneq ($(MODULE_big),)
@@ -742,6 +750,7 @@ endif
 #
 ifdef COPT
    CFLAGS += $(COPT)
+   CXXFLAGS += $(COPT)
    LDFLAGS += $(COPT)
 endif
 
@@ -777,21 +786,13 @@ TAS         = @TAS@
 # Global targets and rules
 
 %.c: %.l
-ifdef FLEX
 	$(FLEX) $(if $(FLEX_NO_BACKUP),-b) $(FLEXFLAGS) -o'$@' $<
 	@$(if $(FLEX_NO_BACKUP),if [ `wc -l <lex.backup` -eq 1 ]; then rm lex.backup; else echo "Scanner requires backup; see lex.backup." 1>&2; exit 1; fi)
 	$(if $(FLEX_FIX_WARNING),$(PERL) $(top_srcdir)/src/tools/fix-old-flex-code.pl '$@')
-else
-	@$(missing) flex $< '$@'
-endif
 
 %.c: %.y
 	$(if $(BISON_CHECK_CMD),$(BISON_CHECK_CMD))
-ifdef BISON
 	$(BISON) $(BISONFLAGS) -o $@ $<
-else
-	@$(missing) bison $< $@
-endif
 
 %.i: %.c
 	$(CPP) $(CPPFLAGS) -o $@ $<
@@ -838,12 +839,6 @@ $(top_builddir)/src/include/pg_config.h: $(top_builddir)/src/include/stamp-h ;
 
 $(top_builddir)/src/include/stamp-h: $(top_srcdir)/src/include/pg_config.h.in $(top_builddir)/config.status
 	cd $(top_builddir) && ./config.status src/include/pg_config.h
-
-# Also remake pg_config_ext.h from pg_config_ext.h.in, same logic as above.
-$(top_builddir)/src/include/pg_config_ext.h: $(top_builddir)/src/include/stamp-ext-h ;
-
-$(top_builddir)/src/include/stamp-ext-h: $(top_srcdir)/src/include/pg_config_ext.h.in $(top_builddir)/config.status
-	cd $(top_builddir) && ./config.status src/include/pg_config_ext.h
 
 # Also remake ecpg_config.h from ecpg_config.h.in if the latter changed, same
 # logic as above.
@@ -919,7 +914,7 @@ recurse = $(foreach target,$(if $1,$1,$(standard_targets)),$(foreach subdir,$(if
 # If a makefile's list of SUBDIRS varies depending on configuration, then
 # any subdirectories excluded from SUBDIRS should instead be added to
 # ALWAYS_SUBDIRS, and then it must call recurse_always as well as recurse.
-# This ensures that distprep, distclean, etc will apply to all subdirectories.
+# This ensures that distclean, etc will apply to all subdirectories.
 # In the normal case all arguments will be defaulted.
 # $1: targets to make recursive (defaults to standard_always_targets)
 # $2: list of subdirs (defaults to ALWAYS_SUBDIRS variable)
@@ -974,7 +969,7 @@ include $(Po_files)
 endif
 
 # hook for clean-up
-clean distclean maintainer-clean: clean-deps
+clean distclean: clean-deps
 
 .PHONY: clean-deps
 clean-deps:
@@ -1058,7 +1053,7 @@ lcov_test.info: $(all_gcda_files)
 
 
 # hook for clean-up
-clean distclean maintainer-clean: clean-coverage
+clean distclean: clean-coverage
 
 .PHONY: clean-coverage
 clean-coverage:

@@ -1,9 +1,9 @@
-# Copyright (c) 2023, PostgreSQL Global Development Group
+# Copyright (c) 2023-2025, PostgreSQL Global Development Group
 
 # Test worker_spi module.
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -115,7 +115,7 @@ my $noconndb_id = $node->safe_psql('mydb',
 my $log_offset = -s $node->logfile;
 
 # worker_spi_launch() may be able to detect that the worker has been
-# stopped, so do not rely on psql_safe().
+# stopped, so do not rely on safe_psql().
 $node->psql('postgres',
 	qq[SELECT worker_spi_launch(12, $noconndb_id, $myrole_id);]);
 $node->wait_for_log(

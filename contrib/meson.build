@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2025, PostgreSQL Global Development Group
 
 contrib_mod_args = pg_mod_args
 
@@ -7,7 +7,11 @@ contrib_data_args = {
   'install_dir': contrib_data_dir,
 }
 
-subdir('adminpack')
+contrib_doc_dir = dir_doc_extension
+contrib_doc_args = {
+  'install_dir': contrib_doc_dir,
+}
+
 subdir('amcheck')
 subdir('auth_delay')
 subdir('auto_explain')
@@ -42,6 +46,7 @@ subdir('passwordcheck')
 subdir('pg_buffercache')
 subdir('pgcrypto')
 subdir('pg_freespacemap')
+subdir('pg_logicalinspect')
 subdir('pg_prewarm')
 subdir('pgrowlocks')
 subdir('pg_stat_statements')

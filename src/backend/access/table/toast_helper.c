@@ -4,7 +4,7 @@
  *	  Helper functions for table AMs implementing compressed or
  *    out-of-line storage of varlena attributes.
  *
- * Copyright (c) 2000-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/access/table/toast_helper.c
@@ -15,7 +15,6 @@
 #include "postgres.h"
 
 #include "access/detoast.h"
-#include "access/table.h"
 #include "access/toast_helper.h"
 #include "access/toast_internals.h"
 #include "catalog/pg_type_d.h"
@@ -325,7 +324,7 @@ toast_delete_external(Relation rel, const Datum *values, const bool *isnull,
 
 	for (i = 0; i < numAttrs; i++)
 	{
-		if (TupleDescAttr(tupleDesc, i)->attlen == -1)
+		if (TupleDescCompactAttr(tupleDesc, i)->attlen == -1)
 		{
 			Datum		value = values[i];
 

@@ -1,10 +1,10 @@
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 # Tests statistics handling around restarts, including handling of crashes and
-# invalid stats files, as well as restorting stats after "normal" restarts.
+# invalid stats files, as well as restoring stats after "normal" restarts.
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -173,7 +173,7 @@ is($wal_start->{reset}, $wal_restart->{reset},
 
 ## Check that checkpoint stats are reset, WAL stats aren't affected
 
-$node->safe_psql($connect_db, "SELECT pg_stat_reset_shared('bgwriter')");
+$node->safe_psql($connect_db, "SELECT pg_stat_reset_shared('checkpointer')");
 
 $sect = "post ckpt reset";
 my $ckpt_reset = checkpoint_stats();
@@ -292,10 +292,10 @@ sub trigger_funcrel_stat
 
 sub have_stats
 {
-	my ($kind, $dboid, $objoid) = @_;
+	my ($kind, $dboid, $objid) = @_;
 
 	return $node->safe_psql($connect_db,
-		"SELECT pg_stat_have_stats('$kind', $dboid, $objoid)");
+		"SELECT pg_stat_have_stats('$kind', $dboid, $objid)");
 }
 
 sub overwrite_file
@@ -323,9 +323,9 @@ sub checkpoint_stats
 	my %results;
 
 	$results{count} = $node->safe_psql($connect_db,
-		"SELECT checkpoints_timed + checkpoints_req FROM pg_stat_bgwriter");
+		"SELECT num_timed + num_requested FROM pg_stat_checkpointer");
 	$results{reset} = $node->safe_psql($connect_db,
-		"SELECT stats_reset FROM pg_stat_bgwriter");
+		"SELECT stats_reset FROM pg_stat_checkpointer");
 
 	return \%results;
 }

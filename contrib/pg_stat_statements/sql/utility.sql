@@ -4,7 +4,7 @@
 
 -- These tests require track_utility to be enabled.
 SET pg_stat_statements.track_utility = TRUE;
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
 -- Tables, indexes, triggers
 CREATE TEMP TABLE tab_stats (a int, b char(20));
@@ -18,7 +18,7 @@ DROP TABLE IF EXISTS tab_stats \;
 DROP TABLE IF EXISTS tab_stats \;
 Drop Table If Exists tab_stats \;
 SELECT calls, rows, query FROM pg_stat_statements ORDER BY query COLLATE "C";
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
 -- Partitions
 CREATE TABLE pt_stats (a int, b int) PARTITION BY range (a);
@@ -47,7 +47,8 @@ DROP FOREIGN DATA WRAPPER wrapper_stats;
 
 -- Functions
 CREATE FUNCTION func_stats(a text DEFAULT 'a_data', b text DEFAULT lower('b_data'))
-  RETURNS text AS $$ SELECT $1::text || '_' || $2::text; $$ LANGUAGE SQL;
+  RETURNS text AS $$ SELECT $1::text || '_' || $2::text; $$ LANGUAGE SQL
+  SET work_mem = '256kB';
 DROP FUNCTION func_stats;
 
 -- Rules
@@ -83,7 +84,7 @@ CREATE STATISTICS tab_expr_stats_1 (mcv) ON a, (2*a), (3*b) FROM tab_expr_stats;
 DROP TABLE tab_expr_stats;
 
 SELECT calls, rows, query FROM pg_stat_statements ORDER BY query COLLATE "C";
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
 -- Transaction statements
 BEGIN;
@@ -113,7 +114,7 @@ COMMIT;
 BEGIN TRANSACTION NOT DEFERRABLE, READ ONLY, READ WRITE, DEFERRABLE;
 COMMIT;
 SELECT calls, rows, query FROM pg_stat_statements ORDER BY query COLLATE "C";
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
 -- Two-phase transactions
 BEGIN;
@@ -123,7 +124,7 @@ BEGIN;
 PREPARE TRANSACTION 'stat_trans2';
 ROLLBACK PREPARED 'stat_trans2';
 SELECT calls, rows, query FROM pg_stat_statements ORDER BY query COLLATE "C";
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
 -- Savepoints
 BEGIN;
@@ -140,7 +141,7 @@ ROLLBACK TO sp1;
 RELEASE SAVEPOINT sp1;
 COMMIT;
 SELECT calls, rows, query FROM pg_stat_statements ORDER BY query COLLATE "C";
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
 -- EXPLAIN statements
 -- A Query is used, normalized by the query jumbling.
@@ -185,7 +186,7 @@ BEGIN
   i2 := i;
   i3 := i3 + i;
 END; $$ LANGUAGE plpgsql;
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 CALL sum_one(3);
 CALL sum_one(199);
 CALL sum_two(1,1);
@@ -198,7 +199,7 @@ SELECT calls, rows, query FROM pg_stat_statements ORDER BY query COLLATE "C";
 
 -- COPY
 CREATE TABLE copy_stats (a int, b int);
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 -- Some queries with A_Const nodes.
 COPY (SELECT 1) TO STDOUT;
 COPY (SELECT 2) TO STDOUT;
@@ -210,7 +211,7 @@ COPY (DELETE FROM copy_stats WHERE a = 1 RETURNING *) TO STDOUT;
 
 SELECT calls, rows, query FROM pg_stat_statements ORDER BY query COLLATE "C";
 DROP TABLE copy_stats;
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
 -- CREATE TABLE AS
 -- SELECT queries are normalized, creating matching query IDs.
@@ -227,7 +228,7 @@ CREATE TABLE ctas_stats_2 AS
     FROM generate_series(1, 5) AS tab(a) WHERE a < 4 AND a > 1;
 DROP TABLE ctas_stats_2;
 SELECT calls, rows, query FROM pg_stat_statements ORDER BY query COLLATE "C";
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
 -- CREATE MATERIALIZED VIEW
 -- SELECT queries are normalized, creating matching query IDs.
@@ -240,7 +241,7 @@ CREATE MATERIALIZED VIEW matview_stats_1 AS
     FROM generate_series(1, 5) AS tab(a) WHERE a < 4 AND a > 3;
 DROP MATERIALIZED VIEW matview_stats_1;
 SELECT calls, rows, query FROM pg_stat_statements ORDER BY query COLLATE "C";
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
 -- CREATE VIEW
 CREATE VIEW view_stats_1 AS
@@ -252,7 +253,7 @@ CREATE VIEW view_stats_1 AS
     FROM generate_series(1, 5) AS tab(a) WHERE a < 4 AND a > 3;
 DROP VIEW view_stats_1;
 SELECT calls, rows, query FROM pg_stat_statements ORDER BY query COLLATE "C";
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
 -- Domains
 CREATE DOMAIN domain_stats AS int CHECK (VALUE > 0);
@@ -260,7 +261,7 @@ ALTER DOMAIN domain_stats SET DEFAULT '3';
 ALTER DOMAIN domain_stats ADD CONSTRAINT higher_than_one CHECK (VALUE > 1);
 DROP DOMAIN domain_stats;
 SELECT calls, rows, query FROM pg_stat_statements ORDER BY query COLLATE "C";
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
 -- Execution statements
 SELECT 1 as a;
@@ -273,16 +274,30 @@ DEALLOCATE PREPARE stat_select;
 DEALLOCATE ALL;
 DEALLOCATE PREPARE ALL;
 SELECT calls, rows, query FROM pg_stat_statements ORDER BY query COLLATE "C";
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
 -- SET statements.
 -- These use two different strings, still they count as one entry.
+CREATE ROLE regress_stat_set_1;
+CREATE ROLE regress_stat_set_2;
 SET work_mem = '1MB';
 Set work_mem = '1MB';
 SET work_mem = '2MB';
+SET work_mem = DEFAULT;
+SET work_mem TO DEFAULT;
+SET work_mem FROM CURRENT;
+BEGIN;
+SET LOCAL work_mem = '128kB';
+SET LOCAL work_mem = '256kB';
+SET LOCAL work_mem = DEFAULT;
+SET LOCAL work_mem TO DEFAULT;
+SET LOCAL work_mem FROM CURRENT;
+COMMIT;
 RESET work_mem;
 SET enable_seqscan = off;
 SET enable_seqscan = on;
+SET SESSION work_mem = '300kB';
+SET SESSION work_mem = '400kB';
 RESET enable_seqscan;
 -- SET TRANSACTION ISOLATION
 BEGIN;
@@ -290,16 +305,36 @@ SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
 SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 COMMIT;
--- SET SESSION CHARACTERISTICS
+-- SET SESSION AUTHORIZATION
 SET SESSION SESSION AUTHORIZATION DEFAULT;
+SET SESSION AUTHORIZATION 'regress_stat_set_1';
+SET SESSION AUTHORIZATION 'regress_stat_set_2';
 RESET SESSION AUTHORIZATION;
 BEGIN;
 SET LOCAL SESSION AUTHORIZATION DEFAULT;
+SET LOCAL SESSION AUTHORIZATION 'regress_stat_set_1';
+SET LOCAL SESSION AUTHORIZATION 'regress_stat_set_2';
 RESET SESSION AUTHORIZATION;
 COMMIT;
+-- SET SESSION CHARACTERISTICS
+SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;
+SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY, READ ONLY;
+SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY, READ WRITE;
+-- SET XML OPTION
+SET XML OPTION DOCUMENT;
+SET XML OPTION CONTENT;
+-- SET TIME ZONE
+SET TIME ZONE 'America/New_York';
+SET TIME ZONE 'Asia/Tokyo';
+SET TIME ZONE DEFAULT;
+SET TIME ZONE LOCAL;
+SET TIME ZONE 'CST7CDT,M4.1.0,M10.5.0';
+RESET TIME ZONE;
 
 SELECT calls, rows, query FROM pg_stat_statements ORDER BY query COLLATE "C";
-SELECT pg_stat_statements_reset();
+DROP ROLE regress_stat_set_1;
+DROP ROLE regress_stat_set_2;
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
 --
 -- Track the total number of rows retrieved or affected by the utility
@@ -328,17 +363,12 @@ DROP MATERIALIZED VIEW pgss_matv;
 DROP TABLE pgss_ctas;
 DROP TABLE pgss_select_into;
 
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
--- SET statements.
--- These use two different strings, still they count as one entry.
-SET work_mem = '1MB';
-Set work_mem = '1MB';
-SET work_mem = '2MB';
-RESET work_mem;
-SET enable_seqscan = off;
-SET enable_seqscan = on;
-RESET enable_seqscan;
-
+-- Special cases.  Keep these ones at the end to avoid conflicts.
+SET SCHEMA 'foo';
+SET SCHEMA 'public';
+RESET ALL;
 SELECT calls, rows, query FROM pg_stat_statements ORDER BY query COLLATE "C";
-SELECT pg_stat_statements_reset();
+
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;

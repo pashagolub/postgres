@@ -5,7 +5,7 @@
  * Originally written by Tatsuo Ishii and enhanced by many contributors.
  *
  * src/bin/pgbench/pgbench.c
- * Copyright (c) 2000-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2025, PostgreSQL Global Development Group
  * ALL RIGHTS RESERVED;
  *
  * Permission to use, copy, modify, and distribute this software and its
@@ -170,37 +170,37 @@ typedef struct socket_set
 #define MIN_ZIPFIAN_PARAM		1.001	/* minimum parameter for zipfian */
 #define MAX_ZIPFIAN_PARAM		1000.0	/* maximum parameter for zipfian */
 
-int			nxacts = 0;			/* number of transactions per client */
-int			duration = 0;		/* duration in seconds */
-int64		end_time = 0;		/* when to stop in micro seconds, under -T */
+static int	nxacts = 0;			/* number of transactions per client */
+static int	duration = 0;		/* duration in seconds */
+static int64 end_time = 0;		/* when to stop in micro seconds, under -T */
 
 /*
  * scaling factor. for example, scale = 10 will make 1000000 tuples in
  * pgbench_accounts table.
  */
-int			scale = 1;
+static int	scale = 1;
 
 /*
  * fillfactor. for example, fillfactor = 90 will use only 90 percent
  * space during inserts and leave 10 percent free.
  */
-int			fillfactor = 100;
+static int	fillfactor = 100;
 
 /*
  * use unlogged tables?
  */
-bool		unlogged_tables = false;
+static bool unlogged_tables = false;
 
 /*
  * log sampling rate (1.0 = log everything, 0.0 = option not given)
  */
-double		sample_rate = 0.0;
+static double sample_rate = 0.0;
 
 /*
  * When threads are throttled to a given rate limit, this is the target delay
  * to reach that rate in usec.  0 is the default and means no throttling.
  */
-double		throttle_delay = 0;
+static double throttle_delay = 0;
 
 /*
  * Transactions which take longer than this limit (in usec) are counted as
@@ -208,13 +208,13 @@ double		throttle_delay = 0;
  * throttling is enabled, execution time slots that are more than this late
  * are skipped altogether, and counted separately.
  */
-int64		latency_limit = 0;
+static int64 latency_limit = 0;
 
 /*
  * tablespace selection
  */
-char	   *tablespace = NULL;
-char	   *index_tablespace = NULL;
+static char *tablespace = NULL;
+static char *index_tablespace = NULL;
 
 /*
  * Number of "pgbench_accounts" partitions.  0 is the default and means no
@@ -234,7 +234,7 @@ static partition_method_t partition_method = PART_NONE;
 static const char *const PARTITION_METHOD[] = {"none", "range", "hash"};
 
 /* random seed used to initialize base_random_sequence */
-int64		random_seed = -1;
+static int64 random_seed = -1;
 
 /*
  * end of configurable parameters
@@ -254,20 +254,20 @@ int64		random_seed = -1;
  */
 #define SCALE_32BIT_THRESHOLD 20000
 
-bool		use_log;			/* log transaction latencies to a file */
-bool		use_quiet;			/* quiet logging onto stderr */
-int			agg_interval;		/* log aggregates instead of individual
+static bool use_log;			/* log transaction latencies to a file */
+static bool use_quiet;			/* quiet logging onto stderr */
+static int	agg_interval;		/* log aggregates instead of individual
 								 * transactions */
-bool		per_script_stats = false;	/* whether to collect stats per script */
-int			progress = 0;		/* thread progress report every this seconds */
-bool		progress_timestamp = false; /* progress report with Unix time */
-int			nclients = 1;		/* number of clients */
-int			nthreads = 1;		/* number of threads */
-bool		is_connect;			/* establish connection for each transaction */
-bool		report_per_command = false; /* report per-command latencies,
+static bool per_script_stats = false;	/* whether to collect stats per script */
+static int	progress = 0;		/* thread progress report every this seconds */
+static bool progress_timestamp = false; /* progress report with Unix time */
+static int	nclients = 1;		/* number of clients */
+static int	nthreads = 1;		/* number of threads */
+static bool is_connect;			/* establish connection for each transaction */
+static bool report_per_command = false; /* report per-command latencies,
 										 * retries after errors and failures
 										 * (errors without retrying) */
-int			main_pid;			/* main process id used in log filename */
+static int	main_pid;			/* main process id used in log filename */
 
 /*
  * There are different types of restrictions for deciding that the current
@@ -287,21 +287,22 @@ int			main_pid;			/* main process id used in log filename */
  * We cannot retry a transaction after the serialization/deadlock error if its
  * number of tries reaches this maximum; if its value is zero, it is not used.
  */
-uint32		max_tries = 1;
+static uint32 max_tries = 1;
 
-bool		failures_detailed = false;	/* whether to group failures in
+static bool failures_detailed = false;	/* whether to group failures in
 										 * reports or logs by basic types */
 
-const char *pghost = NULL;
-const char *pgport = NULL;
-const char *username = NULL;
-const char *dbName = NULL;
-char	   *logfile_prefix = NULL;
-const char *progname;
+static const char *pghost = NULL;
+static const char *pgport = NULL;
+static const char *username = NULL;
+static const char *dbName = NULL;
+static char *logfile_prefix = NULL;
+static const char *progname;
 
 #define WSEP '@'				/* weight separator */
 
-volatile sig_atomic_t timer_exceeded = false;	/* flag from signal handler */
+static volatile sig_atomic_t timer_exceeded = false;	/* flag from signal
+														 * handler */
 
 /*
  * We don't want to allocate variables one by one; for efficiency, add a
@@ -446,7 +447,7 @@ typedef struct StatsData
  * For displaying Unix epoch timestamps, as some time functions may have
  * another reference.
  */
-pg_time_usec_t epoch_shift;
+static pg_time_usec_t epoch_shift;
 
 /*
  * Error status for errors during script execution.
@@ -608,6 +609,7 @@ typedef struct
 
 	int			use_file;		/* index in sql_script for this client */
 	int			command;		/* command number in script */
+	int			num_syncs;		/* number of ongoing sync commands */
 
 	/* client variables */
 	Variables	variables;
@@ -697,6 +699,7 @@ typedef enum MetaCommand
 	META_ELSE,					/* \else */
 	META_ENDIF,					/* \endif */
 	META_STARTPIPELINE,			/* \startpipeline */
+	META_SYNCPIPELINE,			/* \syncpipeline */
 	META_ENDPIPELINE,			/* \endpipeline */
 } MetaCommand;
 
@@ -931,7 +934,8 @@ usage(void)
 		   "  --show-script=NAME       show builtin script code, then exit\n"
 		   "  --verbose-errors         print messages of all errors\n"
 		   "\nCommon options:\n"
-		   "  -d, --debug              print debugging output\n"
+		   "  --debug                  print debugging output\n"
+		   "  -d, --dbname=DBNAME      database name to connect to\n"
 		   "  -h, --host=HOSTNAME      database server host or socket directory\n"
 		   "  -p, --port=PORT          database server port number\n"
 		   "  -U, --username=USERNAME  connect as specified database user\n"
@@ -2902,6 +2906,8 @@ getMetaCommand(const char *cmd)
 		mc = META_ASET;
 	else if (pg_strcasecmp(cmd, "startpipeline") == 0)
 		mc = META_STARTPIPELINE;
+	else if (pg_strcasecmp(cmd, "syncpipeline") == 0)
+		mc = META_SYNCPIPELINE;
 	else if (pg_strcasecmp(cmd, "endpipeline") == 0)
 		mc = META_ENDPIPELINE;
 	else
@@ -3317,8 +3323,10 @@ readCommandResponse(CState *st, MetaCommand meta, char *varprefix)
 				break;
 
 			case PGRES_PIPELINE_SYNC:
-				pg_log_debug("client %d pipeline ending", st->id);
-				if (PQexitPipelineMode(st->con) != 1)
+				pg_log_debug("client %d pipeline ending, ongoing syncs: %d",
+							 st->id, st->num_syncs);
+				st->num_syncs--;
+				if (st->num_syncs == 0 && PQexitPipelineMode(st->con) != 1)
 					pg_log_error("client %d failed to exit pipeline mode: %s", st->id,
 								 PQerrorMessage(st->con));
 				break;
@@ -3763,10 +3771,21 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 			case CSTATE_START_COMMAND:
 				command = sql_script[st->use_file].commands[st->command];
 
-				/* Transition to script end processing if done */
+				/*
+				 * Transition to script end processing if done, but close up
+				 * shop if a pipeline is open at this point.
+				 */
 				if (command == NULL)
 				{
-					st->state = CSTATE_END_TX;
+					if (PQpipelineStatus(st->con) == PQ_PIPELINE_OFF)
+						st->state = CSTATE_END_TX;
+					else
+					{
+						pg_log_error("client %d aborted: end of script reached with pipeline open",
+									 st->id);
+						st->state = CSTATE_ABORTED;
+					}
+
 					break;
 				}
 
@@ -3861,8 +3880,14 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 						switch (conditional_stack_peek(st->cstack))
 						{
 							case IFSTATE_FALSE:
-								if (command->meta == META_IF ||
-									command->meta == META_ELIF)
+								if (command->meta == META_IF)
+								{
+									/* nested if in skipped branch - ignore */
+									conditional_stack_push(st->cstack,
+														   IFSTATE_IGNORED);
+									st->command++;
+								}
+								else if (command->meta == META_ELIF)
 								{
 									/* we must evaluate the condition */
 									st->state = CSTATE_START_COMMAND;
@@ -3881,11 +3906,7 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 									conditional_stack_pop(st->cstack);
 									if (conditional_active(st->cstack))
 										st->state = CSTATE_START_COMMAND;
-
-									/*
-									 * else state remains in
-									 * CSTATE_SKIP_COMMAND
-									 */
+									/* else state remains CSTATE_SKIP_COMMAND */
 									st->command++;
 								}
 								break;
@@ -4438,6 +4459,20 @@ executeMetaCommand(CState *st, pg_time_usec_t *now)
 			return CSTATE_ABORTED;
 		}
 	}
+	else if (command->meta == META_SYNCPIPELINE)
+	{
+		if (PQpipelineStatus(st->con) != PQ_PIPELINE_ON)
+		{
+			commandFailed(st, "syncpipeline", "not in pipeline mode");
+			return CSTATE_ABORTED;
+		}
+		if (PQsendPipelineSync(st->con) == 0)
+		{
+			commandFailed(st, "syncpipeline", "failed to send a pipeline sync");
+			return CSTATE_ABORTED;
+		}
+		st->num_syncs++;
+	}
 	else if (command->meta == META_ENDPIPELINE)
 	{
 		if (PQpipelineStatus(st->con) != PQ_PIPELINE_ON)
@@ -4450,6 +4485,7 @@ executeMetaCommand(CState *st, pg_time_usec_t *now)
 			commandFailed(st, "endpipeline", "failed to send a pipeline sync");
 			return CSTATE_ABORTED;
 		}
+		st->num_syncs++;
 		/* Now wait for the PGRES_PIPELINE_SYNC and exit pipeline mode there */
 		/* collect pending results before getting out of pipeline mode */
 		return CSTATE_WAIT_RESULT;
@@ -4831,7 +4867,7 @@ initCreateTables(PGconn *con)
 
 		/* Construct new create table statement. */
 		printfPQExpBuffer(&query, "create%s table %s(%s)",
-						  unlogged_tables ? " unlogged" : "",
+						  (unlogged_tables && partition_method == PART_NONE) ? " unlogged" : "",
 						  ddl->table,
 						  (scale >= SCALE_32BIT_THRESHOLD) ? ddl->bigcols : ddl->smcols);
 
@@ -4908,8 +4944,9 @@ initPopulateTable(PGconn *con, const char *table, int64 base,
 				  initRowMethod init_row)
 {
 	int			n;
-	int			k;
+	int64		k;
 	int			chars = 0;
+	int			prev_chars = 0;
 	PGresult   *res;
 	PQExpBufferData sql;
 	char		copy_statement[256];
@@ -4970,10 +5007,10 @@ initPopulateTable(PGconn *con, const char *table, int64 base,
 			double		elapsed_sec = PG_TIME_GET_DOUBLE(pg_time_now() - start);
 			double		remaining_sec = ((double) total - j) * elapsed_sec / j;
 
-			chars = fprintf(stderr, INT64_FORMAT " of " INT64_FORMAT " tuples (%d%%) of %s done (elapsed %.2f s, remaining %.2f s)%c",
+			chars = fprintf(stderr, INT64_FORMAT " of " INT64_FORMAT " tuples (%d%%) of %s done (elapsed %.2f s, remaining %.2f s)",
 							j, total,
 							(int) ((j * 100) / total),
-							table, elapsed_sec, remaining_sec, eol);
+							table, elapsed_sec, remaining_sec);
 		}
 		/* let's not call the timing for each row, but only each 100 rows */
 		else if (use_quiet && (j % 100 == 0))
@@ -4984,19 +5021,29 @@ initPopulateTable(PGconn *con, const char *table, int64 base,
 			/* have we reached the next interval (or end)? */
 			if ((j == total) || (elapsed_sec >= log_interval * LOG_STEP_SECONDS))
 			{
-				chars = fprintf(stderr, INT64_FORMAT " of " INT64_FORMAT " tuples (%d%%) of %s done (elapsed %.2f s, remaining %.2f s)%c",
+				chars = fprintf(stderr, INT64_FORMAT " of " INT64_FORMAT " tuples (%d%%) of %s done (elapsed %.2f s, remaining %.2f s)",
 								j, total,
 								(int) ((j * 100) / total),
-								table, elapsed_sec, remaining_sec, eol);
+								table, elapsed_sec, remaining_sec);
 
 				/* skip to the next interval */
 				log_interval = (int) ceil(elapsed_sec / LOG_STEP_SECONDS);
 			}
 		}
+
+		/*
+		 * If the previous progress message is longer than the current one,
+		 * add spaces to the current line to fully overwrite any remaining
+		 * characters from the previous message.
+		 */
+		if (prev_chars > chars)
+			fprintf(stderr, "%*c", prev_chars - chars, ' ');
+		fputc(eol, stderr);
+		prev_chars = chars;
 	}
 
 	if (chars != 0 && eol != '\n')
-		fprintf(stderr, "%*c\r", chars - 1, ' ');	/* Clear the current line */
+		fprintf(stderr, "%*c\r", chars, ' ');	/* Clear the current line */
 
 	if (PQputline(con, "\\.\n"))
 		pg_fatal("very last PQputline failed");
@@ -5343,7 +5390,7 @@ GetTableInfo(PGconn *con, bool scale_given)
 		 * This case is unlikely as pgbench already found "pgbench_branches"
 		 * above to compute the scale.
 		 */
-		pg_log_error("no pgbench_accounts table found in search_path");
+		pg_log_error("no pgbench_accounts table found in \"search_path\"");
 		pg_log_error_hint("Perhaps you need to do initialization (\"pgbench -i\") in database \"%s\".", PQdb(con));
 		exit(1);
 	}
@@ -5783,7 +5830,8 @@ process_backslash_command(PsqlScanState sstate, const char *source)
 	}
 	else if (my_command->meta == META_ELSE || my_command->meta == META_ENDIF ||
 			 my_command->meta == META_STARTPIPELINE ||
-			 my_command->meta == META_ENDPIPELINE)
+			 my_command->meta == META_ENDPIPELINE ||
+			 my_command->meta == META_SYNCPIPELINE)
 	{
 		if (my_command->argc != 1)
 			syntax_error(source, lineno, my_command->first_line, my_command->argv[0],
@@ -6356,6 +6404,13 @@ printResults(StatsData *total,
 			   total->cnt);
 	}
 
+	/*
+	 * Remaining stats are nonsensical if we failed to execute any xacts due
+	 * to others than serialization or deadlock errors
+	 */
+	if (total_cnt <= 0)
+		return;
+
 	printf("number of failed transactions: " INT64_FORMAT " (%.3f%%)\n",
 		   failures, 100.0 * failures / total_cnt);
 
@@ -6376,10 +6431,6 @@ printResults(StatsData *total,
 			   total->retried, 100.0 * total->retried / total_cnt);
 		printf("total number of retries: " INT64_FORMAT "\n", total->retries);
 	}
-
-	/* Remaining stats are nonsensical if we failed to execute any xacts */
-	if (total->cnt + total->skipped <= 0)
-		return;
 
 	if (throttle_delay && latency_limit)
 		printf("number of transactions skipped: " INT64_FORMAT " (%.3f%%)\n",
@@ -6448,45 +6499,53 @@ printResults(StatsData *total,
 
 				printf("SQL script %d: %s\n"
 					   " - weight: %d (targets %.1f%% of total)\n"
-					   " - " INT64_FORMAT " transactions (%.1f%% of total, tps = %f)\n",
+					   " - " INT64_FORMAT " transactions (%.1f%% of total)\n",
 					   i + 1, sql_script[i].desc,
 					   sql_script[i].weight,
 					   100.0 * sql_script[i].weight / total_weight,
-					   sstats->cnt,
-					   100.0 * sstats->cnt / total->cnt,
-					   sstats->cnt / bench_duration);
+					   script_total_cnt,
+					   100.0 * script_total_cnt / total_cnt);
 
-				printf(" - number of failed transactions: " INT64_FORMAT " (%.3f%%)\n",
-					   script_failures,
-					   100.0 * script_failures / script_total_cnt);
-
-				if (failures_detailed)
+				if (script_total_cnt > 0)
 				{
-					printf(" - number of serialization failures: " INT64_FORMAT " (%.3f%%)\n",
-						   sstats->serialization_failures,
-						   (100.0 * sstats->serialization_failures /
-							script_total_cnt));
-					printf(" - number of deadlock failures: " INT64_FORMAT " (%.3f%%)\n",
-						   sstats->deadlock_failures,
-						   (100.0 * sstats->deadlock_failures /
-							script_total_cnt));
+					printf(" - number of transactions actually processed: " INT64_FORMAT " (tps = %f)\n",
+						   sstats->cnt, sstats->cnt / bench_duration);
+
+					printf(" - number of failed transactions: " INT64_FORMAT " (%.3f%%)\n",
+						   script_failures,
+						   100.0 * script_failures / script_total_cnt);
+
+					if (failures_detailed)
+					{
+						printf(" - number of serialization failures: " INT64_FORMAT " (%.3f%%)\n",
+							   sstats->serialization_failures,
+							   (100.0 * sstats->serialization_failures /
+								script_total_cnt));
+						printf(" - number of deadlock failures: " INT64_FORMAT " (%.3f%%)\n",
+							   sstats->deadlock_failures,
+							   (100.0 * sstats->deadlock_failures /
+								script_total_cnt));
+					}
+
+					/*
+					 * it can be non-zero only if max_tries is not equal to
+					 * one
+					 */
+					if (max_tries != 1)
+					{
+						printf(" - number of transactions retried: " INT64_FORMAT " (%.3f%%)\n",
+							   sstats->retried,
+							   100.0 * sstats->retried / script_total_cnt);
+						printf(" - total number of retries: " INT64_FORMAT "\n",
+							   sstats->retries);
+					}
+
+					if (throttle_delay && latency_limit)
+						printf(" - number of transactions skipped: " INT64_FORMAT " (%.3f%%)\n",
+							   sstats->skipped,
+							   100.0 * sstats->skipped / script_total_cnt);
+
 				}
-
-				/* it can be non-zero only if max_tries is not equal to one */
-				if (max_tries != 1)
-				{
-					printf(" - number of transactions retried: " INT64_FORMAT " (%.3f%%)\n",
-						   sstats->retried,
-						   100.0 * sstats->retried / script_total_cnt);
-					printf(" - total number of retries: " INT64_FORMAT "\n",
-						   sstats->retries);
-				}
-
-				if (throttle_delay && latency_limit && script_total_cnt > 0)
-					printf(" - number of transactions skipped: " INT64_FORMAT " (%.3f%%)\n",
-						   sstats->skipped,
-						   100.0 * sstats->skipped / script_total_cnt);
-
 				printSimpleStats(" - latency", &sstats->latency);
 			}
 
@@ -6511,13 +6570,13 @@ printResults(StatsData *total,
 					SimpleStats *cstats = &(*commands)->stats;
 
 					if (max_tries == 1)
-						printf("   %11.3f  %10" INT64_MODIFIER "d  %s\n",
+						printf("   %11.3f  %10" PRId64 " %s\n",
 							   (cstats->count > 0) ?
 							   1000.0 * cstats->sum / cstats->count : 0.0,
 							   (*commands)->failures,
 							   (*commands)->first_line);
 					else
-						printf("   %11.3f  %10" INT64_MODIFIER "d  %10" INT64_MODIFIER "d  %s\n",
+						printf("   %11.3f  %10" PRId64 " %10" PRId64 " %s\n",
 							   (cstats->count > 0) ?
 							   1000.0 * cstats->sum / cstats->count : 0.0,
 							   (*commands)->failures,
@@ -6587,7 +6646,7 @@ main(int argc, char **argv)
 		{"builtin", required_argument, NULL, 'b'},
 		{"client", required_argument, NULL, 'c'},
 		{"connect", no_argument, NULL, 'C'},
-		{"debug", no_argument, NULL, 'd'},
+		{"dbname", required_argument, NULL, 'd'},
 		{"define", required_argument, NULL, 'D'},
 		{"file", required_argument, NULL, 'f'},
 		{"fillfactor", required_argument, NULL, 'F'},
@@ -6628,6 +6687,7 @@ main(int argc, char **argv)
 		{"max-tries", required_argument, NULL, 14},
 		{"verbose-errors", no_argument, NULL, 15},
 		{"exit-on-abort", no_argument, NULL, 16},
+		{"debug", no_argument, NULL, 17},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -6699,7 +6759,7 @@ main(int argc, char **argv)
 	if (!set_random_seed(getenv("PGBENCH_RANDOM_SEED")))
 		pg_fatal("error while setting random seed from PGBENCH_RANDOM_SEED environment variable");
 
-	while ((c = getopt_long(argc, argv, "b:c:CdD:f:F:h:iI:j:lL:M:nNp:P:qrR:s:St:T:U:v", long_options, &optindex)) != -1)
+	while ((c = getopt_long(argc, argv, "b:c:Cd:D:f:F:h:iI:j:lL:M:nNp:P:qrR:s:St:T:U:v", long_options, &optindex)) != -1)
 	{
 		char	   *script;
 
@@ -6740,7 +6800,7 @@ main(int argc, char **argv)
 				is_connect = true;
 				break;
 			case 'd':
-				pg_logging_increase_verbosity();
+				dbName = pg_strdup(optarg);
 				break;
 			case 'D':
 				{
@@ -6965,6 +7025,9 @@ main(int argc, char **argv)
 				benchmarking_option_set = true;
 				exit_on_abort = true;
 				break;
+			case 17:			/* debug */
+				pg_logging_increase_verbosity();
+				break;
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -7015,16 +7078,19 @@ main(int argc, char **argv)
 	 */
 	throttle_delay *= nthreads;
 
-	if (argc > optind)
-		dbName = argv[optind++];
-	else
+	if (dbName == NULL)
 	{
-		if ((env = getenv("PGDATABASE")) != NULL && *env != '\0')
-			dbName = env;
-		else if ((env = getenv("PGUSER")) != NULL && *env != '\0')
-			dbName = env;
+		if (argc > optind)
+			dbName = argv[optind++];
 		else
-			dbName = get_user_name_or_exit(progname);
+		{
+			if ((env = getenv("PGDATABASE")) != NULL && *env != '\0')
+				dbName = env;
+			else if ((env = getenv("PGUSER")) != NULL && *env != '\0')
+				dbName = env;
+			else
+				dbName = get_user_name_or_exit(progname);
+		}
 	}
 
 	if (optind < argc)

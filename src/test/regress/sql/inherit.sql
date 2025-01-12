@@ -96,6 +96,9 @@ SELECT relname, d.* FROM ONLY d, pg_class where d.tableoid = pg_class.oid;
 -- Confirm PRIMARY KEY adds NOT NULL constraint to child table
 CREATE TEMP TABLE z (b TEXT, PRIMARY KEY(aa, b)) inherits (a);
 INSERT INTO z VALUES (NULL, 'text'); -- should fail
+-- ... but not UNIQUE.
+CREATE TEMP TABLE z2 (b TEXT, UNIQUE(aa, b)) inherits (a);
+INSERT INTO z2 VALUES (NULL, 'text'); -- should work
 
 -- Check inherited UPDATE with first child excluded
 create table some_tab (f1 int, f2 int, f3 int, check (f1 < 10) no inherit);
@@ -372,6 +375,15 @@ ALTER TABLE inhts RENAME d TO dd;
 
 DROP TABLE inhts;
 
+-- Test for adding a column to a parent table with complex inheritance
+CREATE TABLE inhta ();
+CREATE TABLE inhtb () INHERITS (inhta);
+CREATE TABLE inhtc () INHERITS (inhtb);
+CREATE TABLE inhtd () INHERITS (inhta, inhtb, inhtc);
+ALTER TABLE inhta ADD COLUMN i int;
+\d+ inhta
+DROP TABLE inhta, inhtb, inhtc, inhtd;
+
 -- Test for renaming in diamond inheritance
 CREATE TABLE inht2 (x int) INHERITS (inht1);
 CREATE TABLE inht3 (y int) INHERITS (inht1);
@@ -456,11 +468,56 @@ alter table p1_c1 add constraint inh_check_constraint1 check (f1 > 0);
 alter table p1_c1 add constraint inh_check_constraint2 check (f1 < 10);
 alter table p1 add constraint inh_check_constraint2 check (f1 < 10);
 
-select conrelid::regclass::text as relname, conname, conislocal, coninhcount
+alter table p1 add constraint inh_check_constraint3 check (f1 > 0) not enforced;
+alter table p1_c1 add constraint inh_check_constraint3 check (f1 > 0) not enforced;
+
+alter table p1_c1 add constraint inh_check_constraint4 check (f1 < 10) not enforced;
+alter table p1 add constraint inh_check_constraint4 check (f1 < 10) not enforced;
+
+-- allowed to merge enforced constraint with parent's not enforced constraint
+alter table p1_c1 add constraint inh_check_constraint5 check (f1 < 10) enforced;
+alter table p1 add constraint inh_check_constraint5 check (f1 < 10) not enforced;
+
+alter table p1 add constraint inh_check_constraint6 check (f1 < 10) not enforced;
+alter table p1_c1 add constraint inh_check_constraint6 check (f1 < 10) enforced;
+
+create table p1_c2(f1 int constraint inh_check_constraint4 check (f1 < 10)) inherits(p1);
+
+-- but reverse is not allowed
+alter table p1_c1 add constraint inh_check_constraint7 check (f1 < 10) not enforced;
+alter table p1 add constraint inh_check_constraint7 check (f1 < 10) enforced;
+
+alter table p1 add constraint inh_check_constraint8 check (f1 < 10) enforced;
+alter table p1_c1 add constraint inh_check_constraint8 check (f1 < 10) not enforced;
+
+create table p1_fail(f1 int constraint inh_check_constraint2 check (f1 < 10) not enforced) inherits(p1);
+
+-- constraints with different enforceability can be merged by marking them as ENFORCED
+create table p1_c3() inherits(p1, p1_c1);
+
+-- but not allowed if the child constraint is explicitly asked to be NOT ENFORCED
+create table p1_fail(f1 int constraint inh_check_constraint6 check (f1 < 10) not enforced) inherits(p1, p1_c1);
+
+select conrelid::regclass::text as relname, conname, conislocal, coninhcount, conenforced
 from pg_constraint where conname like 'inh\_check\_constraint%'
 order by 1, 2;
 
 drop table p1 cascade;
+
+--
+-- Similarly, check the merging of existing constraints; a parent constraint
+-- marked as NOT ENFORCED can merge with an ENFORCED child constraint, but the
+-- reverse is not allowed.
+--
+create table p1(f1 int constraint p1_a_check check (f1 > 0) not enforced);
+create table p1_c1(f1 int constraint p1_a_check check (f1 > 0) enforced);
+alter table p1_c1 inherit p1;
+drop table p1 cascade;
+
+create table p1(f1 int constraint p1_a_check check (f1 > 0) enforced);
+create table p1_c1(f1 int constraint p1_a_check check (f1 > 0) not enforced);
+alter table p1_c1 inherit p1;
+drop table p1, p1_c1;
 
 --
 -- Test DROP behavior of multiply-defined CHECK constraints
@@ -592,6 +649,14 @@ select min(1-id) from matest0;
 reset enable_seqscan;
 reset enable_parallel_append;
 
+explain (verbose, costs off)  -- bug #18652
+select 1 - id as c from
+(select id from matest3 t1 union all select id * 2 from matest3 t2) ss
+order by c;
+select 1 - id as c from
+(select id from matest3 t1 union all select id * 2 from matest3 t2) ss
+order by c;
+
 drop table matest0 cascade;
 
 --
@@ -612,6 +677,19 @@ where t1.b = t2.b and t2.c = t2.d
 order by t1.b limit 10;
 
 reset enable_nestloop;
+
+drop table matest0 cascade;
+
+-- Test a MergeAppend plan where one child requires a sort
+create table matest0(a int primary key);
+create table matest1() inherits (matest0);
+insert into matest0 select generate_series(1, 400);
+insert into matest1 select generate_series(1, 200);
+analyze matest0;
+analyze matest1;
+
+explain (costs off)
+select * from matest0 where a < 100 order by a;
 
 drop table matest0 cascade;
 
@@ -742,9 +820,15 @@ drop table cnullparent cascade;
 --
 create table pp1 (f1 int);
 create table cc1 (f2 text, f3 int) inherits (pp1);
-\d cc1
-create table cc2(f4 float) inherits(pp1,cc1);
-\d cc2
+create table cc2 (f4 float) inherits (pp1,cc1);
+create table cc3 () inherits (pp1,cc1,cc2);
+alter table pp1 alter f1 set not null;
+\d+ cc3
+alter table cc3 no inherit pp1;
+alter table cc3 no inherit cc1;
+alter table cc3 no inherit cc2;
+\d+ cc3
+drop table cc3;
 
 -- named NOT NULL constraint
 alter table cc1 add column a2 int constraint nn not null;
@@ -764,7 +848,7 @@ alter table cc2 add not null a2 no inherit;
 -- remove constraint from cc2: no dice, it's inherited
 alter table cc2 alter column a2 drop not null;
 
--- remove constraint cc1, should succeed
+-- remove constraint from cc1, should succeed
 alter table cc1 alter column a2 drop not null;
 \d+ cc1
 
@@ -782,12 +866,50 @@ alter table pp1 alter column f1 drop not null;
 alter table pp1 add primary key (f1);
 -- Leave these tables around, for pg_upgrade testing
 
+-- test that removing inheritance of NOT NULL NO INHERIT works correctly
+create table inh_parent (f1 int not null no inherit, f2 int not null no inherit);
+create table inh_child (f1 int not null no inherit, f2 int);
+alter table inh_child inherit inh_parent;
+alter table inh_child no inherit inh_parent;
+\d+ inh_child
+drop table inh_parent, inh_child;
+
+-- test that inhcount is updated correctly through multiple inheritance
+create table inh_pp1 (f1 int);
+create table inh_cc1 (f2 text, f3 int) inherits (inh_pp1);
+create table inh_cc2(f4 float) inherits(inh_pp1,inh_cc1);
+alter table inh_pp1 alter column f1 set not null;
+alter table inh_cc2 no inherit inh_pp1;
+alter table inh_cc2 no inherit inh_cc1;
+\d+ inh_cc2
+drop table inh_pp1, inh_cc1, inh_cc2;
+
+create table inh_pp1 (f1 int not null);
+create table inh_cc1 (f2 text, f3 int) inherits (inh_pp1);
+create table inh_cc2(f4 float) inherits(inh_pp1,inh_cc1);
+alter table inh_pp1 alter column f1 drop not null;
+\d+ inh_cc2
+drop table inh_pp1, inh_cc1, inh_cc2;
+
+
+-- Test a not-null addition that must walk down the hierarchy
+CREATE TABLE inh_parent ();
+CREATE TABLE inh_child (i int) INHERITS (inh_parent);
+CREATE TABLE inh_grandchild () INHERITS (inh_parent, inh_child);
+ALTER TABLE inh_parent ADD COLUMN i int NOT NULL;
+drop table inh_parent, inh_child, inh_grandchild;
+
 -- Test the same constraint name for different columns in different parents
 create table inh_parent1(a int constraint nn not null);
 create table inh_parent2(b int constraint nn not null);
-create table inh_child () inherits (inh_parent1, inh_parent2);
-\d+ inh_child
-drop table inh_parent1, inh_parent2, inh_child;
+create table inh_child1 () inherits (inh_parent1, inh_parent2);
+\d+ inh_child1
+
+create table inh_child2 (constraint foo not null a) inherits (inh_parent1, inh_parent2);
+alter table inh_child2 no inherit inh_parent2;
+\d+ inh_child2
+
+drop table inh_parent1, inh_parent2, inh_child1, inh_child2;
 
 -- Test multiple parents with overlapping primary keys
 create table inh_parent1(a int, b int, c int, primary key (a, b));
@@ -814,6 +936,28 @@ select conrelid::regclass, conname, contype, conkey,
  order by 2, 1;
 \d+ inh_nn*
 drop table inh_nn_parent, inh_nn_child, inh_nn_child2;
+
+CREATE TABLE inh_nn_parent (a int, NOT NULL a NO INHERIT);
+CREATE TABLE inh_nn_child() INHERITS (inh_nn_parent);
+ALTER TABLE inh_nn_parent ADD CONSTRAINT nna NOT NULL a;
+ALTER TABLE inh_nn_parent ALTER a SET NOT NULL;
+DROP TABLE inh_nn_parent cascade;
+
+-- Adding a PK at the top level of a hierarchy should cause all descendants
+-- to be checked for nulls, even past a no-inherit constraint
+CREATE TABLE inh_nn_lvl1 (a int);
+CREATE TABLE inh_nn_lvl2 () INHERITS (inh_nn_lvl1);
+CREATE TABLE inh_nn_lvl3 (CONSTRAINT foo NOT NULL a NO INHERIT) INHERITS (inh_nn_lvl2);
+ALTER TABLE inh_nn_lvl1 ADD PRIMARY KEY (a);
+DROP TABLE inh_nn_lvl1, inh_nn_lvl2, inh_nn_lvl3;
+
+-- Disallow specifying conflicting NO INHERIT flags for the same constraint
+CREATE TABLE inh_nn1 (a int primary key, b int, not null a no inherit);
+CREATE TABLE inh_nn1 (a int not null);
+CREATE TABLE inh_nn2 (a int not null no inherit) INHERITS (inh_nn1);
+CREATE TABLE inh_nn3 (a int not null, b int,  not null a no inherit);
+CREATE TABLE inh_nn4 (a int not null no inherit, b int,  not null a);
+DROP TABLE inh_nn1, inh_nn2, inh_nn3, inh_nn4;
 
 --
 -- test inherit/deinherit
@@ -859,14 +1003,21 @@ select conrelid::regclass, conname, contype, coninhcount, conislocal
  order by 2, 1;
 drop table inh_parent, inh_child1, inh_child2, inh_child3;
 
--- a PK in parent must have a not-null in child that it can mark inherited
-create table inh_parent (a int primary key);
-create table inh_child (a int primary key);
-alter table inh_child inherit inh_parent;		-- nope
-alter table inh_child alter a set not null;
-alter table inh_child inherit inh_parent;		-- now it works
+-- ALTER TABLE INHERIT ensures that the child has not-null constraints
+create table inh_parent (a int not null);
+create table inh_child (a int);
+alter table inh_child inherit inh_parent; -- nope
+drop table inh_parent, inh_child;
+
+-- Can't merge a NO INHERIT constraint with a normal one
+create table inh_parent (a int not null);
+create table inh_child (a int not null no inherit);
+alter table inh_child inherit inh_parent;
+drop table inh_parent, inh_child;
 
 -- don't interfere with other types of constraints
+create table inh_parent (a int primary key);
+create table inh_child (a int primary key) inherits (inh_parent);
 alter table inh_parent add constraint inh_parent_excl exclude ((1) with =);
 alter table inh_parent add constraint inh_parent_uq unique (a);
 alter table inh_parent add constraint inh_parent_fk foreign key (a) references inh_parent (a);

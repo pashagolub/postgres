@@ -1,8 +1,8 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use Config qw ( %Config );
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
@@ -17,7 +17,7 @@ if ($ENV{with_ssl} ne 'openssl')
 {
 	plan skip_all => 'OpenSSL not supported by this build';
 }
-elsif ($ENV{PG_TEST_EXTRA} !~ /\bssl\b/)
+if (!$ENV{PG_TEST_EXTRA} || $ENV{PG_TEST_EXTRA} !~ /\bssl\b/)
 {
 	plan skip_all =>
 	  'Potentially unsafe test SSL not enabled in PG_TEST_EXTRA';
@@ -36,8 +36,7 @@ sub switch_server_cert
 }
 
 # Determine whether this build uses OpenSSL or LibreSSL. As a heuristic, the
-# HAVE_SSL_CTX_SET_CERT_CB macro isn't defined for LibreSSL. (Nor for OpenSSL
-# 1.0.1, but that's old enough that accommodating it isn't worth the cost.)
+# HAVE_SSL_CTX_SET_CERT_CB macro isn't defined for LibreSSL.
 my $libressl = not check_pg_config("#define HAVE_SSL_CTX_SET_CERT_CB 1");
 
 #### Some configuration
@@ -86,7 +85,8 @@ switch_server_cert(
 	restart => 'no');
 
 $result = $node->restart(fail_ok => 1);
-is($result, 0, 'restart fails with password-protected key file with wrong password');
+is($result, 0,
+	'restart fails with password-protected key file with wrong password');
 
 switch_server_cert(
 	$node,
@@ -115,6 +115,18 @@ $node->append_conf(
 ssl_max_protocol_version=''});
 $result = $node->restart(fail_ok => 1);
 is($result, 1, 'restart succeeds with correct SSL protocol bounds');
+
+# Test parsing colon-separated groups. Resetting to a default value to clear
+# the error is fine since the call to switch_server_cert in the client side
+# tests will overwrite ssl_groups with a known set of groups.
+$node->append_conf('sslconfig.conf', qq{ssl_groups='bad:value'});
+my $log_size = -s $node->logfile;
+$result = $node->restart(fail_ok => 1);
+is($result, 0, 'restart fails with incorrect groups');
+ok($node->log_contains(qr/no SSL error reported/) == 0,
+	'error message translated');
+$node->append_conf('ssl_config.conf', qq{ssl_groups='prime256v1'});
+$result = $node->restart(fail_ok => 1);
 
 ### Run client-side tests.
 ###
@@ -553,11 +565,11 @@ $node->connect_fails(
 $node->connect_fails(
 	"$common_connstr sslrootcert=ssl/root+server_ca.crt sslmode=require ssl_min_protocol_version=incorrect_tls",
 	"connection failure with an incorrect SSL protocol minimum bound",
-	expected_stderr => qr/invalid ssl_min_protocol_version value/);
+	expected_stderr => qr/invalid "ssl_min_protocol_version" value/);
 $node->connect_fails(
 	"$common_connstr sslrootcert=ssl/root+server_ca.crt sslmode=require ssl_max_protocol_version=incorrect_tls",
 	"connection failure with an incorrect SSL protocol maximum bound",
-	expected_stderr => qr/invalid ssl_max_protocol_version value/);
+	expected_stderr => qr/invalid "ssl_max_protocol_version" value/);
 
 ### Server-side tests.
 ###
@@ -708,6 +720,8 @@ if ($? == 0)
 	# integer like how we do when grabbing the serial fails.
 	if ($Config{ivsize} == 8)
 	{
+		no warnings qw(portable);
+
 		$serialno =~ s/^serial=//;
 		$serialno =~ s/\s+//g;
 		$serialno = hex($serialno);
@@ -776,7 +790,7 @@ $node->connect_fails(
 	"$common_connstr user=ssltestuser sslcert=ssl/client-revoked.crt "
 	  . sslkey('client-revoked.key'),
 	"certificate authorization fails with revoked client cert",
-	expected_stderr => qr/SSL error: sslv3 alert certificate revoked/,
+	expected_stderr => qr|SSL error: ssl[a-z0-9/]* alert certificate revoked|,
 	# temporarily(?) skip this check due to timing issue
 	#	log_like => [
 	#		qr{Client certificate verification failed at depth 0: certificate revoked},
@@ -881,7 +895,7 @@ $node->connect_fails(
 	"$common_connstr user=ssltestuser sslcert=ssl/client-revoked.crt "
 	  . sslkey('client-revoked.key'),
 	"certificate authorization fails with revoked client cert with server-side CRL directory",
-	expected_stderr => qr/SSL error: sslv3 alert certificate revoked/,
+	expected_stderr => qr|SSL error: ssl[a-z0-9/]* alert certificate revoked|,
 	# temporarily(?) skip this check due to timing issue
 	#	log_like => [
 	#		qr{Client certificate verification failed at depth 0: certificate revoked},
@@ -894,7 +908,7 @@ $node->connect_fails(
 	"$common_connstr user=ssltestuser sslcert=ssl/client-revoked-utf8.crt "
 	  . sslkey('client-revoked-utf8.key'),
 	"certificate authorization fails with revoked UTF-8 client cert with server-side CRL directory",
-	expected_stderr => qr/SSL error: sslv3 alert certificate revoked/,
+	expected_stderr => qr|SSL error: ssl[a-z0-9/]* alert certificate revoked|,
 	# temporarily(?) skip this check due to timing issue
 	#	log_like => [
 	#		qr{Client certificate verification failed at depth 0: certificate revoked},

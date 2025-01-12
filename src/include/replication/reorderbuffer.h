@@ -2,7 +2,7 @@
  * reorderbuffer.h
  *	  PostgreSQL logical replay/reorder buffer management.
  *
- * Copyright (c) 2012-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2025, PostgreSQL Global Development Group
  *
  * src/include/replication/reorderbuffer.h
  */
@@ -11,11 +11,17 @@
 
 #include "access/htup_details.h"
 #include "lib/ilist.h"
+#include "lib/pairingheap.h"
 #include "storage/sinval.h"
 #include "utils/hsearch.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
 #include "utils/timestamp.h"
+
+/* paths for logical decoding data (relative to installation's $PGDATA) */
+#define PG_LOGICAL_DIR				"pg_logical"
+#define PG_LOGICAL_MAPPINGS_DIR		PG_LOGICAL_DIR "/mappings"
+#define PG_LOGICAL_SNAPSHOTS_DIR	PG_LOGICAL_DIR "/snapshots"
 
 /* GUC variables */
 extern PGDLLIMPORT int logical_decoding_work_mem;
@@ -27,25 +33,6 @@ typedef enum
 	DEBUG_LOGICAL_REP_STREAMING_BUFFERED,
 	DEBUG_LOGICAL_REP_STREAMING_IMMEDIATE,
 }			DebugLogicalRepStreamingMode;
-
-/* an individual tuple, stored in one chunk of memory */
-typedef struct ReorderBufferTupleBuf
-{
-	/* position in preallocated list */
-	slist_node	node;
-
-	/* tuple header, the interesting bit for users of logical decoding */
-	HeapTupleData tuple;
-
-	/* pre-allocated size of tuple buffer, different from tuple size */
-	Size		alloc_tuple_size;
-
-	/* actual tuple data follows */
-} ReorderBufferTupleBuf;
-
-/* pointer to the data stored in a TupleBuf */
-#define ReorderBufferTupleBufData(p) \
-	((HeapTupleHeader) MAXALIGN(((char *) p) + sizeof(ReorderBufferTupleBuf)))
 
 /*
  * Types of the change passed to a 'change' callback.
@@ -114,9 +101,9 @@ typedef struct ReorderBufferChange
 			bool		clear_toast_afterwards;
 
 			/* valid for DELETE || UPDATE */
-			ReorderBufferTupleBuf *oldtuple;
+			HeapTuple	oldtuple;
 			/* valid for INSERT || UPDATE */
-			ReorderBufferTupleBuf *newtuple;
+			HeapTuple	newtuple;
 		}			tp;
 
 		/*
@@ -211,7 +198,7 @@ typedef struct ReorderBufferChange
 	((txn)->txn_flags & RBTXN_IS_SERIALIZED_CLEAR) != 0 \
 )
 
-/* Has this transaction contains partial changes? */
+/* Does this transaction contain partial changes? */
 #define rbtxn_has_partial_change(txn) \
 ( \
 	((txn)->txn_flags & RBTXN_HAS_PARTIAL_CHANGE) != 0 \
@@ -407,10 +394,9 @@ typedef struct ReorderBufferTXN
 	SharedInvalidationMessage *invalidations;
 
 	/* ---
-	 * Position in one of three lists:
+	 * Position in one of two lists:
 	 * * list of subtransactions if we are *known* to be subxact
 	 * * list of toplevel xacts (can be an as-yet unknown subxact)
-	 * * list of preallocated ReorderBufferTXNs (if unused)
 	 * ---
 	 */
 	dlist_node	node;
@@ -419,6 +405,11 @@ typedef struct ReorderBufferTXN
 	 * A node in the list of catalog modifying transactions
 	 */
 	dlist_node	catchange_node;
+
+	/*
+	 * A node in txn_heap
+	 */
+	pairingheap_node txn_node;
 
 	/*
 	 * Size of this transaction (changes currently in memory, in bytes).
@@ -491,45 +482,38 @@ typedef void (*ReorderBufferRollbackPreparedCB) (ReorderBuffer *rb,
 												 TimestampTz prepare_time);
 
 /* start streaming transaction callback signature */
-typedef void (*ReorderBufferStreamStartCB) (
-											ReorderBuffer *rb,
+typedef void (*ReorderBufferStreamStartCB) (ReorderBuffer *rb,
 											ReorderBufferTXN *txn,
 											XLogRecPtr first_lsn);
 
 /* stop streaming transaction callback signature */
-typedef void (*ReorderBufferStreamStopCB) (
-										   ReorderBuffer *rb,
+typedef void (*ReorderBufferStreamStopCB) (ReorderBuffer *rb,
 										   ReorderBufferTXN *txn,
 										   XLogRecPtr last_lsn);
 
 /* discard streamed transaction callback signature */
-typedef void (*ReorderBufferStreamAbortCB) (
-											ReorderBuffer *rb,
+typedef void (*ReorderBufferStreamAbortCB) (ReorderBuffer *rb,
 											ReorderBufferTXN *txn,
 											XLogRecPtr abort_lsn);
 
 /* prepare streamed transaction callback signature */
-typedef void (*ReorderBufferStreamPrepareCB) (
-											  ReorderBuffer *rb,
+typedef void (*ReorderBufferStreamPrepareCB) (ReorderBuffer *rb,
 											  ReorderBufferTXN *txn,
 											  XLogRecPtr prepare_lsn);
 
 /* commit streamed transaction callback signature */
-typedef void (*ReorderBufferStreamCommitCB) (
-											 ReorderBuffer *rb,
+typedef void (*ReorderBufferStreamCommitCB) (ReorderBuffer *rb,
 											 ReorderBufferTXN *txn,
 											 XLogRecPtr commit_lsn);
 
 /* stream change callback signature */
-typedef void (*ReorderBufferStreamChangeCB) (
-											 ReorderBuffer *rb,
+typedef void (*ReorderBufferStreamChangeCB) (ReorderBuffer *rb,
 											 ReorderBufferTXN *txn,
 											 Relation relation,
 											 ReorderBufferChange *change);
 
 /* stream message callback signature */
-typedef void (*ReorderBufferStreamMessageCB) (
-											  ReorderBuffer *rb,
+typedef void (*ReorderBufferStreamMessageCB) (ReorderBuffer *rb,
 											  ReorderBufferTXN *txn,
 											  XLogRecPtr message_lsn,
 											  bool transactional,
@@ -537,16 +521,14 @@ typedef void (*ReorderBufferStreamMessageCB) (
 											  const char *message);
 
 /* stream truncate callback signature */
-typedef void (*ReorderBufferStreamTruncateCB) (
-											   ReorderBuffer *rb,
+typedef void (*ReorderBufferStreamTruncateCB) (ReorderBuffer *rb,
 											   ReorderBufferTXN *txn,
 											   int nrelations,
 											   Relation relations[],
 											   ReorderBufferChange *change);
 
 /* update progress txn callback signature */
-typedef void (*ReorderBufferUpdateProgressTxnCB) (
-												  ReorderBuffer *rb,
+typedef void (*ReorderBufferUpdateProgressTxnCB) (ReorderBuffer *rb,
 												  ReorderBufferTXN *txn,
 												  XLogRecPtr lsn);
 
@@ -650,6 +632,9 @@ struct ReorderBuffer
 	/* memory accounting */
 	Size		size;
 
+	/* Max-heap for sizes of all top-level and sub transactions */
+	pairingheap *txn_heap;
+
 	/*
 	 * Statistics about transactions spilled to disk.
 	 *
@@ -678,10 +663,10 @@ struct ReorderBuffer
 extern ReorderBuffer *ReorderBufferAllocate(void);
 extern void ReorderBufferFree(ReorderBuffer *rb);
 
-extern ReorderBufferTupleBuf *ReorderBufferGetTupleBuf(ReorderBuffer *rb,
-													   Size tuple_len);
-extern void ReorderBufferReturnTupleBuf(ReorderBuffer *rb,
-										ReorderBufferTupleBuf *tuple);
+extern HeapTuple ReorderBufferGetTupleBuf(ReorderBuffer *rb,
+										  Size tuple_len);
+extern void ReorderBufferReturnTupleBuf(HeapTuple tuple);
+
 extern ReorderBufferChange *ReorderBufferGetChange(ReorderBuffer *rb);
 extern void ReorderBufferReturnChange(ReorderBuffer *rb,
 									  ReorderBufferChange *change, bool upd_mem);

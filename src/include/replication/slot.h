@@ -2,7 +2,7 @@
  * slot.h
  *	   Replication slot management.
  *
- * Copyright (c) 2012-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2025, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -16,6 +16,9 @@
 #include "storage/shmem.h"
 #include "storage/spin.h"
 #include "replication/walreceiver.h"
+
+/* directory to store replication slot data in */
+#define PG_REPLSLOT_DIR     "pg_replslot"
 
 /*
  * Behaviour of replication slots, upon release or crash.
@@ -40,6 +43,9 @@ typedef enum ReplicationSlotPersistency
 /*
  * Slots can be invalidated, e.g. due to max_slot_wal_keep_size. If so, the
  * 'invalidated' field is set to a value other than _NONE.
+ *
+ * When adding a new invalidation cause here, remember to update
+ * SlotInvalidationCauses and RS_INVAL_MAX_CAUSES.
  */
 typedef enum ReplicationSlotInvalidationCause
 {
@@ -51,6 +57,8 @@ typedef enum ReplicationSlotInvalidationCause
 	/* wal_level insufficient for slot */
 	RS_INVAL_WAL_LEVEL,
 } ReplicationSlotInvalidationCause;
+
+extern PGDLLIMPORT const char *const SlotInvalidationCauses[];
 
 /*
  * On-Disk data of a replication slot, preserved across restarts.
@@ -111,6 +119,17 @@ typedef struct ReplicationSlotPersistentData
 
 	/* plugin name */
 	NameData	plugin;
+
+	/*
+	 * Was this slot synchronized from the primary server?
+	 */
+	char		synced;
+
+	/*
+	 * Is this a failover slot (sync candidate for standbys)? Only relevant
+	 * for logical slots on the primary server.
+	 */
+	bool		failover;
 } ReplicationSlotPersistentData;
 
 /*
@@ -185,6 +204,13 @@ typedef struct ReplicationSlot
 	 * forcibly flushed or not.
 	 */
 	XLogRecPtr	last_saved_confirmed_flush;
+
+	/*
+	 * The time when the slot became inactive. For synced slots on a standby
+	 * server, it represents the time when slot synchronization was most
+	 * recently stopped.
+	 */
+	TimestampTz inactive_since;
 } ReplicationSlot;
 
 #define SlotIsPhysical(slot) ((slot)->data.database == InvalidOid)
@@ -210,6 +236,7 @@ extern PGDLLIMPORT ReplicationSlot *MyReplicationSlot;
 
 /* GUCs */
 extern PGDLLIMPORT int max_replication_slots;
+extern PGDLLIMPORT char *synchronized_standby_slots;
 
 /* shmem initialization functions */
 extern Size ReplicationSlotsShmemSize(void);
@@ -218,13 +245,17 @@ extern void ReplicationSlotsShmemInit(void);
 /* management of individual slots */
 extern void ReplicationSlotCreate(const char *name, bool db_specific,
 								  ReplicationSlotPersistency persistency,
-								  bool two_phase);
+								  bool two_phase, bool failover,
+								  bool synced);
 extern void ReplicationSlotPersist(void);
 extern void ReplicationSlotDrop(const char *name, bool nowait);
+extern void ReplicationSlotDropAcquired(void);
+extern void ReplicationSlotAlter(const char *name, const bool *failover,
+								 const bool *two_phase);
 
 extern void ReplicationSlotAcquire(const char *name, bool nowait);
 extern void ReplicationSlotRelease(void);
-extern void ReplicationSlotCleanup(void);
+extern void ReplicationSlotCleanup(bool synced_only);
 extern void ReplicationSlotSave(void);
 extern void ReplicationSlotMarkDirty(void);
 
@@ -252,5 +283,11 @@ extern void CheckPointReplicationSlots(bool is_shutdown);
 
 extern void CheckSlotRequirements(void);
 extern void CheckSlotPermissions(void);
+extern ReplicationSlotInvalidationCause
+			GetSlotInvalidationCause(const char *invalidation_reason);
+
+extern bool SlotExistsInSyncStandbySlots(const char *slot_name);
+extern bool StandbySlotsHaveCaughtup(XLogRecPtr wait_for_lsn, int elevel);
+extern void WaitForStandbyConfirmation(XLogRecPtr wait_for_lsn);
 
 #endif							/* SLOT_H */

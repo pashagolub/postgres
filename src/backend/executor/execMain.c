@@ -26,7 +26,7 @@
  *	before ExecutorEnd.  This can be omitted only in case of EXPLAIN,
  *	which should also omit ExecutorRun.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,35 +37,29 @@
  */
 #include "postgres.h"
 
-#include "access/heapam.h"
-#include "access/htup_details.h"
 #include "access/sysattr.h"
+#include "access/table.h"
 #include "access/tableam.h"
-#include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/partition.h"
-#include "catalog/pg_publication.h"
 #include "commands/matview.h"
 #include "commands/trigger.h"
-#include "executor/execdebug.h"
+#include "executor/executor.h"
 #include "executor/nodeSubplan.h"
 #include "foreign/fdwapi.h"
-#include "jit/jit.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/queryjumble.h"
 #include "parser/parse_relation.h"
-#include "parser/parsetree.h"
-#include "storage/bufmgr.h"
-#include "storage/lmgr.h"
+#include "pgstat.h"
+#include "rewrite/rewriteHandler.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/backend_status.h"
 #include "utils/lsyscache.h"
-#include "utils/memutils.h"
 #include "utils/partcache.h"
 #include "utils/rls.h"
-#include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
 
 
@@ -83,24 +77,17 @@ static void InitPlan(QueryDesc *queryDesc, int eflags);
 static void CheckValidRowMarkRel(Relation rel, RowMarkType markType);
 static void ExecPostprocessPlan(EState *estate);
 static void ExecEndPlan(PlanState *planstate, EState *estate);
-static void ExecutePlan(EState *estate, PlanState *planstate,
-						bool use_parallel_mode,
+static void ExecutePlan(QueryDesc *queryDesc,
 						CmdType operation,
 						bool sendTuples,
 						uint64 numberTuples,
 						ScanDirection direction,
-						DestReceiver *dest,
-						bool execute_once);
+						DestReceiver *dest);
 static bool ExecCheckOneRelPerms(RTEPermissionInfo *perminfo);
 static bool ExecCheckPermissionsModified(Oid relOid, Oid userid,
 										 Bitmapset *modifiedCols,
 										 AclMode requiredPerms);
 static void ExecCheckXactReadOnly(PlannedStmt *plannedstmt);
-static char *ExecBuildSlotValueDescription(Oid reloid,
-										   TupleTableSlot *slot,
-										   TupleDesc tupdesc,
-										   Bitmapset *modifiedCols,
-										   int maxfieldlen);
 static void EvalPlanQualStart(EPQState *epqstate, Plan *planTree);
 
 /* end of local decls */
@@ -132,10 +119,12 @@ void
 ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	/*
-	 * In some cases (e.g. an EXECUTE statement) a query execution will skip
-	 * parse analysis, which means that the query_id won't be reported.  Note
-	 * that it's harmless to report the query_id multiple times, as the call
-	 * will be ignored if the top level query_id has already been reported.
+	 * In some cases (e.g. an EXECUTE statement or an execute message with the
+	 * extended query protocol) the query_id won't be reported, so do it now.
+	 *
+	 * Note that it's harmless to report the query_id multiple times, as the
+	 * call will be ignored if the top level query_id has already been
+	 * reported.
 	 */
 	pgstat_report_query_id(queryDesc->plannedstmt->queryId, false);
 
@@ -154,6 +143,9 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	/* sanity checks: queryDesc must not be started already */
 	Assert(queryDesc != NULL);
 	Assert(queryDesc->estate == NULL);
+
+	/* caller must ensure the query's snapshot is active */
+	Assert(GetActiveSnapshot() == queryDesc->snapshot);
 
 	/*
 	 * If the transaction is read-only, we need to check if any writes are
@@ -300,18 +292,17 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
  */
 void
 ExecutorRun(QueryDesc *queryDesc,
-			ScanDirection direction, uint64 count,
-			bool execute_once)
+			ScanDirection direction, uint64 count)
 {
 	if (ExecutorRun_hook)
-		(*ExecutorRun_hook) (queryDesc, direction, count, execute_once);
+		(*ExecutorRun_hook) (queryDesc, direction, count);
 	else
-		standard_ExecutorRun(queryDesc, direction, count, execute_once);
+		standard_ExecutorRun(queryDesc, direction, count);
 }
 
 void
 standard_ExecutorRun(QueryDesc *queryDesc,
-					 ScanDirection direction, uint64 count, bool execute_once)
+					 ScanDirection direction, uint64 count)
 {
 	EState	   *estate;
 	CmdType		operation;
@@ -326,6 +317,9 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 
 	Assert(estate != NULL);
 	Assert(!(estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY));
+
+	/* caller must ensure the query's snapshot is active */
+	Assert(GetActiveSnapshot() == estate->es_snapshot);
 
 	/*
 	 * Switch into per-query memory context
@@ -354,24 +348,24 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 		dest->rStartup(dest, operation, queryDesc->tupDesc);
 
 	/*
-	 * run plan
+	 * Run plan, unless direction is NoMovement.
+	 *
+	 * Note: pquery.c selects NoMovement if a prior call already reached
+	 * end-of-data in the user-specified fetch direction.  This is important
+	 * because various parts of the executor can misbehave if called again
+	 * after reporting EOF.  For example, heapam.c would actually restart a
+	 * heapscan and return all its data afresh.  There is also some doubt
+	 * about whether a parallel plan would operate properly if an additional,
+	 * necessarily non-parallel execution request occurs after completing a
+	 * parallel execution.  (That case should work, but it's untested.)
 	 */
 	if (!ScanDirectionIsNoMovement(direction))
-	{
-		if (execute_once && queryDesc->already_executed)
-			elog(ERROR, "can't re-execute query flagged for single execution");
-		queryDesc->already_executed = true;
-
-		ExecutePlan(estate,
-					queryDesc->planstate,
-					queryDesc->plannedstmt->parallelModeNeeded,
+		ExecutePlan(queryDesc,
 					operation,
 					sendTuples,
 					count,
 					direction,
-					dest,
-					execute_once);
-	}
+					dest);
 
 	/*
 	 * Update es_total_processed to keep track of the number of tuples
@@ -486,6 +480,10 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
 	estate = queryDesc->estate;
 
 	Assert(estate != NULL);
+
+	if (estate->es_parallel_workers_to_launch > 0)
+		pgstat_update_parallel_workers_stats((PgStat_Counter) estate->es_parallel_workers_to_launch,
+											 (PgStat_Counter) estate->es_parallel_workers_launched);
 
 	/*
 	 * Check that ExecutorFinish was called, unless in EXPLAIN-only mode. This
@@ -1017,15 +1015,23 @@ InitPlan(QueryDesc *queryDesc, int eflags)
  * Generally the parser and/or planner should have noticed any such mistake
  * already, but let's make sure.
  *
+ * For MERGE, mergeActions is the list of actions that may be performed.  The
+ * result relation is required to support every action, regardless of whether
+ * or not they are all executed.
+ *
  * Note: when changing this function, you probably also need to look at
  * CheckValidRowMarkRel.
  */
 void
-CheckValidResultRel(ResultRelInfo *resultRelInfo, CmdType operation)
+CheckValidResultRel(ResultRelInfo *resultRelInfo, CmdType operation,
+					List *mergeActions)
 {
 	Relation	resultRel = resultRelInfo->ri_RelationDesc;
-	TriggerDesc *trigDesc = resultRel->trigdesc;
 	FdwRoutine *fdwroutine;
+
+	/* Expect a fully-formed ResultRelInfo from InitResultRelInfo(). */
+	Assert(resultRelInfo->ri_needLockTagTuple ==
+		   IsInplaceUpdateRelation(resultRel));
 
 	switch (resultRel->rd_rel->relkind)
 	{
@@ -1048,42 +1054,14 @@ CheckValidResultRel(ResultRelInfo *resultRelInfo, CmdType operation)
 		case RELKIND_VIEW:
 
 			/*
-			 * Okay only if there's a suitable INSTEAD OF trigger.  Messages
-			 * here should match rewriteHandler.c's rewriteTargetView and
-			 * RewriteQuery, except that we omit errdetail because we haven't
-			 * got the information handy (and given that we really shouldn't
-			 * get here anyway, it's not worth great exertion to get).
+			 * Okay only if there's a suitable INSTEAD OF trigger.  Otherwise,
+			 * complain, but omit errdetail because we haven't got the
+			 * information handy (and given that it really shouldn't happen,
+			 * it's not worth great exertion to get).
 			 */
-			switch (operation)
-			{
-				case CMD_INSERT:
-					if (!trigDesc || !trigDesc->trig_insert_instead_row)
-						ereport(ERROR,
-								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-								 errmsg("cannot insert into view \"%s\"",
-										RelationGetRelationName(resultRel)),
-								 errhint("To enable inserting into the view, provide an INSTEAD OF INSERT trigger or an unconditional ON INSERT DO INSTEAD rule.")));
-					break;
-				case CMD_UPDATE:
-					if (!trigDesc || !trigDesc->trig_update_instead_row)
-						ereport(ERROR,
-								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-								 errmsg("cannot update view \"%s\"",
-										RelationGetRelationName(resultRel)),
-								 errhint("To enable updating the view, provide an INSTEAD OF UPDATE trigger or an unconditional ON UPDATE DO INSTEAD rule.")));
-					break;
-				case CMD_DELETE:
-					if (!trigDesc || !trigDesc->trig_delete_instead_row)
-						ereport(ERROR,
-								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-								 errmsg("cannot delete from view \"%s\"",
-										RelationGetRelationName(resultRel)),
-								 errhint("To enable deleting from the view, provide an INSTEAD OF DELETE trigger or an unconditional ON DELETE DO INSTEAD rule.")));
-					break;
-				default:
-					elog(ERROR, "unrecognized CmdType: %d", (int) operation);
-					break;
-			}
+			if (!view_has_instead_trigger(resultRel, operation, mergeActions))
+				error_view_not_updatable(resultRel, operation, mergeActions,
+										 NULL);
 			break;
 		case RELKIND_MATVIEW:
 			if (!MatViewIncrementalMaintenanceIsEnabled())
@@ -1235,6 +1213,8 @@ InitResultRelInfo(ResultRelInfo *resultRelInfo,
 	resultRelInfo->ri_NumIndices = 0;
 	resultRelInfo->ri_IndexRelationDescs = NULL;
 	resultRelInfo->ri_IndexRelationInfo = NULL;
+	resultRelInfo->ri_needLockTagTuple =
+		IsInplaceUpdateRelation(resultRelationDesc);
 	/* make a copy so as not to depend on relcache info not changing... */
 	resultRelInfo->ri_TrigDesc = CopyTriggerDesc(resultRelationDesc->trigdesc);
 	if (resultRelInfo->ri_TrigDesc)
@@ -1277,8 +1257,10 @@ InitResultRelInfo(ResultRelInfo *resultRelInfo,
 	resultRelInfo->ri_ReturningSlot = NULL;
 	resultRelInfo->ri_TrigOldSlot = NULL;
 	resultRelInfo->ri_TrigNewSlot = NULL;
-	resultRelInfo->ri_matchedMergeAction = NIL;
-	resultRelInfo->ri_notMatchedMergeAction = NIL;
+	resultRelInfo->ri_MergeActions[MERGE_WHEN_MATCHED] = NIL;
+	resultRelInfo->ri_MergeActions[MERGE_WHEN_NOT_MATCHED_BY_SOURCE] = NIL;
+	resultRelInfo->ri_MergeActions[MERGE_WHEN_NOT_MATCHED_BY_TARGET] = NIL;
+	resultRelInfo->ri_MergeJoinCondition = NULL;
 
 	/*
 	 * Only ExecInitPartitionInfo() and ExecInitPartitionDispatchInfo() pass
@@ -1616,22 +1598,19 @@ ExecCloseRangeTableRelations(EState *estate)
  *		moving in the specified direction.
  *
  *		Runs to completion if numberTuples is 0
- *
- * Note: the ctid attribute is a 'junk' attribute that is removed before the
- * user can see it
  * ----------------------------------------------------------------
  */
 static void
-ExecutePlan(EState *estate,
-			PlanState *planstate,
-			bool use_parallel_mode,
+ExecutePlan(QueryDesc *queryDesc,
 			CmdType operation,
 			bool sendTuples,
 			uint64 numberTuples,
 			ScanDirection direction,
-			DestReceiver *dest,
-			bool execute_once)
+			DestReceiver *dest)
 {
+	EState	   *estate = queryDesc->estate;
+	PlanState  *planstate = queryDesc->planstate;
+	bool		use_parallel_mode;
 	TupleTableSlot *slot;
 	uint64		current_tuple_count;
 
@@ -1646,11 +1625,17 @@ ExecutePlan(EState *estate,
 	estate->es_direction = direction;
 
 	/*
-	 * If the plan might potentially be executed multiple times, we must force
-	 * it to run without parallelism, because we might exit early.
+	 * Set up parallel mode if appropriate.
+	 *
+	 * Parallel mode only supports complete execution of a plan.  If we've
+	 * already partially executed it, or if the caller asks us to exit early,
+	 * we must force the plan to run without parallelism.
 	 */
-	if (!execute_once)
+	if (queryDesc->already_executed || numberTuples != 0)
 		use_parallel_mode = false;
+	else
+		use_parallel_mode = queryDesc->plannedstmt->parallelModeNeeded;
+	queryDesc->already_executed = true;
 
 	estate->es_use_parallel_mode = use_parallel_mode;
 	if (use_parallel_mode)
@@ -1766,10 +1751,14 @@ ExecRelCheck(ResultRelInfo *resultRelInfo,
 	{
 		oldContext = MemoryContextSwitchTo(estate->es_query_cxt);
 		resultRelInfo->ri_ConstraintExprs =
-			(ExprState **) palloc(ncheck * sizeof(ExprState *));
+			(ExprState **) palloc0(ncheck * sizeof(ExprState *));
 		for (i = 0; i < ncheck; i++)
 		{
 			Expr	   *checkconstr;
+
+			/* Skip not enforced constraint */
+			if (!check[i].ccenforced)
+				continue;
 
 			checkconstr = stringToNode(check[i].ccbin);
 			resultRelInfo->ri_ConstraintExprs[i] =
@@ -1797,7 +1786,7 @@ ExecRelCheck(ResultRelInfo *resultRelInfo,
 		 * is not to be treated as a failure.  Therefore, use ExecCheck not
 		 * ExecQual.
 		 */
-		if (!ExecCheck(checkconstr, econtext))
+		if (checkconstr && !ExecCheck(checkconstr, econtext))
 			return check[i].ccname;
 	}
 
@@ -1849,7 +1838,7 @@ ExecPartitionCheck(ResultRelInfo *resultRelInfo, TupleTableSlot *slot,
 	econtext->ecxt_scantuple = slot;
 
 	/*
-	 * As in case of the catalogued constraints, we treat a NULL result as
+	 * As in case of the cataloged constraints, we treat a NULL result as
 	 * success here, not a failure.
 	 */
 	success = ExecCheck(resultRelInfo->ri_PartitionCheckExpr, econtext);
@@ -2234,7 +2223,7 @@ ExecWithCheckOptions(WCOKind kind, ResultRelInfo *resultRelInfo,
  * column involved, that subset will be returned with a key identifying which
  * columns they are.
  */
-static char *
+char *
 ExecBuildSlotValueDescription(Oid reloid,
 							  TupleTableSlot *slot,
 							  TupleDesc tupdesc,

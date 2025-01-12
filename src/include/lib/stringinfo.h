@@ -8,7 +8,7 @@
  * (null-terminated text) or arbitrary binary data.  All storage is allocated
  * with palloc() (falling back to malloc in frontend code).
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/lib/stringinfo.h
@@ -55,16 +55,25 @@ typedef StringInfoData *StringInfo;
 
 
 /*------------------------
- * There are four ways to create a StringInfo object initially:
+ * There are six ways to create a StringInfo object initially:
  *
  * StringInfo stringptr = makeStringInfo();
  *		Both the StringInfoData and the data buffer are palloc'd.
+ *
+ * StringInfo stringptr = makeStringInfoExt(initsize);
+ *		Same as makeStringInfo except the data buffer is allocated
+ *		with size 'initsize'.
  *
  * StringInfoData string;
  * initStringInfo(&string);
  *		The data buffer is palloc'd but the StringInfoData is just local.
  *		This is the easiest approach for a StringInfo object that will
  *		only live as long as the current routine.
+ *
+ * StringInfoData string;
+ * initStringInfoExt(&string, initsize);
+ *		Same as initStringInfo except the data buffer is allocated
+ *		with size 'initsize'.
  *
  * StringInfoData string;
  * initReadOnlyStringInfo(&string, existingbuf, len);
@@ -87,7 +96,8 @@ typedef StringInfoData *StringInfo;
  *		to be len + 1 in size.
  *
  * To destroy a StringInfo, pfree() the data buffer, and then pfree() the
- * StringInfoData if it was palloc'd.  There's no special support for this.
+ * StringInfoData if it was palloc'd.  For StringInfos created with
+ * makeStringInfo(), destroyStringInfo() is provided for this purpose.
  * However, if the StringInfo was initialized using initReadOnlyStringInfo()
  * then the caller will need to consider if it is safe to pfree the data
  * buffer.
@@ -99,6 +109,8 @@ typedef StringInfoData *StringInfo;
  *-------------------------
  */
 
+#define STRINGINFO_DEFAULT_SIZE 1024	/* default initial allocation size */
+
 /*------------------------
  * makeStringInfo
  * Create an empty 'StringInfoData' & return a pointer to it.
@@ -106,11 +118,27 @@ typedef StringInfoData *StringInfo;
 extern StringInfo makeStringInfo(void);
 
 /*------------------------
+ * makeStringInfoExt
+ * Create an empty 'StringInfoData' & return a pointer to it.
+ * The data buffer is allocated with size 'initsize'.
+ * The valid range for 'initsize' is 1 to MaxAllocSize.
+ */
+extern StringInfo makeStringInfoExt(int initsize);
+
+/*------------------------
  * initStringInfo
  * Initialize a StringInfoData struct (with previously undefined contents)
  * to describe an empty string.
  */
 extern void initStringInfo(StringInfo str);
+
+/*------------------------
+ * initStringInfoExt
+ * Initialize a StringInfoData struct (with previously undefined contents) to
+ * describe an empty string. The data buffer is allocated with size
+ * 'initsize'. The valid range for 'initsize' is 1 to MaxAllocSize.
+ */
+extern void initStringInfoExt(StringInfo str, int initsize);
 
 /*------------------------
  * initReadOnlyStringInfo
@@ -232,5 +260,11 @@ extern void appendBinaryStringInfoNT(StringInfo str,
  * Make sure a StringInfo's buffer can hold at least 'needed' more bytes.
  */
 extern void enlargeStringInfo(StringInfo str, int needed);
+
+/*------------------------
+ * destroyStringInfo
+ * Frees a StringInfo and its buffer (opposite of makeStringInfo()).
+ */
+extern void destroyStringInfo(StringInfo str);
 
 #endif							/* STRINGINFO_H */

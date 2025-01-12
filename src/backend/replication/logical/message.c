@@ -3,7 +3,7 @@
  * message.c
  *	  Generic logical messages.
  *
- * Copyright (c) 2013-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/logical/message.c
@@ -34,10 +34,7 @@
 #include "access/xact.h"
 #include "access/xloginsert.h"
 #include "miscadmin.h"
-#include "nodes/execnodes.h"
-#include "replication/logical.h"
 #include "replication/message.h"
-#include "utils/memutils.h"
 
 /*
  * Write logical decoding message into XLog.
@@ -66,8 +63,8 @@ LogLogicalMessage(const char *prefix, const char *message, size_t size,
 
 	XLogBeginInsert();
 	XLogRegisterData((char *) &xlrec, SizeOfLogicalMessage);
-	XLogRegisterData(unconstify(char *, prefix), xlrec.prefix_size);
-	XLogRegisterData(unconstify(char *, message), size);
+	XLogRegisterData(prefix, xlrec.prefix_size);
+	XLogRegisterData(message, size);
 
 	/* allow origin filtering */
 	XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);

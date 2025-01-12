@@ -10,7 +10,7 @@
  *	  Over time, this has also become the preferred place for widely known
  *	  resource-limitation stuff, such as work_mem and check_stack_depth().
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/miscadmin.h
@@ -91,6 +91,7 @@ extern PGDLLIMPORT volatile sig_atomic_t InterruptPending;
 extern PGDLLIMPORT volatile sig_atomic_t QueryCancelPending;
 extern PGDLLIMPORT volatile sig_atomic_t ProcDiePending;
 extern PGDLLIMPORT volatile sig_atomic_t IdleInTransactionSessionTimeoutPending;
+extern PGDLLIMPORT volatile sig_atomic_t TransactionTimeoutPending;
 extern PGDLLIMPORT volatile sig_atomic_t IdleSessionTimeoutPending;
 extern PGDLLIMPORT volatile sig_atomic_t ProcSignalBarrierPending;
 extern PGDLLIMPORT volatile sig_atomic_t LogMemoryContextPending;
@@ -164,7 +165,6 @@ do { \
 extern PGDLLIMPORT pid_t PostmasterPid;
 extern PGDLLIMPORT bool IsPostmasterEnvironment;
 extern PGDLLIMPORT bool IsUnderPostmaster;
-extern PGDLLIMPORT bool IsBackgroundWorker;
 extern PGDLLIMPORT bool IsBinaryUpgrade;
 
 extern PGDLLIMPORT bool ExitOnAnyError;
@@ -178,11 +178,20 @@ extern PGDLLIMPORT int MaxConnections;
 extern PGDLLIMPORT int max_worker_processes;
 extern PGDLLIMPORT int max_parallel_workers;
 
+extern PGDLLIMPORT int commit_timestamp_buffers;
+extern PGDLLIMPORT int multixact_member_buffers;
+extern PGDLLIMPORT int multixact_offset_buffers;
+extern PGDLLIMPORT int notify_buffers;
+extern PGDLLIMPORT int serializable_buffers;
+extern PGDLLIMPORT int subtransaction_buffers;
+extern PGDLLIMPORT int transaction_buffers;
+
 extern PGDLLIMPORT int MyProcPid;
 extern PGDLLIMPORT pg_time_t MyStartTime;
 extern PGDLLIMPORT TimestampTz MyStartTimestamp;
 extern PGDLLIMPORT struct Port *MyProcPort;
 extern PGDLLIMPORT struct Latch *MyLatch;
+extern PGDLLIMPORT bool MyCancelKeyValid;
 extern PGDLLIMPORT int32 MyCancelKey;
 extern PGDLLIMPORT int MyPMChildSlot;
 
@@ -194,11 +203,6 @@ extern PGDLLIMPORT char pkglib_path[];
 extern PGDLLIMPORT char postgres_exec_path[];
 #endif
 
-/*
- * done in storage/backendid.h for now.
- *
- * extern BackendId    MyBackendId;
- */
 extern PGDLLIMPORT Oid MyDatabaseId;
 
 extern PGDLLIMPORT Oid MyDatabaseTableSpace;
@@ -280,15 +284,16 @@ extern PGDLLIMPORT int VacuumCostPageDirty;
 extern PGDLLIMPORT int VacuumCostLimit;
 extern PGDLLIMPORT double VacuumCostDelay;
 
-extern PGDLLIMPORT int64 VacuumPageHit;
-extern PGDLLIMPORT int64 VacuumPageMiss;
-extern PGDLLIMPORT int64 VacuumPageDirty;
-
 extern PGDLLIMPORT int VacuumCostBalance;
 extern PGDLLIMPORT bool VacuumCostActive;
 
 
-/* in tcop/postgres.c */
+/* in utils/misc/stack_depth.c */
+
+extern PGDLLIMPORT int max_stack_depth;
+
+/* Required daylight between max_stack_depth and the kernel limit, in bytes */
+#define STACK_DEPTH_SLOP (512 * 1024L)
 
 typedef char *pg_stack_base_t;
 
@@ -296,15 +301,12 @@ extern pg_stack_base_t set_stack_base(void);
 extern void restore_stack_base(pg_stack_base_t base);
 extern void check_stack_depth(void);
 extern bool stack_is_too_deep(void);
+extern long get_stack_depth_rlimit(void);
 
 /* in tcop/utility.c */
 extern void PreventCommandIfReadOnly(const char *cmdname);
 extern void PreventCommandIfParallelMode(const char *cmdname);
 extern void PreventCommandDuringRecovery(const char *cmdname);
-
-/* in utils/misc/guc_tables.c */
-extern PGDLLIMPORT int trace_recovery_messages;
-extern int	trace_recovery(int trace_level);
 
 /*****************************************************************************
  *	  pdir.h --																 *
@@ -325,27 +327,72 @@ extern void InitProcessLocalLatch(void);
 extern void SwitchToSharedLatch(void);
 extern void SwitchBackToLocalLatch(void);
 
+/*
+ * MyBackendType indicates what kind of a backend this is.
+ *
+ * If you add entries, please also update the child_process_kinds array in
+ * launch_backend.c.
+ */
 typedef enum BackendType
 {
 	B_INVALID = 0,
-	B_ARCHIVER,
+
+	/* Backends and other backend-like processes */
+	B_BACKEND,
+	B_DEAD_END_BACKEND,
 	B_AUTOVAC_LAUNCHER,
 	B_AUTOVAC_WORKER,
-	B_BACKEND,
 	B_BG_WORKER,
+	B_WAL_SENDER,
+	B_SLOTSYNC_WORKER,
+
+	B_STANDALONE_BACKEND,
+
+	/*
+	 * Auxiliary processes. These have PGPROC entries, but they are not
+	 * attached to any particular database, and cannot run transactions or
+	 * even take heavyweight locks. There can be only one of each of these
+	 * running at a time.
+	 *
+	 * If you modify these, make sure to update NUM_AUXILIARY_PROCS and the
+	 * glossary in the docs.
+	 */
+	B_ARCHIVER,
 	B_BG_WRITER,
 	B_CHECKPOINTER,
-	B_LOGGER,
-	B_STANDALONE_BACKEND,
 	B_STARTUP,
 	B_WAL_RECEIVER,
-	B_WAL_SENDER,
+	B_WAL_SUMMARIZER,
 	B_WAL_WRITER,
+
+	/*
+	 * Logger is not connected to shared memory and does not have a PGPROC
+	 * entry.
+	 */
+	B_LOGGER,
 } BackendType;
 
-#define BACKEND_NUM_TYPES (B_WAL_WRITER + 1)
+#define BACKEND_NUM_TYPES (B_LOGGER + 1)
 
 extern PGDLLIMPORT BackendType MyBackendType;
+
+#define AmRegularBackendProcess()	(MyBackendType == B_BACKEND)
+#define AmAutoVacuumLauncherProcess() (MyBackendType == B_AUTOVAC_LAUNCHER)
+#define AmAutoVacuumWorkerProcess()	(MyBackendType == B_AUTOVAC_WORKER)
+#define AmBackgroundWorkerProcess() (MyBackendType == B_BG_WORKER)
+#define AmWalSenderProcess()        (MyBackendType == B_WAL_SENDER)
+#define AmLogicalSlotSyncWorkerProcess() (MyBackendType == B_SLOTSYNC_WORKER)
+#define AmArchiverProcess()			(MyBackendType == B_ARCHIVER)
+#define AmBackgroundWriterProcess() (MyBackendType == B_BG_WRITER)
+#define AmCheckpointerProcess()		(MyBackendType == B_CHECKPOINTER)
+#define AmStartupProcess()			(MyBackendType == B_STARTUP)
+#define AmWalReceiverProcess()		(MyBackendType == B_WAL_RECEIVER)
+#define AmWalSummarizerProcess()	(MyBackendType == B_WAL_SUMMARIZER)
+#define AmWalWriterProcess()		(MyBackendType == B_WAL_WRITER)
+
+#define AmSpecialWorkerProcess() \
+	(AmAutoVacuumLauncherProcess() || \
+	 AmLogicalSlotSyncWorkerProcess())
 
 extern const char *GetBackendTypeDesc(BackendType backendType);
 
@@ -358,7 +405,9 @@ extern char *GetUserNameFromId(Oid roleid, bool noerr);
 extern Oid	GetUserId(void);
 extern Oid	GetOuterUserId(void);
 extern Oid	GetSessionUserId(void);
+extern bool GetSessionUserIsSuperuser(void);
 extern Oid	GetAuthenticatedUserId(void);
+extern void SetAuthenticatedUserId(Oid userid);
 extern void GetUserIdAndSecContext(Oid *userid, int *sec_context);
 extern void SetUserIdAndSecContext(Oid userid, int sec_context);
 extern bool InLocalUserIdChange(void);
@@ -429,37 +478,6 @@ extern PGDLLIMPORT ProcessingMode Mode;
 	} while(0)
 
 
-/*
- * Auxiliary-process type identifiers.  These used to be in bootstrap.h
- * but it seems saner to have them here, with the ProcessingMode stuff.
- * The MyAuxProcType global is defined and set in auxprocess.c.
- *
- * Make sure to list in the glossary any items you add here.
- */
-
-typedef enum
-{
-	NotAnAuxProcess = -1,
-	StartupProcess = 0,
-	BgWriterProcess,
-	ArchiverProcess,
-	CheckpointerProcess,
-	WalWriterProcess,
-	WalReceiverProcess,
-
-	NUM_AUXPROCTYPES			/* Must be last! */
-} AuxProcType;
-
-extern PGDLLIMPORT AuxProcType MyAuxProcType;
-
-#define AmStartupProcess()			(MyAuxProcType == StartupProcess)
-#define AmBackgroundWriterProcess() (MyAuxProcType == BgWriterProcess)
-#define AmArchiverProcess()			(MyAuxProcType == ArchiverProcess)
-#define AmCheckpointerProcess()		(MyAuxProcType == CheckpointerProcess)
-#define AmWalWriterProcess()		(MyAuxProcType == WalWriterProcess)
-#define AmWalReceiverProcess()		(MyAuxProcType == WalReceiverProcess)
-
-
 /*****************************************************************************
  *	  pinit.h --															 *
  *			POSTGRES initialization and cleanup definitions.                 *
@@ -472,6 +490,7 @@ extern PGDLLIMPORT AuxProcType MyAuxProcType;
 #define INIT_PG_OVERRIDE_ROLE_LOGIN		0x0004
 extern void pg_split_opts(char **argv, int *argcp, const char *optstr);
 extern void InitializeMaxBackends(void);
+extern void InitializeFastPathLocks(void);
 extern void InitPostgres(const char *in_dbname, Oid dboid,
 						 const char *username, Oid useroid,
 						 bits32 flags,

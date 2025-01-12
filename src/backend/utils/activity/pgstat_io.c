@@ -7,7 +7,7 @@
  * from pgstat.c to enforce the line between the statistics access / storage
  * implementation and the details about individual types of statistics.
  *
- * Copyright (c) 2021-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2021-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat_io.c
@@ -20,16 +20,8 @@
 #include "storage/bufmgr.h"
 #include "utils/pgstat_internal.h"
 
-
-typedef struct PgStat_PendingIO
-{
-	PgStat_Counter counts[IOOBJECT_NUM_TYPES][IOCONTEXT_NUM_TYPES][IOOP_NUM_TYPES];
-	instr_time	pending_times[IOOBJECT_NUM_TYPES][IOCONTEXT_NUM_TYPES][IOOP_NUM_TYPES];
-} PgStat_PendingIO;
-
-
 static PgStat_PendingIO PendingIOStats;
-bool		have_iostats = false;
+static bool have_iostats = false;
 
 
 /*
@@ -74,39 +66,51 @@ pgstat_bktype_io_stats_valid(PgStat_BktypeIO *backend_io,
 }
 
 void
-pgstat_count_io_op(IOObject io_object, IOContext io_context, IOOp io_op)
-{
-	pgstat_count_io_op_n(io_object, io_context, io_op, 1);
-}
-
-void
-pgstat_count_io_op_n(IOObject io_object, IOContext io_context, IOOp io_op, uint32 cnt)
+pgstat_count_io_op(IOObject io_object, IOContext io_context, IOOp io_op, uint32 cnt)
 {
 	Assert((unsigned int) io_object < IOOBJECT_NUM_TYPES);
 	Assert((unsigned int) io_context < IOCONTEXT_NUM_TYPES);
 	Assert((unsigned int) io_op < IOOP_NUM_TYPES);
 	Assert(pgstat_tracks_io_op(MyBackendType, io_object, io_context, io_op));
 
+	if (pgstat_tracks_backend_bktype(MyBackendType))
+	{
+		PgStat_BackendPending *entry_ref;
+
+		entry_ref = pgstat_prep_backend_pending(MyProcNumber);
+		entry_ref->pending_io.counts[io_object][io_context][io_op] += cnt;
+	}
+
 	PendingIOStats.counts[io_object][io_context][io_op] += cnt;
 
 	have_iostats = true;
 }
 
+/*
+ * Initialize the internal timing for an IO operation, depending on an
+ * IO timing GUC.
+ */
 instr_time
-pgstat_prepare_io_time(void)
+pgstat_prepare_io_time(bool track_io_guc)
 {
 	instr_time	io_start;
 
-	if (track_io_timing)
+	if (track_io_guc)
 		INSTR_TIME_SET_CURRENT(io_start);
 	else
+	{
+		/*
+		 * There is no need to set io_start when an IO timing GUC is disabled,
+		 * still initialize it to zero to avoid compiler warnings.
+		 */
 		INSTR_TIME_SET_ZERO(io_start);
+	}
 
 	return io_start;
 }
 
 /*
- * Like pgstat_count_io_op_n() except it also accumulates time.
+ * Like pgstat_count_io_op() except it also accumulates time.
  */
 void
 pgstat_count_io_op_time(IOObject io_object, IOContext io_context, IOOp io_op,
@@ -138,9 +142,18 @@ pgstat_count_io_op_time(IOObject io_object, IOContext io_context, IOOp io_op,
 
 		INSTR_TIME_ADD(PendingIOStats.pending_times[io_object][io_context][io_op],
 					   io_time);
+
+		if (pgstat_tracks_backend_bktype(MyBackendType))
+		{
+			PgStat_BackendPending *entry_ref;
+
+			entry_ref = pgstat_prep_backend_pending(MyProcNumber);
+			INSTR_TIME_ADD(entry_ref->pending_io.pending_times[io_object][io_context][io_op],
+						   io_time);
+		}
 	}
 
-	pgstat_count_io_op_n(io_object, io_context, io_op, cnt);
+	pgstat_count_io_op(io_object, io_context, io_op, cnt);
 }
 
 PgStat_IO *
@@ -152,6 +165,24 @@ pgstat_fetch_stat_io(void)
 }
 
 /*
+ * Check if there any IO stats waiting for flush.
+ */
+bool
+pgstat_io_have_pending_cb(void)
+{
+	return have_iostats;
+}
+
+/*
+ * Simpler wrapper of pgstat_io_flush_cb()
+ */
+void
+pgstat_flush_io(bool nowait)
+{
+	(void) pgstat_io_flush_cb(nowait);
+}
+
+/*
  * Flush out locally pending IO statistics
  *
  * If no stats have been recorded, this function returns false.
@@ -160,7 +191,7 @@ pgstat_fetch_stat_io(void)
  * acquired. Otherwise, return false.
  */
 bool
-pgstat_flush_io(bool nowait)
+pgstat_io_flush_cb(bool nowait)
 {
 	LWLock	   *bktype_lock;
 	PgStat_BktypeIO *bktype_shstats;
@@ -242,6 +273,15 @@ pgstat_get_io_object_name(IOObject io_object)
 }
 
 void
+pgstat_io_init_shmem_cb(void *stats)
+{
+	PgStatShared_IO *stat_shmem = (PgStatShared_IO *) stats;
+
+	for (int i = 0; i < BACKEND_NUM_TYPES; i++)
+		LWLockInitialize(&stat_shmem->locks[i], LWTRANCHE_PGSTATS_DATA);
+}
+
+void
 pgstat_io_reset_all_cb(TimestampTz ts)
 {
 	for (int i = 0; i < BACKEND_NUM_TYPES; i++)
@@ -293,10 +333,13 @@ pgstat_io_snapshot_cb(void)
 *
 * The following BackendTypes do not participate in the cumulative stats
 * subsystem or do not perform IO on which we currently track:
+* - Dead-end backend because it is not connected to shared memory and
+*   doesn't do any IO
 * - Syslogger because it is not connected to shared memory
 * - Archiver because most relevant archiving IO is delegated to a
 *   specialized command or module
-* - WAL Receiver and WAL Writer IO is not tracked in pg_stat_io for now
+* - WAL Receiver, WAL Writer, and WAL Summarizer IO are not tracked in
+*   pg_stat_io for now
 *
 * Function returns true if BackendType participates in the cumulative stats
 * subsystem for IO and false if it does not.
@@ -314,10 +357,12 @@ pgstat_tracks_io_bktype(BackendType bktype)
 	switch (bktype)
 	{
 		case B_INVALID:
+		case B_DEAD_END_BACKEND:
 		case B_ARCHIVER:
 		case B_LOGGER:
 		case B_WAL_RECEIVER:
 		case B_WAL_WRITER:
+		case B_WAL_SUMMARIZER:
 			return false;
 
 		case B_AUTOVAC_LAUNCHER:
@@ -326,6 +371,7 @@ pgstat_tracks_io_bktype(BackendType bktype)
 		case B_BG_WORKER:
 		case B_BG_WRITER:
 		case B_CHECKPOINTER:
+		case B_SLOTSYNC_WORKER:
 		case B_STANDALONE_BACKEND:
 		case B_STARTUP:
 		case B_WAL_SENDER:

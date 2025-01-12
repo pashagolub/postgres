@@ -9,7 +9,7 @@
  * exist, though, because mmap'd shmem provides no way to find out how
  * many processes are attached, which we need for interlocking purposes.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -34,6 +34,7 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/pg_shmem.h"
+#include "utils/guc.h"
 #include "utils/guc_hooks.h"
 #include "utils/pidfile.h"
 
@@ -285,7 +286,7 @@ static void
 IpcMemoryDetach(int status, Datum shmaddr)
 {
 	/* Detach System V shared memory block. */
-	if (shmdt((void *) DatumGetPointer(shmaddr)) < 0)
+	if (shmdt(DatumGetPointer(shmaddr)) < 0)
 		elog(LOG, "shmdt(%p) failed: %m", DatumGetPointer(shmaddr));
 }
 
@@ -319,7 +320,7 @@ PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
 	IpcMemoryState state;
 
 	state = PGSharedMemoryAttach((IpcMemoryId) id2, NULL, &memAddress);
-	if (memAddress && shmdt((void *) memAddress) < 0)
+	if (memAddress && shmdt(memAddress) < 0)
 		elog(LOG, "shmdt(%p) failed: %m", memAddress);
 	switch (state)
 	{
@@ -580,7 +581,7 @@ check_huge_page_size(int *newval, void **extra, GucSource source)
 	/* Recent enough Linux only, for now.  See GetHugePageSize(). */
 	if (*newval != 0)
 	{
-		GUC_check_errdetail("huge_page_size must be 0 on this platform.");
+		GUC_check_errdetail("\"huge_page_size\" must be 0 on this platform.");
 		return false;
 	}
 #endif
@@ -657,8 +658,8 @@ CreateAnonymousSegment(Size *size)
 						 "for a shared memory segment exceeded available memory, "
 						 "swap space, or huge pages. To reduce the request size "
 						 "(currently %zu bytes), reduce PostgreSQL's shared "
-						 "memory usage, perhaps by reducing shared_buffers or "
-						 "max_connections.",
+						 "memory usage, perhaps by reducing \"shared_buffers\" or "
+						 "\"max_connections\".",
 						 allocsize) : 0));
 	}
 
@@ -728,7 +729,7 @@ PGSharedMemoryCreate(Size size,
 	if (huge_pages == HUGE_PAGES_ON && shared_memory_type != SHMEM_TYPE_MMAP)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("huge pages not supported with the current shared_memory_type setting")));
+				 errmsg("huge pages not supported with the current \"shared_memory_type\" setting")));
 
 	/* Room for a header? */
 	Assert(size > MAXALIGN(sizeof(PGShmemHeader)));
@@ -834,7 +835,7 @@ PGSharedMemoryCreate(Size size,
 				break;
 		}
 
-		if (oldhdr && shmdt((void *) oldhdr) < 0)
+		if (oldhdr && shmdt(oldhdr) < 0)
 			elog(LOG, "shmdt(%p) failed: %m", oldhdr);
 	}
 

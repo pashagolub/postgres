@@ -3,7 +3,7 @@
  * pl_comp.c		- Compiler part of the PL/pgSQL
  *			  procedural language
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -23,7 +23,7 @@
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "nodes/makefuncs.h"
-#include "parser/parse_type.h"
+#include "parser/parse_node.h"
 #include "plpgsql.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -31,7 +31,6 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/regproc.h"
-#include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
@@ -80,7 +79,7 @@ typedef struct
 } ExceptionLabelMap;
 
 static const ExceptionLabelMap exception_label_map[] = {
-#include "plerrcodes.h"			/* pgrminclude ignore */
+#include "plerrcodes.h"
 	{NULL, 0}
 };
 
@@ -230,13 +229,19 @@ recheck:
 	/*
 	 * Save pointer in FmgrInfo to avoid search on subsequent calls
 	 */
-	fcinfo->flinfo->fn_extra = (void *) function;
+	fcinfo->flinfo->fn_extra = function;
 
 	/*
 	 * Finally return the compiled function
 	 */
 	return function;
 }
+
+struct compile_error_callback_arg
+{
+	const char *proc_source;
+	yyscan_t	yyscanner;
+};
 
 /*
  * This is the slow part of plpgsql_compile().
@@ -270,6 +275,7 @@ do_compile(FunctionCallInfo fcinfo,
 	Form_pg_proc procStruct = (Form_pg_proc) GETSTRUCT(procTup);
 	bool		is_dml_trigger = CALLED_AS_TRIGGER(fcinfo);
 	bool		is_event_trigger = CALLED_AS_EVENT_TRIGGER(fcinfo);
+	yyscan_t	scanner;
 	Datum		prosrcdatum;
 	char	   *proc_source;
 	HeapTuple	typeTup;
@@ -277,6 +283,7 @@ do_compile(FunctionCallInfo fcinfo,
 	PLpgSQL_variable *var;
 	PLpgSQL_rec *rec;
 	int			i;
+	struct compile_error_callback_arg cbarg;
 	ErrorContextCallback plerrcontext;
 	int			parse_rc;
 	Oid			rettypeid;
@@ -291,21 +298,21 @@ do_compile(FunctionCallInfo fcinfo,
 	MemoryContext func_cxt;
 
 	/*
-	 * Setup the scanner input and error info.  We assume that this function
-	 * cannot be invoked recursively, so there's no need to save and restore
-	 * the static variables used here.
+	 * Setup the scanner input and error info.
 	 */
 	prosrcdatum = SysCacheGetAttrNotNull(PROCOID, procTup, Anum_pg_proc_prosrc);
 	proc_source = TextDatumGetCString(prosrcdatum);
-	plpgsql_scanner_init(proc_source);
+	scanner = plpgsql_scanner_init(proc_source);
 
 	plpgsql_error_funcname = pstrdup(NameStr(procStruct->proname));
 
 	/*
 	 * Setup error traceback support for ereport()
 	 */
+	cbarg.proc_source = forValidator ? proc_source : NULL;
+	cbarg.yyscanner = scanner;
 	plerrcontext.callback = plpgsql_compile_error_callback;
-	plerrcontext.arg = forValidator ? proc_source : NULL;
+	plerrcontext.arg = &cbarg;
 	plerrcontext.previous = error_context_stack;
 	error_context_stack = &plerrcontext;
 
@@ -780,12 +787,12 @@ do_compile(FunctionCallInfo fcinfo,
 	/*
 	 * Now parse the function's text
 	 */
-	parse_rc = plpgsql_yyparse();
+	parse_rc = plpgsql_yyparse(scanner);
 	if (parse_rc != 0)
 		elog(ERROR, "plpgsql parser returned %d", parse_rc);
 	function->action = plpgsql_parse_result;
 
-	plpgsql_scanner_finish();
+	plpgsql_scanner_finish(scanner);
 	pfree(proc_source);
 
 	/*
@@ -842,27 +849,29 @@ do_compile(FunctionCallInfo fcinfo,
 PLpgSQL_function *
 plpgsql_compile_inline(char *proc_source)
 {
+	yyscan_t	scanner;
 	char	   *func_name = "inline_code_block";
 	PLpgSQL_function *function;
+	struct compile_error_callback_arg cbarg;
 	ErrorContextCallback plerrcontext;
 	PLpgSQL_variable *var;
 	int			parse_rc;
 	MemoryContext func_cxt;
 
 	/*
-	 * Setup the scanner input and error info.  We assume that this function
-	 * cannot be invoked recursively, so there's no need to save and restore
-	 * the static variables used here.
+	 * Setup the scanner input and error info.
 	 */
-	plpgsql_scanner_init(proc_source);
+	scanner = plpgsql_scanner_init(proc_source);
 
 	plpgsql_error_funcname = func_name;
 
 	/*
 	 * Setup error traceback support for ereport()
 	 */
+	cbarg.proc_source = proc_source;
+	cbarg.yyscanner = scanner;
 	plerrcontext.callback = plpgsql_compile_error_callback;
-	plerrcontext.arg = proc_source;
+	plerrcontext.arg = &cbarg;
 	plerrcontext.previous = error_context_stack;
 	error_context_stack = &plerrcontext;
 
@@ -936,12 +945,12 @@ plpgsql_compile_inline(char *proc_source)
 	/*
 	 * Now parse the function's text
 	 */
-	parse_rc = plpgsql_yyparse();
+	parse_rc = plpgsql_yyparse(scanner);
 	if (parse_rc != 0)
 		elog(ERROR, "plpgsql parser returned %d", parse_rc);
 	function->action = plpgsql_parse_result;
 
-	plpgsql_scanner_finish();
+	plpgsql_scanner_finish(scanner);
 
 	/*
 	 * If it returns VOID (always true at the moment), we allow control to
@@ -979,13 +988,16 @@ plpgsql_compile_inline(char *proc_source)
 static void
 plpgsql_compile_error_callback(void *arg)
 {
-	if (arg)
+	struct compile_error_callback_arg *cbarg = (struct compile_error_callback_arg *) arg;
+	yyscan_t	yyscanner = cbarg->yyscanner;
+
+	if (cbarg->proc_source)
 	{
 		/*
 		 * Try to convert syntax error position to reference text of original
 		 * CREATE FUNCTION or DO command.
 		 */
-		if (function_parse_error_transpose((const char *) arg))
+		if (function_parse_error_transpose(cbarg->proc_source))
 			return;
 
 		/*
@@ -996,7 +1008,7 @@ plpgsql_compile_error_callback(void *arg)
 
 	if (plpgsql_error_funcname)
 		errcontext("compilation of PL/pgSQL function \"%s\" near line %d",
-				   plpgsql_error_funcname, plpgsql_latest_lineno());
+				   plpgsql_error_funcname, plpgsql_latest_lineno(yyscanner));
 }
 
 
@@ -1080,7 +1092,7 @@ plpgsql_parser_setup(struct ParseState *pstate, PLpgSQL_expr *expr)
 	pstate->p_post_columnref_hook = plpgsql_post_column_ref;
 	pstate->p_paramref_hook = plpgsql_param_ref;
 	/* no need to use p_coerce_param_hook */
-	pstate->p_ref_hook_state = (void *) expr;
+	pstate->p_ref_hook_state = expr;
 }
 
 /*
@@ -1596,19 +1608,16 @@ plpgsql_parse_tripword(char *word1, char *word2, char *word3,
 
 
 /* ----------
- * plpgsql_parse_wordtype	The scanner found word%TYPE. word can be
- *				a variable name or a basetype.
+ * plpgsql_parse_wordtype	The scanner found word%TYPE. word should be
+ *				a pre-existing variable name.
  *
- * Returns datatype struct, or NULL if no match found for word.
+ * Returns datatype struct.  Throws error if no match found for word.
  * ----------
  */
 PLpgSQL_type *
 plpgsql_parse_wordtype(char *ident)
 {
-	PLpgSQL_type *dtype;
 	PLpgSQL_nsitem *nse;
-	TypeName   *typeName;
-	HeapTuple	typeTup;
 
 	/*
 	 * Do a lookup in the current namespace stack
@@ -1623,49 +1632,27 @@ plpgsql_parse_wordtype(char *ident)
 		{
 			case PLPGSQL_NSTYPE_VAR:
 				return ((PLpgSQL_var *) (plpgsql_Datums[nse->itemno]))->datatype;
-
-				/* XXX perhaps allow REC/ROW here? */
-
+			case PLPGSQL_NSTYPE_REC:
+				return ((PLpgSQL_rec *) (plpgsql_Datums[nse->itemno]))->datatype;
 			default:
-				return NULL;
+				break;
 		}
 	}
 
-	/*
-	 * Word wasn't found in the namespace stack. Try to find a data type with
-	 * that name, but ignore shell types and complex types.
-	 */
-	typeName = makeTypeName(ident);
-	typeTup = LookupTypeName(NULL, typeName, NULL, false);
-	if (typeTup)
-	{
-		Form_pg_type typeStruct = (Form_pg_type) GETSTRUCT(typeTup);
-
-		if (!typeStruct->typisdefined ||
-			typeStruct->typrelid != InvalidOid)
-		{
-			ReleaseSysCache(typeTup);
-			return NULL;
-		}
-
-		dtype = build_datatype(typeTup, -1,
-							   plpgsql_curr_compile->fn_input_collation,
-							   typeName);
-
-		ReleaseSysCache(typeTup);
-		return dtype;
-	}
-
-	/*
-	 * Nothing found - up to now it's a word without any special meaning for
-	 * us.
-	 */
-	return NULL;
+	/* No match, complain */
+	ereport(ERROR,
+			(errcode(ERRCODE_UNDEFINED_OBJECT),
+			 errmsg("variable \"%s\" does not exist", ident)));
+	return NULL;				/* keep compiler quiet */
 }
 
 
 /* ----------
  * plpgsql_parse_cwordtype		Same lookup for compositeword%TYPE
+ *
+ * Here, we allow either a block-qualified variable name, or a reference
+ * to a column of some table.  (If we must throw error, we assume that the
+ * latter case was intended.)
  * ----------
  */
 PLpgSQL_type *
@@ -1673,12 +1660,12 @@ plpgsql_parse_cwordtype(List *idents)
 {
 	PLpgSQL_type *dtype = NULL;
 	PLpgSQL_nsitem *nse;
-	const char *fldname;
+	int			nnames;
+	RangeVar   *relvar = NULL;
+	const char *fldname = NULL;
 	Oid			classOid;
-	HeapTuple	classtup = NULL;
 	HeapTuple	attrtup = NULL;
 	HeapTuple	typetup = NULL;
-	Form_pg_class classStruct;
 	Form_pg_attribute attrStruct;
 	MemoryContext oldCxt;
 
@@ -1688,70 +1675,64 @@ plpgsql_parse_cwordtype(List *idents)
 	if (list_length(idents) == 2)
 	{
 		/*
-		 * Do a lookup in the current namespace stack. We don't need to check
-		 * number of names matched, because we will only consider scalar
-		 * variables.
+		 * Do a lookup in the current namespace stack
 		 */
 		nse = plpgsql_ns_lookup(plpgsql_ns_top(), false,
 								strVal(linitial(idents)),
 								strVal(lsecond(idents)),
 								NULL,
-								NULL);
+								&nnames);
 
 		if (nse != NULL && nse->itemtype == PLPGSQL_NSTYPE_VAR)
 		{
+			/* Block-qualified reference to scalar variable. */
 			dtype = ((PLpgSQL_var *) (plpgsql_Datums[nse->itemno]))->datatype;
+			goto done;
+		}
+		else if (nse != NULL && nse->itemtype == PLPGSQL_NSTYPE_REC &&
+				 nnames == 2)
+		{
+			/* Block-qualified reference to record variable. */
+			dtype = ((PLpgSQL_rec *) (plpgsql_Datums[nse->itemno]))->datatype;
 			goto done;
 		}
 
 		/*
 		 * First word could also be a table name
 		 */
-		classOid = RelnameGetRelid(strVal(linitial(idents)));
-		if (!OidIsValid(classOid))
-			goto done;
+		relvar = makeRangeVar(NULL,
+							  strVal(linitial(idents)),
+							  -1);
 		fldname = strVal(lsecond(idents));
 	}
-	else if (list_length(idents) == 3)
-	{
-		RangeVar   *relvar;
-
-		relvar = makeRangeVar(strVal(linitial(idents)),
-							  strVal(lsecond(idents)),
-							  -1);
-		/* Can't lock relation - we might not have privileges. */
-		classOid = RangeVarGetRelid(relvar, NoLock, true);
-		if (!OidIsValid(classOid))
-			goto done;
-		fldname = strVal(lthird(idents));
-	}
 	else
-		goto done;
+	{
+		/*
+		 * We could check for a block-qualified reference to a field of a
+		 * record variable, but %TYPE is documented as applying to variables,
+		 * not fields of variables.  Things would get rather ambiguous if we
+		 * allowed either interpretation.
+		 */
+		List	   *rvnames;
 
-	classtup = SearchSysCache1(RELOID, ObjectIdGetDatum(classOid));
-	if (!HeapTupleIsValid(classtup))
-		goto done;
-	classStruct = (Form_pg_class) GETSTRUCT(classtup);
+		Assert(list_length(idents) > 2);
+		rvnames = list_delete_last(list_copy(idents));
+		relvar = makeRangeVarFromNameList(rvnames);
+		fldname = strVal(llast(idents));
+	}
 
-	/*
-	 * It must be a relation, sequence, view, materialized view, composite
-	 * type, or foreign table
-	 */
-	if (classStruct->relkind != RELKIND_RELATION &&
-		classStruct->relkind != RELKIND_SEQUENCE &&
-		classStruct->relkind != RELKIND_VIEW &&
-		classStruct->relkind != RELKIND_MATVIEW &&
-		classStruct->relkind != RELKIND_COMPOSITE_TYPE &&
-		classStruct->relkind != RELKIND_FOREIGN_TABLE &&
-		classStruct->relkind != RELKIND_PARTITIONED_TABLE)
-		goto done;
+	/* Look up relation name.  Can't lock it - we might not have privileges. */
+	classOid = RangeVarGetRelid(relvar, NoLock, false);
 
 	/*
 	 * Fetch the named table field and its type
 	 */
 	attrtup = SearchSysCacheAttName(classOid, fldname);
 	if (!HeapTupleIsValid(attrtup))
-		goto done;
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("column \"%s\" of relation \"%s\" does not exist",
+						fldname, relvar->relname)));
 	attrStruct = (Form_pg_attribute) GETSTRUCT(attrtup);
 
 	typetup = SearchSysCache1(TYPEOID,
@@ -1772,8 +1753,6 @@ plpgsql_parse_cwordtype(List *idents)
 	MemoryContextSwitchTo(plpgsql_compile_tmp_cxt);
 
 done:
-	if (HeapTupleIsValid(classtup))
-		ReleaseSysCache(classtup);
 	if (HeapTupleIsValid(attrtup))
 		ReleaseSysCache(attrtup);
 	if (HeapTupleIsValid(typetup))
@@ -1837,16 +1816,12 @@ plpgsql_parse_cwordrowtype(List *idents)
 	 * As above, this is a relation lookup but could be a type lookup if we
 	 * weren't being backwards-compatible about error wording.
 	 */
-	if (list_length(idents) != 2)
-		return NULL;
 
 	/* Avoid memory leaks in long-term function context */
 	oldCxt = MemoryContextSwitchTo(plpgsql_compile_tmp_cxt);
 
 	/* Look up relation name.  Can't lock it - we might not have privileges. */
-	relvar = makeRangeVar(strVal(linitial(idents)),
-						  strVal(lsecond(idents)),
-						  -1);
+	relvar = makeRangeVarFromNameList(idents);
 	classOid = RangeVarGetRelid(relvar, NoLock, false);
 
 	/* Some relkinds lack type OIDs */
@@ -1855,7 +1830,7 @@ plpgsql_parse_cwordrowtype(List *idents)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("relation \"%s\" does not have a composite type",
-						strVal(lsecond(idents)))));
+						relvar->relname)));
 
 	MemoryContextSwitchTo(oldCxt);
 
@@ -2206,6 +2181,33 @@ build_datatype(HeapTuple typeTup, int32 typmod,
 	}
 
 	return typ;
+}
+
+/*
+ * Build an array type for the element type specified as argument.
+ */
+PLpgSQL_type *
+plpgsql_build_datatype_arrayof(PLpgSQL_type *dtype)
+{
+	Oid			array_typeid;
+
+	/*
+	 * If it's already an array type, use it as-is: Postgres doesn't do nested
+	 * arrays.
+	 */
+	if (dtype->typisarray)
+		return dtype;
+
+	array_typeid = get_array_type(dtype->typoid);
+	if (!OidIsValid(array_typeid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("could not find array type for data type %s",
+						format_type_be(dtype->typoid))));
+
+	/* Note we inherit typmod and collation, if any, from the element type */
+	return plpgsql_build_datatype(array_typeid, dtype->atttypmod,
+								  dtype->collation, NULL);
 }
 
 /*

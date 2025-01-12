@@ -3,7 +3,7 @@
  * verify_heapam.c
  *	  Functions to check postgresql heap relations for corruption
  *
- * Copyright (c) 2016-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2025, PostgreSQL Global Development Group
  *
  *	  contrib/amcheck/verify_heapam.c
  *-------------------------------------------------------------------------
@@ -12,18 +12,22 @@
 
 #include "access/detoast.h"
 #include "access/genam.h"
-#include "access/heapam.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
+#include "access/relation.h"
+#include "access/table.h"
 #include "access/toast_internals.h"
 #include "access/visibilitymap.h"
+#include "access/xact.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_class.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/rel.h"
 
 PG_FUNCTION_INFO_V1(verify_heapam);
 
@@ -81,12 +85,12 @@ typedef struct ToastedAttribute
 typedef struct HeapCheckContext
 {
 	/*
-	 * Cached copies of values from ShmemVariableCache and computed values
-	 * from them.
+	 * Cached copies of values from TransamVariables and computed values from
+	 * them.
 	 */
-	FullTransactionId next_fxid;	/* ShmemVariableCache->nextXid */
+	FullTransactionId next_fxid;	/* TransamVariables->nextXid */
 	TransactionId next_xid;		/* 32-bit version of next_fxid */
-	TransactionId oldest_xid;	/* ShmemVariableCache->oldestXid */
+	TransactionId oldest_xid;	/* TransamVariables->oldestXid */
 	FullTransactionId oldest_fxid;	/* 64-bit version of oldest_xid, computed
 									 * relative to next_fxid */
 	TransactionId safe_xmin;	/* this XID and newer ones can't become
@@ -1567,11 +1571,11 @@ check_tuple_attribute(HeapCheckContext *ctx)
 	struct varlena *attr;
 	char	   *tp;				/* pointer to the tuple data */
 	uint16		infomask;
-	Form_pg_attribute thisatt;
+	CompactAttribute *thisatt;
 	struct varatt_external toast_pointer;
 
 	infomask = ctx->tuphdr->t_infomask;
-	thisatt = TupleDescAttr(RelationGetDescr(ctx->rel), ctx->attnum);
+	thisatt = TupleDescCompactAttr(RelationGetDescr(ctx->rel), ctx->attnum);
 
 	tp = (char *) ctx->tuphdr + ctx->tuphdr->t_hoff;
 
@@ -1592,7 +1596,7 @@ check_tuple_attribute(HeapCheckContext *ctx)
 	/* Skip non-varlena values, but update offset first */
 	if (thisatt->attlen != -1)
 	{
-		ctx->offset = att_align_nominal(ctx->offset, thisatt->attalign);
+		ctx->offset = att_nominal_alignby(ctx->offset, thisatt->attalignby);
 		ctx->offset = att_addlength_pointer(ctx->offset, thisatt->attlen,
 											tp + ctx->offset);
 		if (ctx->tuphdr->t_hoff + ctx->offset > ctx->lp_len)
@@ -1608,8 +1612,8 @@ check_tuple_attribute(HeapCheckContext *ctx)
 	}
 
 	/* Ok, we're looking at a varlena attribute. */
-	ctx->offset = att_align_pointer(ctx->offset, thisatt->attalign, -1,
-									tp + ctx->offset);
+	ctx->offset = att_pointer_alignby(ctx->offset, thisatt->attalignby, -1,
+									  tp + ctx->offset);
 
 	/* Get the (possibly corrupt) varlena datum */
 	attdatum = fetchatt(thisatt, tp + ctx->offset);
@@ -1763,7 +1767,6 @@ check_tuple_attribute(HeapCheckContext *ctx)
 static void
 check_toasted_attribute(HeapCheckContext *ctx, ToastedAttribute *ta)
 {
-	SnapshotData SnapshotToast;
 	ScanKeyData toastkey;
 	SysScanDesc toastscan;
 	bool		found_toasttup;
@@ -1787,10 +1790,9 @@ check_toasted_attribute(HeapCheckContext *ctx, ToastedAttribute *ta)
 	 * Check if any chunks for this toasted object exist in the toast table,
 	 * accessible via the index.
 	 */
-	init_toast_snapshot(&SnapshotToast);
 	toastscan = systable_beginscan_ordered(ctx->toast_rel,
 										   ctx->valid_toast_index,
-										   &SnapshotToast, 1,
+										   get_toast_snapshot(), 1,
 										   &toastkey);
 	found_toasttup = false;
 	while ((toasttup =
@@ -1924,8 +1926,8 @@ update_cached_xid_range(HeapCheckContext *ctx)
 {
 	/* Make cached copies */
 	LWLockAcquire(XidGenLock, LW_SHARED);
-	ctx->next_fxid = ShmemVariableCache->nextXid;
-	ctx->oldest_xid = ShmemVariableCache->oldestXid;
+	ctx->next_fxid = TransamVariables->nextXid;
+	ctx->oldest_xid = TransamVariables->oldestXid;
 	LWLockRelease(XidGenLock);
 
 	/* And compute alternate versions of the same */
@@ -2062,7 +2064,7 @@ get_xid_status(TransactionId xid, HeapCheckContext *ctx,
 	*status = XID_COMMITTED;
 	LWLockAcquire(XactTruncationLock, LW_SHARED);
 	clog_horizon =
-		FullTransactionIdFromXidAndCtx(ShmemVariableCache->oldestClogXid,
+		FullTransactionIdFromXidAndCtx(TransamVariables->oldestClogXid,
 									   ctx);
 	if (FullTransactionIdPrecedesOrEquals(clog_horizon, fxid))
 	{

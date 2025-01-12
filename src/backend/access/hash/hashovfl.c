@@ -3,7 +3,7 @@
  * hashovfl.c
  *	  Overflow page management code for the Postgres hash access method
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -647,6 +647,7 @@ _hash_freeovflpage(Relation rel, Buffer bucketbuf, Buffer ovflbuf,
 		xl_hash_squeeze_page xlrec;
 		XLogRecPtr	recptr;
 		int			i;
+		bool		mod_wbuf = false;
 
 		xlrec.prevblkno = prevblkno;
 		xlrec.nextblkno = nextblkno;
@@ -668,13 +669,41 @@ _hash_freeovflpage(Relation rel, Buffer bucketbuf, Buffer ovflbuf,
 			XLogRegisterBuffer(0, bucketbuf, flags);
 		}
 
-		XLogRegisterBuffer(1, wbuf, REGBUF_STANDARD);
 		if (xlrec.ntups > 0)
 		{
+			XLogRegisterBuffer(1, wbuf, REGBUF_STANDARD);
+
+			/* Remember that wbuf is modified. */
+			mod_wbuf = true;
+
 			XLogRegisterBufData(1, (char *) itup_offsets,
 								nitups * sizeof(OffsetNumber));
 			for (i = 0; i < nitups; i++)
 				XLogRegisterBufData(1, (char *) itups[i], tups_size[i]);
+		}
+		else if (xlrec.is_prim_bucket_same_wrt || xlrec.is_prev_bucket_same_wrt)
+		{
+			uint8		wbuf_flags;
+
+			/*
+			 * A write buffer needs to be registered even if no tuples are
+			 * added to it to ensure that we can acquire a cleanup lock on it
+			 * if it is the same as primary bucket buffer or update the
+			 * nextblkno if it is same as the previous bucket buffer.
+			 */
+			Assert(xlrec.ntups == 0);
+
+			wbuf_flags = REGBUF_STANDARD;
+			if (!xlrec.is_prev_bucket_same_wrt)
+			{
+				wbuf_flags |= REGBUF_NO_CHANGE;
+			}
+			else
+			{
+				/* Remember that wbuf is modified. */
+				mod_wbuf = true;
+			}
+			XLogRegisterBuffer(1, wbuf, wbuf_flags);
 		}
 
 		XLogRegisterBuffer(2, ovflbuf, REGBUF_STANDARD);
@@ -702,7 +731,10 @@ _hash_freeovflpage(Relation rel, Buffer bucketbuf, Buffer ovflbuf,
 
 		recptr = XLogInsert(RM_HASH_ID, XLOG_HASH_SQUEEZE_PAGE);
 
-		PageSetLSN(BufferGetPage(wbuf), recptr);
+		/* Set LSN iff wbuf is modified. */
+		if (mod_wbuf)
+			PageSetLSN(BufferGetPage(wbuf), recptr);
+
 		PageSetLSN(BufferGetPage(ovflbuf), recptr);
 
 		if (BufferIsValid(prevbuf) && !xlrec.is_prev_bucket_same_wrt)

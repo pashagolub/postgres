@@ -7,7 +7,7 @@
 # - wait_event_funcs_data.c (if --code is passed)
 # - wait_event_types.sgml (if --docs is passed)
 #
-# Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/backend/utils/activity/generate-wait_event_types.pl
@@ -15,7 +15,7 @@
 #----------------------------------------------------------------------
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use Getopt::Long;
 
 my $output_path = '.';
@@ -38,10 +38,10 @@ die "Not possible to specify --docs and --code simultaneously"
 
 open my $wait_event_names, '<', $ARGV[0] or die;
 
+my @abi_compatibility_lines;
 my @lines;
+my $abi_compatibility = 0;
 my $section_name;
-my $note;
-my $note_name;
 
 # Remove comments and empty lines and add waitclassname based on the section
 while (<$wait_event_names>)
@@ -59,16 +59,40 @@ while (<$wait_event_names>)
 	{
 		$section_name = $_;
 		$section_name =~ s/^.*- //;
+		$abi_compatibility = 0;
 		next;
 	}
 
-	push(@lines, $section_name . "\t" . $_);
+	# ABI_compatibility region, preserving ABI compatibility of the code
+	# generated.  Any wait events listed in this part of the file will
+	# not be sorted during the code generation.
+	if (/^ABI_compatibility:$/)
+	{
+		$abi_compatibility = 1;
+		next;
+	}
+
+	if ($gen_code && $abi_compatibility)
+	{
+		push(@abi_compatibility_lines, $section_name . "\t" . $_);
+	}
+	else
+	{
+		push(@lines, $section_name . "\t" . $_);
+	}
 }
 
 # Sort the lines based on the second column.
 # uc() is being used to force the comparison to be case-insensitive.
 my @lines_sorted =
   sort { uc((split(/\t/, $a))[1]) cmp uc((split(/\t/, $b))[1]) } @lines;
+
+# If we are generating code, concat @lines_sorted and then
+# @abi_compatibility_lines.
+if ($gen_code)
+{
+	push(@lines_sorted, @abi_compatibility_lines);
+}
 
 # Read the sorted lines and populate the hash table
 foreach my $line (@lines_sorted)
@@ -126,7 +150,7 @@ if ($gen_code)
  * %s
  *    Generated wait events infrastructure code
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -155,9 +179,10 @@ if ($gen_code)
 	foreach my $waitclass (sort { uc($a) cmp uc($b) } keys %hashwe)
 	{
 		# Don't generate the pgstat_wait_event.c and wait_event_types.h files
-		# for Extension, LWLock and Lock, these are handled independently.
+		# for types handled independently.
 		next
 		  if ( $waitclass eq 'WaitEventExtension'
+			|| $waitclass eq 'WaitEventInjectionPoint'
 			|| $waitclass eq 'WaitEventLWLock'
 			|| $waitclass eq 'WaitEventLock');
 

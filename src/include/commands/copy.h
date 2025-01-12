@@ -4,7 +4,7 @@
  *	  Definitions for using the POSTGRES copy command.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/commands/copy.h
@@ -29,6 +29,27 @@ typedef enum CopyHeaderChoice
 	COPY_HEADER_TRUE,
 	COPY_HEADER_MATCH,
 } CopyHeaderChoice;
+
+/*
+ * Represents where to save input processing errors.  More values to be added
+ * in the future.
+ */
+typedef enum CopyOnErrorChoice
+{
+	COPY_ON_ERROR_STOP = 0,		/* immediately throw errors, default */
+	COPY_ON_ERROR_IGNORE,		/* ignore errors */
+} CopyOnErrorChoice;
+
+/*
+ * Represents verbosity of logged messages by COPY command.
+ */
+typedef enum CopyLogVerbosityChoice
+{
+	COPY_LOG_VERBOSITY_SILENT = -1, /* logs none */
+	COPY_LOG_VERBOSITY_DEFAULT = 0, /* logs no additional messages. As this is
+									 * the default, assign 0 */
+	COPY_LOG_VERBOSITY_VERBOSE, /* logs additional messages */
+} CopyLogVerbosityChoice;
 
 /*
  * A struct to hold COPY options, in a parsed form. All of these are related
@@ -62,6 +83,9 @@ typedef struct CopyFormatOptions
 	bool		force_null_all; /* FORCE_NULL *? */
 	bool	   *force_null_flags;	/* per-column CSV FN flags */
 	bool		convert_selectively;	/* do selective binary conversion? */
+	CopyOnErrorChoice on_error; /* what to do when error happened */
+	CopyLogVerbosityChoice log_verbosity;	/* verbosity of logged messages */
+	int64		reject_limit;	/* maximum tolerable number of errors */
 	List	   *convert_select; /* list of column names (can be NIL) */
 } CopyFormatOptions;
 
@@ -86,6 +110,7 @@ extern bool NextCopyFrom(CopyFromState cstate, ExprContext *econtext,
 extern bool NextCopyFromRawFields(CopyFromState cstate,
 								  char ***fields, int *nfields);
 extern void CopyFromErrorCallback(void *arg);
+extern char *CopyLimitPrintoutLength(const char *str);
 
 extern uint64 CopyFrom(CopyFromState cstate);
 

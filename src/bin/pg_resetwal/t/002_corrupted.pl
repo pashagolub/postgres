@@ -1,10 +1,10 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 # Tests for handling a corrupted pg_control
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
@@ -21,7 +21,7 @@ my $size = -s $pg_control;
 my $data;
 open my $fh, '<', $pg_control or BAIL_OUT($!);
 binmode $fh;
-read $fh, $data, 16;
+read $fh, $data, 16 or die $!;
 close $fh;
 
 # Fill pg_control with zeros
@@ -54,5 +54,13 @@ command_checks_all(
 		qr/\Qpg_resetwal: warning: pg_control specifies invalid WAL segment size (0 bytes); proceed with caution\E/
 	],
 	'processes zero WAL segment size');
+
+# now try to run it
+command_fails_like(
+	[ 'pg_resetwal', $node->data_dir ],
+	qr/not proceeding because control file values were guessed/,
+	'does not run when control file values were guessed');
+command_ok([ 'pg_resetwal', '-f', $node->data_dir ],
+	'runs with force when control file values were guessed');
 
 done_testing();

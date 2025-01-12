@@ -1,8 +1,8 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Utils;
 use Test::More;
 
@@ -36,7 +36,7 @@ sub create_files
 {
 	foreach my $fn (map { $_->{name} } @_)
 	{
-		open my $file, '>', "$tempdir/$fn";
+		open my $file, '>', "$tempdir/$fn" or die $!;
 
 		print $file 'CONTENT';
 		close $file;

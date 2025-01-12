@@ -4,7 +4,7 @@
  *	  insert routines for the postgres inverted index access method.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -15,15 +15,12 @@
 #include "postgres.h"
 
 #include "access/gin_private.h"
-#include "access/ginxlog.h"
 #include "access/tableam.h"
 #include "access/xloginsert.h"
-#include "catalog/index.h"
 #include "miscadmin.h"
+#include "nodes/execnodes.h"
 #include "storage/bufmgr.h"
-#include "storage/indexfsm.h"
 #include "storage/predicate.h"
-#include "storage/smgr.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -383,8 +380,7 @@ ginbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * prefers to receive tuples in TID order.
 	 */
 	reltuples = table_index_build_scan(heap, index, indexInfo, false, true,
-									   ginBuildCallback, (void *) &buildstate,
-									   NULL);
+									   ginBuildCallback, &buildstate, NULL);
 
 	/* dump remaining entries to the index */
 	oldCtx = MemoryContextSwitchTo(buildstate.tmpCtx);
@@ -500,7 +496,7 @@ gininsert(Relation index, Datum *values, bool *isnull,
 		oldCtx = MemoryContextSwitchTo(indexInfo->ii_Context);
 		ginstate = (GinState *) palloc(sizeof(GinState));
 		initGinState(ginstate, index);
-		indexInfo->ii_AmCache = (void *) ginstate;
+		indexInfo->ii_AmCache = ginstate;
 		MemoryContextSwitchTo(oldCtx);
 	}
 

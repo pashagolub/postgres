@@ -2,7 +2,7 @@
  * gin_private.h
  *	  header file for postgres inverted index access method implementation.
  *
- *	Copyright (c) 2006-2023, PostgreSQL Global Development Group
+ *	Copyright (c) 2006-2025, PostgreSQL Global Development Group
  *
  *	src/include/access/gin_private.h
  *--------------------------------------------------------------------------
@@ -14,6 +14,7 @@
 #include "access/gin.h"
 #include "access/ginblock.h"
 #include "access/itup.h"
+#include "common/int.h"
 #include "catalog/pg_am_d.h"
 #include "fmgr.h"
 #include "lib/rbtree.h"
@@ -351,7 +352,7 @@ typedef struct GinScanEntryData
 
 	/* for a partial-match or full-scan query, we accumulate all TIDs here */
 	TIDBitmap  *matchBitmap;
-	TBMIterator *matchIterator;
+	TBMPrivateIterator *matchIterator;
 	TBMIterateResult *matchResult;
 
 	/* used for Posting list and one page in Posting tree */
@@ -489,12 +490,7 @@ ginCompareItemPointers(ItemPointer a, ItemPointer b)
 	uint64		ia = (uint64) GinItemPointerGetBlockNumber(a) << 32 | GinItemPointerGetOffsetNumber(a);
 	uint64		ib = (uint64) GinItemPointerGetBlockNumber(b) << 32 | GinItemPointerGetOffsetNumber(b);
 
-	if (ia == ib)
-		return 0;
-	else if (ia > ib)
-		return 1;
-	else
-		return -1;
+	return pg_cmp_u64(ia, ib);
 }
 
 extern int	ginTraverseLock(Buffer buffer, bool searchMode);

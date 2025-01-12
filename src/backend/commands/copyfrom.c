@@ -9,7 +9,7 @@
  * Reading data from the input file or client and parsing it into Datums
  * is handled in copyfromparse.c.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,10 +25,8 @@
 #include <sys/stat.h>
 
 #include "access/heapam.h"
-#include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/xact.h"
-#include "access/xlog.h"
 #include "catalog/namespace.h"
 #include "commands/copy.h"
 #include "commands/copyfrom_internal.h"
@@ -39,9 +37,9 @@
 #include "executor/nodeModifyTable.h"
 #include "executor/tuptable.h"
 #include "foreign/fdwapi.h"
-#include "libpq/libpq.h"
-#include "libpq/pqformat.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/miscnodes.h"
 #include "optimizer/optimizer.h"
 #include "pgstat.h"
 #include "rewrite/rewriteHandler.h"
@@ -70,7 +68,10 @@
  */
 #define MAX_BUFFERED_BYTES		65535
 
-/* Trim the list of buffers back down to this number after flushing */
+/*
+ * Trim the list of buffers back down to this number after flushing.  This
+ * must be >= 2.
+ */
 #define MAX_PARTITION_BUFFERS	32
 
 /* Stores multi-insert data related to a single relation in CopyFrom. */
@@ -103,8 +104,6 @@ typedef struct CopyMultiInsertInfo
 
 
 /* non-export function prototypes */
-static char *limit_printout_length(const char *str);
-
 static void ClosePipeFromProgram(CopyFromState cstate);
 
 /*
@@ -143,7 +142,7 @@ CopyFromErrorCallback(void *arg)
 			/* error is relevant to a particular column */
 			char	   *attval;
 
-			attval = limit_printout_length(cstate->cur_attval);
+			attval = CopyLimitPrintoutLength(cstate->cur_attval);
 			errcontext("COPY %s, line %llu, column %s: \"%s\"",
 					   cstate->cur_relname,
 					   (unsigned long long) cstate->cur_lineno,
@@ -170,7 +169,7 @@ CopyFromErrorCallback(void *arg)
 			{
 				char	   *lineval;
 
-				lineval = limit_printout_length(cstate->line_buf.data);
+				lineval = CopyLimitPrintoutLength(cstate->line_buf.data);
 				errcontext("COPY %s, line %llu: \"%s\"",
 						   cstate->cur_relname,
 						   (unsigned long long) cstate->cur_lineno, lineval);
@@ -191,8 +190,8 @@ CopyFromErrorCallback(void *arg)
  *
  * Returns a pstrdup'd copy of the input.
  */
-static char *
-limit_printout_length(const char *str)
+char *
+CopyLimitPrintoutLength(const char *str)
 {
 #define MAX_COPY_DATA_DISPLAY 100
 
@@ -554,6 +553,13 @@ CopyMultiInsertInfoFlush(CopyMultiInsertInfo *miinfo, ResultRelInfo *curr_rri,
 		 */
 		if (buffer->resultRelInfo == curr_rri)
 		{
+			/*
+			 * The code below would misbehave if we were trying to reduce the
+			 * list to less than two items.
+			 */
+			StaticAssertDecl(MAX_PARTITION_BUFFERS >= 2,
+							 "MAX_PARTITION_BUFFERS must be >= 2");
+
 			miinfo->multiInsertBuffers = list_delete_first(miinfo->multiInsertBuffers);
 			miinfo->multiInsertBuffers = lappend(miinfo->multiInsertBuffers, buffer);
 			buffer = (CopyMultiInsertBuffer *) linitial(miinfo->multiInsertBuffers);
@@ -591,10 +597,12 @@ CopyMultiInsertInfoNextFreeSlot(CopyMultiInsertInfo *miinfo,
 								ResultRelInfo *rri)
 {
 	CopyMultiInsertBuffer *buffer = rri->ri_CopyMultiInsertBuffer;
-	int			nused = buffer->nused;
+	int			nused;
 
 	Assert(buffer != NULL);
-	Assert(nused < MAX_BUFFERED_TUPLES);
+	Assert(buffer->nused < MAX_BUFFERED_TUPLES);
+
+	nused = buffer->nused;
 
 	if (buffer->slots[nused] == NULL)
 		buffer->slots[nused] = table_slot_create(rri->ri_RelationDesc, NULL);
@@ -655,6 +663,9 @@ CopyFrom(CopyFromState cstate)
 
 	Assert(cstate->rel);
 	Assert(list_length(cstate->range_table) == 1);
+
+	if (cstate->opts.on_error != COPY_ON_ERROR_STOP)
+		Assert(cstate->escontext);
 
 	/*
 	 * The target must be a plain, foreign, or partitioned relation, or have
@@ -762,7 +773,7 @@ CopyFrom(CopyFromState cstate)
 	ExecInitResultRelation(estate, resultRelInfo, 1);
 
 	/* Verify the named relation is a valid target for INSERT */
-	CheckValidResultRel(resultRelInfo, CMD_INSERT);
+	CheckValidResultRel(resultRelInfo, CMD_INSERT, NIL);
 
 	ExecOpenIndices(resultRelInfo, false);
 
@@ -887,6 +898,9 @@ CopyFrom(CopyFromState cstate)
 		 * Can't support multi-inserts if there are any volatile function
 		 * expressions in WHERE clause.  Similarly to the trigger case above,
 		 * such expressions may query the table we're inserting into.
+		 *
+		 * Note: the whereClause was already preprocessed in DoCopy(), so it's
+		 * okay to use contain_volatile_functions() directly.
 		 */
 		insertMethod = CIM_SINGLE;
 	}
@@ -945,7 +959,7 @@ CopyFrom(CopyFromState cstate)
 
 	/* Set up callback to identify error line number */
 	errcallback.callback = CopyFromErrorCallback;
-	errcallback.arg = (void *) cstate;
+	errcallback.arg = cstate;
 	errcallback.previous = error_context_stack;
 	error_context_stack = &errcallback;
 
@@ -988,6 +1002,32 @@ CopyFrom(CopyFromState cstate)
 		/* Directly store the values/nulls array in the slot */
 		if (!NextCopyFrom(cstate, econtext, myslot->tts_values, myslot->tts_isnull))
 			break;
+
+		if (cstate->opts.on_error == COPY_ON_ERROR_IGNORE &&
+			cstate->escontext->error_occurred)
+		{
+			/*
+			 * Soft error occurred, skip this tuple and just make
+			 * ErrorSaveContext ready for the next NextCopyFrom. Since we
+			 * don't set details_wanted and error_data is not to be filled,
+			 * just resetting error_occurred is enough.
+			 */
+			cstate->escontext->error_occurred = false;
+
+			/* Report that this tuple was skipped by the ON_ERROR clause */
+			pgstat_progress_update_param(PROGRESS_COPY_TUPLES_SKIPPED,
+										 cstate->num_errors);
+
+			if (cstate->opts.reject_limit > 0 &&
+				cstate->num_errors > cstate->opts.reject_limit)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("skipped more than REJECT_LIMIT (%lld) rows due to data type incompatibility",
+								(long long) cstate->opts.reject_limit)));
+
+			/* Repeat NextCopyFrom() until no soft error occurs */
+			continue;
+		}
 
 		ExecStoreVirtualTuple(myslot);
 
@@ -1281,6 +1321,15 @@ CopyFrom(CopyFromState cstate)
 	/* Done, clean up */
 	error_context_stack = errcallback.previous;
 
+	if (cstate->opts.on_error != COPY_ON_ERROR_STOP &&
+		cstate->num_errors > 0 &&
+		cstate->opts.log_verbosity >= COPY_LOG_VERBOSITY_DEFAULT)
+		ereport(NOTICE,
+				errmsg_plural("%llu row was skipped due to data type incompatibility",
+							  "%llu rows were skipped due to data type incompatibility",
+							  (unsigned long long) cstate->num_errors,
+							  (unsigned long long) cstate->num_errors));
+
 	if (bistate != NULL)
 		FreeBulkInsertState(bistate);
 
@@ -1410,11 +1459,29 @@ BeginCopyFrom(ParseState *pstate,
 			if (!list_member_int(cstate->attnumlist, attnum))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
-						 errmsg("FORCE_NOT_NULL column \"%s\" not referenced by COPY",
-								NameStr(attr->attname))));
+				/*- translator: first %s is the name of a COPY option, e.g. FORCE_NOT_NULL */
+						 errmsg("%s column \"%s\" not referenced by COPY",
+								"FORCE_NOT_NULL", NameStr(attr->attname))));
 			cstate->opts.force_notnull_flags[attnum - 1] = true;
 		}
 	}
+
+	/* Set up soft error handler for ON_ERROR */
+	if (cstate->opts.on_error != COPY_ON_ERROR_STOP)
+	{
+		cstate->escontext = makeNode(ErrorSaveContext);
+		cstate->escontext->type = T_ErrorSaveContext;
+		cstate->escontext->error_occurred = false;
+
+		/*
+		 * Currently we only support COPY_ON_ERROR_IGNORE. We'll add other
+		 * options later
+		 */
+		if (cstate->opts.on_error == COPY_ON_ERROR_IGNORE)
+			cstate->escontext->details_wanted = false;
+	}
+	else
+		cstate->escontext = NULL;
 
 	/* Convert FORCE_NULL name list to per-column flags, check validity */
 	cstate->opts.force_null_flags = (bool *) palloc0(num_phys_attrs * sizeof(bool));
@@ -1435,8 +1502,9 @@ BeginCopyFrom(ParseState *pstate,
 			if (!list_member_int(cstate->attnumlist, attnum))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
-						 errmsg("FORCE_NULL column \"%s\" not referenced by COPY",
-								NameStr(attr->attname))));
+				/*- translator: first %s is the name of a COPY option, e.g. FORCE_NOT_NULL */
+						 errmsg("%s column \"%s\" not referenced by COPY",
+								"FORCE_NULL", NameStr(attr->attname))));
 			cstate->opts.force_null_flags[attnum - 1] = true;
 		}
 	}
@@ -1616,7 +1684,8 @@ BeginCopyFrom(ParseState *pstate,
 				 * known to be safe for use with the multi-insert
 				 * optimization. Hence we use this special case function
 				 * checker rather than the standard check for
-				 * contain_volatile_functions().
+				 * contain_volatile_functions().  Note also that we already
+				 * ran the expression through expression_planner().
 				 */
 				if (!volatile_defexprs)
 					volatile_defexprs = contain_volatile_functions_not_nextval((Node *) defexpr);

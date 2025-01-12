@@ -1,9 +1,9 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 # Test behavior with different schema on subscriber
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -48,7 +48,8 @@ is($result, qq(2|2|2), 'check initial data was copied to subscriber');
 
 # Update the rows on the publisher and check the additional columns on
 # subscriber didn't change
-$node_publisher->safe_psql('postgres', "UPDATE test_tab SET b = encode(sha256(b::bytea), 'hex')");
+$node_publisher->safe_psql('postgres',
+	"UPDATE test_tab SET b = encode(sha256(b::bytea), 'hex')");
 
 $node_publisher->wait_for_catchup('tap_sub');
 

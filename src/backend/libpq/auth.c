@@ -3,7 +3,7 @@
  * auth.c
  *	  Routines to handle network authentication
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,9 +37,7 @@
 #include "postmaster/postmaster.h"
 #include "replication/walsender.h"
 #include "storage/ipc.h"
-#include "utils/guc.h"
 #include "utils/memutils.h"
-#include "utils/timestamp.h"
 
 /*----------------------------------------------------------------
  * Global authentication functions
@@ -865,15 +863,13 @@ CheckPWChallengeAuth(Port *port, const char **logdetail)
 
 	if (shadow_pass)
 		pfree(shadow_pass);
-
-	/*
-	 * If get_role_password() returned error, return error, even if the
-	 * authentication succeeded.
-	 */
-	if (!shadow_pass)
+	else
 	{
+		/*
+		 * If get_role_password() returned error, authentication better not
+		 * have succeeded.
+		 */
 		Assert(auth_result != STATUS_OK);
-		return STATUS_ERROR;
 	}
 
 	if (auth_result == STATUS_OK)
@@ -1861,7 +1857,10 @@ auth_peer(hbaPort *port)
 	uid_t		uid;
 	gid_t		gid;
 #ifndef WIN32
+	struct passwd pwbuf;
 	struct passwd *pw;
+	char		buf[1024];
+	int			rc;
 	int			ret;
 #endif
 
@@ -1880,16 +1879,18 @@ auth_peer(hbaPort *port)
 	}
 
 #ifndef WIN32
-	errno = 0;					/* clear errno before call */
-	pw = getpwuid(uid);
-	if (!pw)
+	rc = getpwuid_r(uid, &pwbuf, buf, sizeof buf, &pw);
+	if (rc != 0)
 	{
-		int			save_errno = errno;
-
+		errno = rc;
 		ereport(LOG,
-				(errmsg("could not look up local user ID %ld: %s",
-						(long) uid,
-						save_errno ? strerror(save_errno) : _("user does not exist"))));
+				errmsg("could not look up local user ID %ld: %m", (long) uid));
+		return STATUS_ERROR;
+	}
+	else if (!pw)
+	{
+		ereport(LOG,
+				errmsg("local user with ID %ld does not exist", (long) uid));
 		return STATUS_ERROR;
 	}
 

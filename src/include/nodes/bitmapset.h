@@ -9,7 +9,7 @@
  * empty set by a NULL pointer.
  *
  *
- * Copyright (c) 2003-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2003-2025, PostgreSQL Global Development Group
  *
  * src/include/nodes/bitmapset.h
  *
@@ -73,6 +73,19 @@ typedef enum
 	BMS_MULTIPLE,				/* >1 member */
 } BMS_Membership;
 
+/* Select appropriate bit-twiddling functions for bitmap word size */
+#if BITS_PER_BITMAPWORD == 32
+#define bmw_leftmost_one_pos(w)		pg_leftmost_one_pos32(w)
+#define bmw_rightmost_one_pos(w)	pg_rightmost_one_pos32(w)
+#define bmw_popcount(w)				pg_popcount32(w)
+#elif BITS_PER_BITMAPWORD == 64
+#define bmw_leftmost_one_pos(w)		pg_leftmost_one_pos64(w)
+#define bmw_rightmost_one_pos(w)	pg_rightmost_one_pos64(w)
+#define bmw_popcount(w)				pg_popcount64(w)
+#else
+#error "invalid BITS_PER_BITMAPWORD"
+#endif
+
 
 /*
  * function prototypes in nodes/bitmapset.c
@@ -109,6 +122,7 @@ extern BMS_Membership bms_membership(const Bitmapset *a);
 extern Bitmapset *bms_add_member(Bitmapset *a, int x);
 extern Bitmapset *bms_del_member(Bitmapset *a, int x);
 extern Bitmapset *bms_add_members(Bitmapset *a, const Bitmapset *b);
+extern Bitmapset *bms_replace_members(Bitmapset *a, const Bitmapset *b);
 extern Bitmapset *bms_add_range(Bitmapset *a, int lower, int upper);
 extern Bitmapset *bms_int_members(Bitmapset *a, const Bitmapset *b);
 extern Bitmapset *bms_del_members(Bitmapset *a, const Bitmapset *b);

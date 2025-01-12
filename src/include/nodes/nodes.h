@@ -4,7 +4,7 @@
  *	  Definitions for tagged nodes.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/nodes.h
@@ -139,39 +139,18 @@ typedef struct Node
  *
  * !WARNING!: Avoid using newNode directly. You should be using the
  *	  macro makeNode.  eg. to create a Query node, use makeNode(Query)
- *
- * Note: the size argument should always be a compile-time constant, so the
- * apparent risk of multiple evaluation doesn't matter in practice.
  */
-#ifdef __GNUC__
+static inline Node *
+newNode(size_t size, NodeTag tag)
+{
+	Node	   *result;
 
-/* With GCC, we can use a compound statement within an expression */
-#define newNode(size, tag) \
-({	Node   *_result; \
-	AssertMacro((size) >= sizeof(Node));		/* need the tag, at least */ \
-	_result = (Node *) palloc0fast(size); \
-	_result->type = (tag); \
-	_result; \
-})
-#else
+	Assert(size >= sizeof(Node));	/* need the tag, at least */
+	result = (Node *) palloc0(size);
+	result->type = tag;
 
-/*
- *	There is no way to dereference the palloc'ed pointer to assign the
- *	tag, and also return the pointer itself, so we need a holder variable.
- *	Fortunately, this macro isn't recursive so we just define
- *	a global variable for this purpose.
- */
-extern PGDLLIMPORT Node *newNodeMacroHolder;
-
-#define newNode(size, tag) \
-( \
-	AssertMacro((size) >= sizeof(Node)),		/* need the tag, at least */ \
-	newNodeMacroHolder = (Node *) palloc0fast(size), \
-	newNodeMacroHolder->type = (tag), \
-	newNodeMacroHolder \
-)
-#endif							/* __GNUC__ */
-
+	return result;
+}
 
 #define makeNode(_type_)		((_type_ *) newNode(sizeof(_type_),T_##_type_))
 #define NodeSetTag(nodeptr,t)	(((Node*)(nodeptr))->type = (t))
@@ -216,13 +195,14 @@ extern void outBitmapset(struct StringInfoData *str,
 extern void outDatum(struct StringInfoData *str, uintptr_t value,
 					 int typlen, bool typbyval);
 extern char *nodeToString(const void *obj);
+extern char *nodeToStringWithLocations(const void *obj);
 extern char *bmsToString(const struct Bitmapset *bms);
 
 /*
  * nodes/{readfuncs.c,read.c}
  */
 extern void *stringToNode(const char *str);
-#ifdef WRITE_READ_PARSE_PLAN_TREES
+#ifdef DEBUG_NODE_TESTS_ENABLED
 extern void *stringToNodeWithLocations(const char *str);
 #endif
 extern struct Bitmapset *readBitmapset(void);
@@ -251,9 +231,18 @@ extern bool equal(const void *a, const void *b);
 
 
 /*
- * Typedefs for identifying qualifier selectivities and plan costs as such.
- * These are just plain "double"s, but declaring a variable as Selectivity
- * or Cost makes the intent more obvious.
+ * Typedef for parse location.  This is just an int, but this way
+ * gen_node_support.pl knows which fields should get special treatment for
+ * location values.
+ *
+ * -1 is used for unknown.
+ */
+typedef int ParseLoc;
+
+/*
+ * Typedefs for identifying qualifier selectivities, plan costs, and row
+ * counts as such.  These are just plain "double"s, but declaring a variable
+ * as Selectivity, Cost, or Cardinality makes the intent more obvious.
  *
  * These could have gone into plannodes.h or some such, but many files
  * depend on them...
@@ -317,6 +306,7 @@ typedef enum JoinType
 	 */
 	JOIN_SEMI,					/* 1 copy of each LHS row that has match(es) */
 	JOIN_ANTI,					/* 1 copy of each LHS row that has no match */
+	JOIN_RIGHT_SEMI,			/* 1 copy of each RHS row that has match(es) */
 	JOIN_RIGHT_ANTI,			/* 1 copy of each RHS row that has no match */
 
 	/*
@@ -333,10 +323,10 @@ typedef enum JoinType
 
 /*
  * OUTER joins are those for which pushed-down quals must behave differently
- * from the join's own quals.  This is in fact everything except INNER and
- * SEMI joins.  However, this macro must also exclude the JOIN_UNIQUE symbols
- * since those are temporary proxies for what will eventually be an INNER
- * join.
+ * from the join's own quals.  This is in fact everything except INNER, SEMI
+ * and RIGHT_SEMI joins.  However, this macro must also exclude the
+ * JOIN_UNIQUE symbols since those are temporary proxies for what will
+ * eventually be an INNER join.
  *
  * Note: semijoins are a hybrid case, but we choose to treat them as not
  * being outer joins.  This is okay principally because the SQL syntax makes
@@ -440,7 +430,6 @@ typedef enum LimitOption
 {
 	LIMIT_OPTION_COUNT,			/* FETCH FIRST... ONLY */
 	LIMIT_OPTION_WITH_TIES,		/* FETCH FIRST... WITH TIES */
-	LIMIT_OPTION_DEFAULT,		/* No limit present */
 } LimitOption;
 
 #endif							/* NODES_H */

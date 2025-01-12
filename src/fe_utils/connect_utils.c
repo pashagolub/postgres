@@ -2,7 +2,7 @@
  *
  * Facilities for frontend code to connect to and disconnect from databases.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/fe_utils/connect_utils.c
@@ -157,19 +157,14 @@ connectMaintenanceDatabase(ConnParams *cparams,
 void
 disconnectDatabase(PGconn *conn)
 {
-	char		errbuf[256];
-
 	Assert(conn != NULL);
 
 	if (PQtransactionStatus(conn) == PQTRANS_ACTIVE)
 	{
-		PGcancel   *cancel;
+		PGcancelConn *cancelConn = PQcancelCreate(conn);
 
-		if ((cancel = PQgetCancel(conn)))
-		{
-			(void) PQcancel(cancel, errbuf, sizeof(errbuf));
-			PQfreeCancel(cancel);
-		}
+		(void) PQcancelBlocking(cancelConn);
+		PQcancelFinish(cancelConn);
 	}
 
 	PQfinish(conn);

@@ -3,7 +3,7 @@
  * jsonb_util.c
  *	  converting between Jsonb and JsonbValues, and iterating.
  *
- * Copyright (c) 2014-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2025, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -14,13 +14,11 @@
 #include "postgres.h"
 
 #include "catalog/pg_collation.h"
-#include "catalog/pg_type.h"
 #include "common/hashfn.h"
-#include "common/jsonapi.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
-#include "utils/builtins.h"
 #include "utils/datetime.h"
+#include "utils/fmgrprotos.h"
 #include "utils/json.h"
 #include "utils/jsonb.h"
 #include "utils/memutils.h"
@@ -248,6 +246,13 @@ compareJsonbContainers(JsonbContainer *a, JsonbContainer *b)
 						 */
 						if (va.val.array.rawScalar != vb.val.array.rawScalar)
 							res = (va.val.array.rawScalar) ? -1 : 1;
+
+						/*
+						 * There should be an "else" here, to prevent us from
+						 * overriding the above, but we can't change the sort
+						 * order now, so there is a mild anomaly that an empty
+						 * top level array sorts less than null.
+						 */
 						if (va.val.array.nElems != vb.val.array.nElems)
 							res = (va.val.array.nElems > vb.val.array.nElems) ? 1 : -1;
 						break;

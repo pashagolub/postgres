@@ -4,7 +4,7 @@
  *
  * Author: Magnus Hagander <magnus@hagander.net>
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/bin/pg_basebackup/pg_basebackup.c
@@ -26,8 +26,8 @@
 #endif
 
 #include "access/xlog_internal.h"
+#include "astreamer_inject.h"
 #include "backup/basebackup.h"
-#include "bbstreamer.h"
 #include "common/compression.h"
 #include "common/file_perm.h"
 #include "common/file_utils.h"
@@ -57,8 +57,8 @@ typedef struct ArchiveStreamState
 {
 	int			tablespacenum;
 	pg_compress_specification *compress;
-	bbstreamer *streamer;
-	bbstreamer *manifest_inject_streamer;
+	astreamer  *streamer;
+	astreamer  *manifest_inject_streamer;
 	PQExpBuffer manifest_buffer;
 	char		manifest_filename[MAXPGPATH];
 	FILE	   *manifest_file;
@@ -67,7 +67,7 @@ typedef struct ArchiveStreamState
 typedef struct WriteTarState
 {
 	int			tablespacenum;
-	bbstreamer *streamer;
+	astreamer  *streamer;
 } WriteTarState;
 
 typedef struct WriteManifestState
@@ -100,6 +100,11 @@ typedef void (*WriteDataCallback) (size_t nbytes, char *buf,
  * terminated.
  */
 #define MINIMUM_VERSION_FOR_TERMINATED_TARFILE 150000
+
+/*
+ * pg_wal/summaries exists beginning with version 17.
+ */
+#define MINIMUM_VERSION_FOR_WAL_SUMMARIES 170000
 
 /*
  * Different ways to include WAL
@@ -194,11 +199,11 @@ static void verify_dir_is_empty_or_create(char *dirname, bool *created, bool *fo
 static void progress_update_filename(const char *filename);
 static void progress_report(int tablespacenum, bool force, bool finished);
 
-static bbstreamer *CreateBackupStreamer(char *archive_name, char *spclocation,
-										bbstreamer **manifest_inject_streamer_p,
-										bool is_recovery_guc_supported,
-										bool expect_unterminated_tarfile,
-										pg_compress_specification *compress);
+static astreamer *CreateBackupStreamer(char *archive_name, char *spclocation,
+									   astreamer **manifest_inject_streamer_p,
+									   bool is_recovery_guc_supported,
+									   bool expect_unterminated_tarfile,
+									   pg_compress_specification *compress);
 static void ReceiveArchiveStreamChunk(size_t r, char *copybuf,
 									  void *callback_data);
 static char GetCopyDataByte(size_t r, char *copybuf, size_t *cursor);
@@ -217,7 +222,8 @@ static void ReceiveBackupManifestInMemoryChunk(size_t r, char *copybuf,
 											   void *callback_data);
 static void BaseBackup(char *compression_algorithm, char *compression_detail,
 					   CompressionLocation compressloc,
-					   pg_compress_specification *client_compress);
+					   pg_compress_specification *client_compress,
+					   char *incremental_manifest);
 
 static bool reached_end_position(XLogRecPtr segendpos, uint32 timeline,
 								 bool segment_finished);
@@ -390,6 +396,8 @@ usage(void)
 	printf(_("\nOptions controlling the output:\n"));
 	printf(_("  -D, --pgdata=DIRECTORY receive base backup into directory\n"));
 	printf(_("  -F, --format=p|t       output format (plain (default), tar)\n"));
+	printf(_("  -i, --incremental=OLDMANIFEST\n"
+			 "                         take incremental backup\n"));
 	printf(_("  -r, --max-rate=RATE    maximum transfer rate to transfer data directory\n"
 			 "                         (in kB/s, or use suffix \"k\" or \"M\")\n"));
 	printf(_("  -R, --write-recovery-conf\n"
@@ -407,7 +415,7 @@ usage(void)
 	printf(_("  -Z, --compress=none    do not compress tar output\n"));
 	printf(_("\nGeneral options:\n"));
 	printf(_("  -c, --checkpoint=fast|spread\n"
-			 "                         set fast or spread checkpointing\n"));
+			 "                         set fast or spread (default) checkpointing\n"));
 	printf(_("  -C, --create-slot      create replication slot\n"));
 	printf(_("  -l, --label=LABEL      set backup label\n"));
 	printf(_("  -n, --no-clean         do not clean up after errors\n"));
@@ -688,6 +696,21 @@ StartLogStreamer(char *startpos, uint32 timeline, char *sysidentifier,
 
 		if (pg_mkdir_p(statusdir, pg_dir_create_mode) != 0 && errno != EEXIST)
 			pg_fatal("could not create directory \"%s\": %m", statusdir);
+
+		/*
+		 * For newer server versions, likewise create pg_wal/summaries
+		 */
+		if (PQserverVersion(conn) >= MINIMUM_VERSION_FOR_WAL_SUMMARIES)
+		{
+			char		summarydir[MAXPGPATH];
+
+			snprintf(summarydir, sizeof(summarydir), "%s/%s/summaries",
+					 basedir, "pg_wal");
+
+			if (pg_mkdir_p(summarydir, pg_dir_create_mode) != 0 &&
+				errno != EEXIST)
+				pg_fatal("could not create directory \"%s\": %m", summarydir);
+		}
 	}
 
 	/*
@@ -1030,19 +1053,19 @@ ReceiveCopyData(PGconn *conn, WriteDataCallback callback,
  * the options selected by the user.  We may just write the results directly
  * to a file, or we might compress first, or we might extract the tar file
  * and write each member separately. This function doesn't do any of that
- * directly, but it works out what kind of bbstreamer we need to create so
+ * directly, but it works out what kind of astreamer we need to create so
  * that the right stuff happens when, down the road, we actually receive
  * the data.
  */
-static bbstreamer *
+static astreamer *
 CreateBackupStreamer(char *archive_name, char *spclocation,
-					 bbstreamer **manifest_inject_streamer_p,
+					 astreamer **manifest_inject_streamer_p,
 					 bool is_recovery_guc_supported,
 					 bool expect_unterminated_tarfile,
 					 pg_compress_specification *compress)
 {
-	bbstreamer *streamer = NULL;
-	bbstreamer *manifest_inject_streamer = NULL;
+	astreamer  *streamer = NULL;
+	astreamer  *manifest_inject_streamer = NULL;
 	bool		inject_manifest;
 	bool		is_tar,
 				is_tar_gz,
@@ -1137,9 +1160,9 @@ CreateBackupStreamer(char *archive_name, char *spclocation,
 			directory = psprintf("%s/%s", basedir, spclocation);
 		else
 			directory = get_tablespace_mapping(spclocation);
-		streamer = bbstreamer_extractor_new(directory,
-											get_tablespace_mapping,
-											progress_update_filename);
+		streamer = astreamer_extractor_new(directory,
+										   get_tablespace_mapping,
+										   progress_update_filename);
 	}
 	else
 	{
@@ -1165,27 +1188,27 @@ CreateBackupStreamer(char *archive_name, char *spclocation,
 		}
 
 		if (compress->algorithm == PG_COMPRESSION_NONE)
-			streamer = bbstreamer_plain_writer_new(archive_filename,
-												   archive_file);
+			streamer = astreamer_plain_writer_new(archive_filename,
+												  archive_file);
 		else if (compress->algorithm == PG_COMPRESSION_GZIP)
 		{
 			strlcat(archive_filename, ".gz", sizeof(archive_filename));
-			streamer = bbstreamer_gzip_writer_new(archive_filename,
-												  archive_file, compress);
+			streamer = astreamer_gzip_writer_new(archive_filename,
+												 archive_file, compress);
 		}
 		else if (compress->algorithm == PG_COMPRESSION_LZ4)
 		{
 			strlcat(archive_filename, ".lz4", sizeof(archive_filename));
-			streamer = bbstreamer_plain_writer_new(archive_filename,
-												   archive_file);
-			streamer = bbstreamer_lz4_compressor_new(streamer, compress);
+			streamer = astreamer_plain_writer_new(archive_filename,
+												  archive_file);
+			streamer = astreamer_lz4_compressor_new(streamer, compress);
 		}
 		else if (compress->algorithm == PG_COMPRESSION_ZSTD)
 		{
 			strlcat(archive_filename, ".zst", sizeof(archive_filename));
-			streamer = bbstreamer_plain_writer_new(archive_filename,
-												   archive_file);
-			streamer = bbstreamer_zstd_compressor_new(streamer, compress);
+			streamer = astreamer_plain_writer_new(archive_filename,
+												  archive_file);
+			streamer = astreamer_zstd_compressor_new(streamer, compress);
 		}
 		else
 		{
@@ -1199,7 +1222,7 @@ CreateBackupStreamer(char *archive_name, char *spclocation,
 		 * into it.
 		 */
 		if (must_parse_archive)
-			streamer = bbstreamer_tar_archiver_new(streamer);
+			streamer = astreamer_tar_archiver_new(streamer);
 		progress_update_filename(archive_filename);
 	}
 
@@ -1218,9 +1241,9 @@ CreateBackupStreamer(char *archive_name, char *spclocation,
 	if (spclocation == NULL && writerecoveryconf)
 	{
 		Assert(must_parse_archive);
-		streamer = bbstreamer_recovery_injector_new(streamer,
-													is_recovery_guc_supported,
-													recoveryconfcontents);
+		streamer = astreamer_recovery_injector_new(streamer,
+												   is_recovery_guc_supported,
+												   recoveryconfcontents);
 	}
 
 	/*
@@ -1230,9 +1253,9 @@ CreateBackupStreamer(char *archive_name, char *spclocation,
 	 * we're talking to such a server we'll need to add the terminator here.
 	 */
 	if (must_parse_archive)
-		streamer = bbstreamer_tar_parser_new(streamer);
+		streamer = astreamer_tar_parser_new(streamer);
 	else if (expect_unterminated_tarfile)
-		streamer = bbstreamer_tar_terminator_new(streamer);
+		streamer = astreamer_tar_terminator_new(streamer);
 
 	/*
 	 * If the user has requested a server compressed archive along with
@@ -1241,11 +1264,11 @@ CreateBackupStreamer(char *archive_name, char *spclocation,
 	if (format == 'p')
 	{
 		if (is_tar_gz)
-			streamer = bbstreamer_gzip_decompressor_new(streamer);
+			streamer = astreamer_gzip_decompressor_new(streamer);
 		else if (is_tar_lz4)
-			streamer = bbstreamer_lz4_decompressor_new(streamer);
+			streamer = astreamer_lz4_decompressor_new(streamer);
 		else if (is_tar_zstd)
-			streamer = bbstreamer_zstd_decompressor_new(streamer);
+			streamer = astreamer_zstd_decompressor_new(streamer);
 	}
 
 	/* Return the results. */
@@ -1284,10 +1307,10 @@ ReceiveArchiveStream(PGconn *conn, pg_compress_specification *compress)
 	if (state.manifest_inject_streamer != NULL &&
 		state.manifest_buffer != NULL)
 	{
-		bbstreamer_inject_file(state.manifest_inject_streamer,
-							   "backup_manifest",
-							   state.manifest_buffer->data,
-							   state.manifest_buffer->len);
+		astreamer_inject_file(state.manifest_inject_streamer,
+							  "backup_manifest",
+							  state.manifest_buffer->data,
+							  state.manifest_buffer->len);
 		destroyPQExpBuffer(state.manifest_buffer);
 		state.manifest_buffer = NULL;
 	}
@@ -1295,8 +1318,8 @@ ReceiveArchiveStream(PGconn *conn, pg_compress_specification *compress)
 	/* If there's still an archive in progress, end processing. */
 	if (state.streamer != NULL)
 	{
-		bbstreamer_finalize(state.streamer);
-		bbstreamer_free(state.streamer);
+		astreamer_finalize(state.streamer);
+		astreamer_free(state.streamer);
 		state.streamer = NULL;
 	}
 }
@@ -1360,8 +1383,8 @@ ReceiveArchiveStreamChunk(size_t r, char *copybuf, void *callback_data)
 				/* End processing of any prior archive. */
 				if (state->streamer != NULL)
 				{
-					bbstreamer_finalize(state->streamer);
-					bbstreamer_free(state->streamer);
+					astreamer_finalize(state->streamer);
+					astreamer_free(state->streamer);
 					state->streamer = NULL;
 				}
 
@@ -1414,8 +1437,8 @@ ReceiveArchiveStreamChunk(size_t r, char *copybuf, void *callback_data)
 				else if (state->streamer != NULL)
 				{
 					/* Archive data. */
-					bbstreamer_content(state->streamer, NULL, copybuf + 1,
-									   r - 1, BBSTREAMER_UNKNOWN);
+					astreamer_content(state->streamer, NULL, copybuf + 1,
+									  r - 1, ASTREAMER_UNKNOWN);
 				}
 				else
 					pg_fatal("unexpected payload data");
@@ -1577,7 +1600,7 @@ ReceiveTarFile(PGconn *conn, char *archive_name, char *spclocation,
 			   bool tablespacenum, pg_compress_specification *compress)
 {
 	WriteTarState state;
-	bbstreamer *manifest_inject_streamer;
+	astreamer  *manifest_inject_streamer;
 	bool		is_recovery_guc_supported;
 	bool		expect_unterminated_tarfile;
 
@@ -1613,16 +1636,16 @@ ReceiveTarFile(PGconn *conn, char *archive_name, char *spclocation,
 			pg_fatal("out of memory");
 
 		/* Inject it into the output tarfile. */
-		bbstreamer_inject_file(manifest_inject_streamer, "backup_manifest",
-							   buf.data, buf.len);
+		astreamer_inject_file(manifest_inject_streamer, "backup_manifest",
+							  buf.data, buf.len);
 
 		/* Free memory. */
 		termPQExpBuffer(&buf);
 	}
 
 	/* Cleanup. */
-	bbstreamer_finalize(state.streamer);
-	bbstreamer_free(state.streamer);
+	astreamer_finalize(state.streamer);
+	astreamer_free(state.streamer);
 
 	progress_report(tablespacenum, true, false);
 
@@ -1640,7 +1663,7 @@ ReceiveTarCopyChunk(size_t r, char *copybuf, void *callback_data)
 {
 	WriteTarState *state = callback_data;
 
-	bbstreamer_content(state->streamer, NULL, copybuf, r, BBSTREAMER_UNKNOWN);
+	astreamer_content(state->streamer, NULL, copybuf, r, ASTREAMER_UNKNOWN);
 
 	totaldone += r;
 	progress_report(state->tablespacenum, false, false);
@@ -1728,7 +1751,9 @@ ReceiveBackupManifestInMemoryChunk(size_t r, char *copybuf,
 
 static void
 BaseBackup(char *compression_algorithm, char *compression_detail,
-		   CompressionLocation compressloc, pg_compress_specification *client_compress)
+		   CompressionLocation compressloc,
+		   pg_compress_specification *client_compress,
+		   char *incremental_manifest)
 {
 	PGresult   *res;
 	char	   *sysidentifier;
@@ -1782,10 +1807,18 @@ BaseBackup(char *compression_algorithm, char *compression_detail,
 	}
 
 	/*
-	 * Build contents of configuration file if requested
+	 * Build contents of configuration file if requested.
+	 *
+	 * Note that we don't use the dbname from key-value pair in conn as that
+	 * would have been filled by the default dbname (dbname=replication) in
+	 * case the user didn't specify the one. The dbname written in the config
+	 * file as part of primary_conninfo would be used by slotsync worker which
+	 * doesn't use a replication connection so the default won't work for it.
 	 */
 	if (writerecoveryconf)
-		recoveryconfcontents = GenerateRecoveryConfig(conn, replication_slot);
+		recoveryconfcontents = GenerateRecoveryConfig(conn,
+													  replication_slot,
+													  GetDbnameFromConnectionOptions());
 
 	/*
 	 * Run IDENTIFY_SYSTEM so we can get the timeline
@@ -1794,7 +1827,76 @@ BaseBackup(char *compression_algorithm, char *compression_detail,
 		exit(1);
 
 	/*
-	 * Start the actual backup
+	 * If the user wants an incremental backup, we must upload the manifest
+	 * for the previous backup upon which it is to be based.
+	 */
+	if (incremental_manifest != NULL)
+	{
+		int			fd;
+		char		mbuf[65536];
+		int			nbytes;
+
+		/* Reject if server is too old. */
+		if (serverVersion < MINIMUM_VERSION_FOR_WAL_SUMMARIES)
+			pg_fatal("server does not support incremental backup");
+
+		/* Open the file. */
+		fd = open(incremental_manifest, O_RDONLY | PG_BINARY, 0);
+		if (fd < 0)
+			pg_fatal("could not open file \"%s\": %m", incremental_manifest);
+
+		/* Tell the server what we want to do. */
+		if (PQsendQuery(conn, "UPLOAD_MANIFEST") == 0)
+			pg_fatal("could not send replication command \"%s\": %s",
+					 "UPLOAD_MANIFEST", PQerrorMessage(conn));
+		res = PQgetResult(conn);
+		if (PQresultStatus(res) != PGRES_COPY_IN)
+		{
+			if (PQresultStatus(res) == PGRES_FATAL_ERROR)
+				pg_fatal("could not upload manifest: %s",
+						 PQerrorMessage(conn));
+			else
+				pg_fatal("could not upload manifest: unexpected status %s",
+						 PQresStatus(PQresultStatus(res)));
+		}
+
+		/* Loop, reading from the file and sending the data to the server. */
+		while ((nbytes = read(fd, mbuf, sizeof mbuf)) > 0)
+		{
+			if (PQputCopyData(conn, mbuf, nbytes) < 0)
+				pg_fatal("could not send COPY data: %s",
+						 PQerrorMessage(conn));
+		}
+
+		/* Bail out if we exited the loop due to an error. */
+		if (nbytes < 0)
+			pg_fatal("could not read file \"%s\": %m", incremental_manifest);
+
+		/* End the COPY operation. */
+		if (PQputCopyEnd(conn, NULL) < 0)
+			pg_fatal("could not send end-of-COPY: %s",
+					 PQerrorMessage(conn));
+
+		/* See whether the server is happy with what we sent. */
+		res = PQgetResult(conn);
+		if (PQresultStatus(res) == PGRES_FATAL_ERROR)
+			pg_fatal("could not upload manifest: %s",
+					 PQerrorMessage(conn));
+		else if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			pg_fatal("could not upload manifest: unexpected status %s",
+					 PQresStatus(PQresultStatus(res)));
+
+		/* Consume ReadyForQuery message from server. */
+		res = PQgetResult(conn);
+		if (res != NULL)
+			pg_fatal("unexpected extra result while sending manifest");
+
+		/* Add INCREMENTAL option to BASE_BACKUP command. */
+		AppendPlainCommandOption(&buf, use_new_option_syntax, "INCREMENTAL");
+	}
+
+	/*
+	 * Continue building up the options list for the BASE_BACKUP command.
 	 */
 	AppendStringCommandOption(&buf, use_new_option_syntax, "LABEL", label);
 	if (estimatesize)
@@ -1901,6 +2003,7 @@ BaseBackup(char *compression_algorithm, char *compression_detail,
 	else
 		basebkp = psprintf("BASE_BACKUP %s", buf.data);
 
+	/* OK, try to start the backup. */
 	if (PQsendQuery(conn, basebkp) == 0)
 		pg_fatal("could not send replication command \"%s\": %s",
 				 "BASE_BACKUP", PQerrorMessage(conn));
@@ -1953,7 +2056,7 @@ BaseBackup(char *compression_algorithm, char *compression_detail,
 	tablespacecount = PQntuples(res);
 	for (i = 0; i < PQntuples(res); i++)
 	{
-		totalsize_kb += atol(PQgetvalue(res, i, 2));
+		totalsize_kb += atoll(PQgetvalue(res, i, 2));
 
 		/*
 		 * Verify tablespace directories are empty. Don't bother with the
@@ -2256,6 +2359,7 @@ main(int argc, char **argv)
 		{"version", no_argument, NULL, 'V'},
 		{"pgdata", required_argument, NULL, 'D'},
 		{"format", required_argument, NULL, 'F'},
+		{"incremental", required_argument, NULL, 'i'},
 		{"checkpoint", required_argument, NULL, 'c'},
 		{"create-slot", no_argument, NULL, 'C'},
 		{"max-rate", required_argument, NULL, 'r'},
@@ -2293,6 +2397,7 @@ main(int argc, char **argv)
 	int			option_index;
 	char	   *compression_algorithm = "none";
 	char	   *compression_detail = NULL;
+	char	   *incremental_manifest = NULL;
 	CompressionLocation compressloc = COMPRESS_LOCATION_UNSPECIFIED;
 	pg_compress_specification client_compress;
 
@@ -2317,7 +2422,7 @@ main(int argc, char **argv)
 
 	atexit(cleanup_directories_atexit);
 
-	while ((c = getopt_long(argc, argv, "c:Cd:D:F:h:l:nNp:Pr:Rs:S:t:T:U:vwWX:zZ:",
+	while ((c = getopt_long(argc, argv, "c:Cd:D:F:h:i:l:nNp:Pr:Rs:S:t:T:U:vwWX:zZ:",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -2351,6 +2456,9 @@ main(int argc, char **argv)
 				break;
 			case 'h':
 				dbhost = pg_strdup(optarg);
+				break;
+			case 'i':
+				incremental_manifest = pg_strdup(optarg);
 				break;
 			case 'l':
 				label = pg_strdup(optarg);
@@ -2765,7 +2873,7 @@ main(int argc, char **argv)
 	}
 
 	BaseBackup(compression_algorithm, compression_detail, compressloc,
-			   &client_compress);
+			   &client_compress, incremental_manifest);
 
 	success = true;
 	return 0;

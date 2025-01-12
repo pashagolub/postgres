@@ -200,10 +200,14 @@ SELECT d1 - timestamp with time zone '1997-01-02' AS diff
    FROM TIMESTAMPTZ_TBL WHERE d1 BETWEEN '1902-01-01' AND '2038-01-01';
 
 SELECT date_trunc( 'week', timestamp with time zone '2004-02-29 15:44:17.71393' ) AS week_trunc;
+SELECT date_trunc( 'ago', timestamp with time zone 'infinity' ) AS invalid_trunc;
 
 SELECT date_trunc('day', timestamp with time zone '2001-02-16 20:38:40+00', 'Australia/Sydney') as sydney_trunc;  -- zone name
 SELECT date_trunc('day', timestamp with time zone '2001-02-16 20:38:40+00', 'GMT') as gmt_trunc;  -- fixed-offset abbreviation
 SELECT date_trunc('day', timestamp with time zone '2001-02-16 20:38:40+00', 'VET') as vet_trunc;  -- variable-offset abbreviation
+SELECT date_trunc('ago', timestamp with time zone 'infinity', 'GMT') AS invalid_zone_trunc;
+
+
 
 -- verify date_bin behaves the same as date_trunc for relevant intervals
 SELECT
@@ -243,6 +247,9 @@ FROM (
 -- shift bins using the origin parameter:
 SELECT date_bin('5 min'::interval, timestamptz '2020-02-01 01:01:01+00', timestamptz '2020-02-01 00:02:30+00');
 
+-- test roundoff edge case when source < origin
+SELECT date_bin('30 minutes'::interval, timestamptz '2024-02-01 15:00:00', timestamptz '2024-02-01 17:00:00');
+
 -- disallow intervals with months or years
 SELECT date_bin('5 months'::interval, timestamp with time zone '2020-02-01 01:01:01+00', timestamp with time zone '2001-01-01+00');
 SELECT date_bin('5 years'::interval,  timestamp with time zone '2020-02-01 01:01:01+00', timestamp with time zone '2001-01-01+00');
@@ -252,6 +259,11 @@ SELECT date_bin('0 days'::interval, timestamp with time zone '1970-01-01 01:00:0
 
 -- disallow negative intervals
 SELECT date_bin('-2 days'::interval, timestamp with time zone '1970-01-01 01:00:00+00' , timestamp with time zone '1970-01-01 00:00:00+00');
+
+-- test overflow cases
+select date_bin('15 minutes'::interval, timestamptz '294276-12-30', timestamptz '4000-12-20 BC');
+select date_bin('200000000 days'::interval, '2024-02-01'::timestamptz, '2024-01-01'::timestamptz);
+select date_bin('365000 days'::interval, '4400-01-01 BC'::timestamptz, '4000-01-01 BC'::timestamptz);
 
 -- Test casting within a BETWEEN qualifier
 SELECT d1 - timestamp with time zone '1997-01-02' AS diff
@@ -441,7 +453,10 @@ SELECT make_timestamptz(1910, 12, 24, 0, 0, 0, 'Nehwon/Lankhmar');
 -- abbreviations
 SELECT make_timestamptz(2008, 12, 10, 10, 10, 10, 'EST');
 SELECT make_timestamptz(2008, 12, 10, 10, 10, 10, 'EDT');
-SELECT make_timestamptz(2014, 12, 10, 10, 10, 10, 'PST8PDT');
+SELECT make_timestamptz(2014, 12, 10, 10, 10, 10, 'FOO8BAR');
+
+-- POSIX
+SELECT make_timestamptz(2014, 12, 10, 10, 10, 10, 'PST8PDT,M3.2.0,M11.1.0');
 
 RESET TimeZone;
 
@@ -458,6 +473,8 @@ select generate_series('2022-01-01 00:00'::timestamptz,
 select * from generate_series('2020-01-01 00:00'::timestamptz,
                               '2020-01-02 03:00'::timestamptz,
                               '0 hour'::interval);
+select generate_series(timestamptz '1995-08-06 12:12:12', timestamptz '1996-08-06 12:12:12', interval 'infinity');
+select generate_series(timestamptz '1995-08-06 12:12:12', timestamptz '1996-08-06 12:12:12', interval '-infinity');
 
 -- Interval crossing time shift for Europe/Warsaw timezone (with DST)
 SET TimeZone to 'UTC';
@@ -642,3 +659,23 @@ insert into tmptz values ('2017-01-18 00:00+00');
 explain (costs off)
 select * from tmptz where f1 at time zone 'utc' = '2017-01-18 00:00';
 select * from tmptz where f1 at time zone 'utc' = '2017-01-18 00:00';
+
+-- test arithmetic with infinite timestamps
+SELECT timestamptz 'infinity' - timestamptz 'infinity';
+SELECT timestamptz 'infinity' - timestamptz '-infinity';
+SELECT timestamptz '-infinity' - timestamptz 'infinity';
+SELECT timestamptz '-infinity' - timestamptz '-infinity';
+SELECT timestamptz 'infinity' - timestamptz '1995-08-06 12:12:12';
+SELECT timestamptz '-infinity' - timestamptz '1995-08-06 12:12:12';
+
+-- test age() with infinite timestamps
+SELECT age(timestamptz 'infinity');
+SELECT age(timestamptz '-infinity');
+SELECT age(timestamptz 'infinity', timestamptz 'infinity');
+SELECT age(timestamptz 'infinity', timestamptz '-infinity');
+SELECT age(timestamptz '-infinity', timestamptz 'infinity');
+SELECT age(timestamptz '-infinity', timestamptz '-infinity');
+
+-- test timestamp near POSTGRES_EPOCH_JDATE
+select timestamptz '1999-12-31 24:00:00';
+select make_timestamptz(1999, 12, 31, 24, 0, 0);

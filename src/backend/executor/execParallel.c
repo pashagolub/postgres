@@ -3,7 +3,7 @@
  * execParallel.c
  *	  Support routines for parallel execution.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * This file contains routines that are intended to support setting up,
@@ -43,12 +43,10 @@
 #include "jit/jit.h"
 #include "nodes/nodeFuncs.h"
 #include "pgstat.h"
-#include "storage/spin.h"
 #include "tcop/tcopprot.h"
 #include "utils/datum.h"
 #include "utils/dsa.h"
 #include "utils/lsyscache.h"
-#include "utils/memutils.h"
 #include "utils/snapmgr.h"
 
 /*
@@ -722,6 +720,13 @@ ExecInitParallelPlan(PlanState *planstate, EState *estate,
 	shm_toc_estimate_chunk(&pcxt->estimator, dsa_minsize);
 	shm_toc_estimate_keys(&pcxt->estimator, 1);
 
+	/*
+	 * InitializeParallelDSM() passes the active snapshot to the parallel
+	 * worker, which uses it to set es_snapshot.  Make sure we don't set
+	 * es_snapshot differently in the child.
+	 */
+	Assert(GetActiveSnapshot() == estate->es_snapshot);
+
 	/* Everyone's had a chance to ask for space, so now create the DSM. */
 	InitializeParallelDSM(pcxt);
 
@@ -1070,6 +1075,9 @@ ExecParallelRetrieveInstrumentation(PlanState *planstate,
 			break;
 		case T_MemoizeState:
 			ExecMemoizeRetrieveInstrumentation((MemoizeState *) planstate);
+			break;
+		case T_BitmapHeapScanState:
+			ExecBitmapHeapRetrieveInstrumentation((BitmapHeapScanState *) planstate);
 			break;
 		default:
 			break;
@@ -1463,8 +1471,7 @@ ParallelQueryMain(dsm_segment *seg, shm_toc *toc)
 	 */
 	ExecutorRun(queryDesc,
 				ForwardScanDirection,
-				fpes->tuples_needed < 0 ? (int64) 0 : fpes->tuples_needed,
-				true);
+				fpes->tuples_needed < 0 ? (int64) 0 : fpes->tuples_needed);
 
 	/* Shut down the executor */
 	ExecutorFinish(queryDesc);

@@ -1,5 +1,8 @@
+
+# Copyright (c) 2024-2025, PostgreSQL Global Development Group
+
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -202,7 +205,6 @@ sub cause_eviction
 sub send_query_and_wait
 {
 	my ($psql, $query, $untl) = @_;
-	my $ret;
 
 	# For each query we run, we'll restart the timeout.  Otherwise the timeout
 	# would apply to the whole test script, and would need to be set very high

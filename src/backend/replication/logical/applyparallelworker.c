@@ -2,7 +2,7 @@
  * applyparallelworker.c
  *	   Support routines for applying xact by parallel apply worker
  *
- * Copyright (c) 2023, PostgreSQL Global Development Group
+ * Copyright (c) 2023-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/logical/applyparallelworker.c
@@ -509,7 +509,6 @@ pa_allocate_worker(TransactionId xid)
 	winfo->in_use = true;
 	winfo->serialize_changes = false;
 	entry->winfo = winfo;
-	entry->xid = xid;
 }
 
 /*
@@ -846,7 +845,7 @@ pa_shutdown(int code, Datum arg)
 {
 	SendProcSignal(MyLogicalRepWorker->leader_pid,
 				   PROCSIG_PARALLEL_APPLY_MESSAGE,
-				   InvalidBackendId);
+				   INVALID_PROC_NUMBER);
 
 	dsm_detach((dsm_segment *) DatumGetPointer(arg));
 }
@@ -935,7 +934,7 @@ ParallelApplyWorkerMain(Datum main_arg)
 
 	pq_redirect_to_shm_mq(seg, error_mqh);
 	pq_set_parallel_leader(MyLogicalRepWorker->leader_pid,
-						   InvalidBackendId);
+						   INVALID_PROC_NUMBER);
 
 	MyLogicalRepWorker->last_send_time = MyLogicalRepWorker->last_recv_time =
 		MyLogicalRepWorker->reply_time = 0;

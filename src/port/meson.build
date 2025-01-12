@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2025, PostgreSQL Global Development Group
 
 pgport_sources = [
   'bsearch_arg.c',
@@ -7,6 +7,7 @@ pgport_sources = [
   'noblock.c',
   'path.c',
   'pg_bitutils.c',
+  'pg_popcount_avx512.c',
   'pg_strong_random.c',
   'pgcheckdir.c',
   'pgmkdirp.c',
@@ -20,7 +21,6 @@ pgport_sources = [
   'snprintf.c',
   'strerror.c',
   'tar.c',
-  'user.c',
 ]
 
 if host_system == 'windows'
@@ -35,6 +35,7 @@ if host_system == 'windows'
     'win32error.c',
     'win32fdatasync.c',
     'win32fseek.c',
+    'win32gai_strerror.c',
     'win32getrusage.c',
     'win32link.c',
     'win32ntdll.c',
@@ -66,11 +67,10 @@ replace_funcs_neg = [
   ['getpeereid'],
   ['inet_aton'],
   ['mkdtemp'],
-  ['preadv', 'HAVE_DECL_PREADV'],
-  ['pwritev', 'HAVE_DECL_PWRITEV'],
   ['strlcat'],
   ['strlcpy'],
   ['strnlen'],
+  ['strsep'],
 ]
 
 if host_system != 'windows'
@@ -82,7 +82,7 @@ endif
 replace_funcs_pos = [
   # x86/x64
   ['pg_crc32c_sse42', 'USE_SSE42_CRC32C'],
-  ['pg_crc32c_sse42', 'USE_SSE42_CRC32C_WITH_RUNTIME_CHECK', 'crc'],
+  ['pg_crc32c_sse42', 'USE_SSE42_CRC32C_WITH_RUNTIME_CHECK'],
   ['pg_crc32c_sse42_choose', 'USE_SSE42_CRC32C_WITH_RUNTIME_CHECK'],
   ['pg_crc32c_sb8', 'USE_SSE42_CRC32C_WITH_RUNTIME_CHECK'],
 
@@ -184,6 +184,7 @@ foreach name, opts : pgport_variants
   lib = static_library('libpgport@0@'.format(name),
       pgport_sources,
       link_with: cflag_libs,
+      link_whole: cflag_libs,
       c_pch: pch_c_h,
       kwargs: opts + {
         'dependencies': opts['dependencies'] + [ssl],

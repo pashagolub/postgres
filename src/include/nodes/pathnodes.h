@@ -6,7 +6,7 @@
  * We don't support copying RelOptInfo, IndexOptInfo, or Path nodes.
  * There are some subsidiary structs that are useful to copy, though.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/pathnodes.h
@@ -103,6 +103,9 @@ typedef struct PlannerGlobal
 
 	/* Plans for SubPlan nodes */
 	List	   *subplans;
+
+	/* Paths from which the SubPlan Plans were made */
+	List	   *subpaths;
 
 	/* PlannerInfos for SubPlan nodes */
 	List	   *subroots pg_node_attr(read_write_ignore);
@@ -397,6 +400,8 @@ struct PlannerInfo
 	List	   *distinct_pathkeys;
 	/* sortClause pathkeys, if any */
 	List	   *sort_pathkeys;
+	/* set operator pathkeys, if any */
+	List	   *setop_pathkeys;
 
 	/* Canonicalised partition schemes used in the query. */
 	List	   *part_schemes pg_node_attr(read_write_ignore);
@@ -421,7 +426,11 @@ struct PlannerInfo
 	 * items to be proven redundant, implying that there is only one group
 	 * containing all the query's rows.  Hence, if you want to check whether
 	 * GROUP BY was specified, test for nonempty parse->groupClause, not for
-	 * nonempty processed_groupClause.
+	 * nonempty processed_groupClause.  Optimizer chooses specific order of
+	 * group-by clauses during the upper paths generation process, attempting
+	 * to use different strategies to minimize number of sorts or engage
+	 * incremental sort.  See preprocess_groupclause() and
+	 * get_useful_group_keys_orderings() for details.
 	 *
 	 * Currently, when grouping sets are specified we do not attempt to
 	 * optimize the groupClause, so that processed_groupClause will be
@@ -499,6 +508,12 @@ struct PlannerInfo
 	bool		placeholdersFrozen;
 	/* true if planning a recursive WITH item */
 	bool		hasRecursion;
+
+	/*
+	 * The rangetable index for the RTE_GROUP RTE, or 0 if there is no
+	 * RTE_GROUP RTE.
+	 */
+	int			group_rtindex;
 
 	/*
 	 * Information about aggregates. Filled by preprocess_aggrefs().
@@ -719,7 +734,7 @@ typedef struct PartitionSchemeData *PartitionScheme;
  * populate these fields, for base rels; but someday they might be used for
  * join rels too:
  *
- *		unique_for_rels - list of UniqueRelInfo, each one being a set of other
+ *		unique_for_rels - list of Relid sets, each one being a set of other
  *					rels for which this one has been proven unique
  *		non_unique_for_rels - list of Relid sets, each one being a set of
  *					other rels for which we have tried and failed to prove
@@ -913,6 +928,12 @@ typedef struct RelOptInfo
 	Relids	   *attr_needed pg_node_attr(read_write_ignore);
 	/* array indexed [min_attr .. max_attr] */
 	int32	   *attr_widths pg_node_attr(read_write_ignore);
+
+	/*
+	 * Zero-based set containing attnums of NOT NULL columns.  Not populated
+	 * for rels corresponding to non-partitioned inh==true RTEs.
+	 */
+	Bitmapset  *notnullattnums;
 	/* relids of outer joins that can null this baserel */
 	Relids		nulling_relids;
 	/* LATERAL Vars and PHVs referenced by rel */
@@ -952,7 +973,7 @@ typedef struct RelOptInfo
 	/*
 	 * cache space for remembering if we have proven this relation unique
 	 */
-	/* known unique for these other relid set(s) given in UniqueRelInfo(s) */
+	/* known unique for these other relid set(s) */
 	List	   *unique_for_rels;
 	/* known not unique for these set(s) */
 	List	   *non_unique_for_rels;
@@ -1086,6 +1107,9 @@ typedef struct IndexOptInfo IndexOptInfo;
 #define HAVE_INDEXOPTINFO_TYPEDEF 1
 #endif
 
+struct IndexPath;				/* avoid including pathnodes.h here */
+struct PlannerInfo;				/* avoid including pathnodes.h here */
+
 struct IndexOptInfo
 {
 	pg_node_attr(no_copy_equal, no_read, no_query_jumble)
@@ -1163,6 +1187,8 @@ struct IndexOptInfo
 	bool		predOK;
 	/* true if a unique index */
 	bool		unique;
+	/* true if the index was defined with NULLS NOT DISTINCT */
+	bool		nullsnotdistinct;
 	/* is uniqueness enforced immediately? */
 	bool		immediate;
 	/* true if index doesn't really exist */
@@ -1185,7 +1211,7 @@ struct IndexOptInfo
 	bool		amcanmarkpos;
 	/* AM's cost estimator */
 	/* Rather than include amapi.h here, we declare amcostestimate like this */
-	void		(*amcostestimate) () pg_node_attr(read_write_ignore);
+	void		(*amcostestimate) (struct PlannerInfo *, struct IndexPath *, double, Cost *, Cost *, Selectivity *, double *, double *) pg_node_attr(read_write_ignore);
 };
 
 /*
@@ -1457,6 +1483,23 @@ typedef struct PathKey
 } PathKey;
 
 /*
+ * Contains an order of group-by clauses and the corresponding list of
+ * pathkeys.
+ *
+ * The elements of 'clauses' list should have the same order as the head of
+ * 'pathkeys' list.  The tleSortGroupRef of the clause should be equal to
+ * ec_sortref of the pathkey equivalence class.  If there are redundant
+ * clauses with the same tleSortGroupRef, they must be grouped together.
+ */
+typedef struct GroupByOrdering
+{
+	NodeTag		type;
+
+	List	   *pathkeys;
+	List	   *clauses;
+} GroupByOrdering;
+
+/*
  * VolatileFunctionStatus -- allows nodes to cache their
  * contain_volatile_functions properties. VOLATILITY_UNKNOWN means not yet
  * determined.
@@ -1626,6 +1669,7 @@ typedef struct Path
 
 	/* estimated size/costs for path (see costsize.c for more info) */
 	Cardinality rows;			/* estimated number of result tuples */
+	int			disabled_nodes; /* count of disabled nodes */
 	Cost		startup_cost;	/* cost expended before fetching any tuples */
 	Cost		total_cost;		/* total cost (assuming all tuples fetched) */
 
@@ -1846,7 +1890,7 @@ typedef struct ForeignPath
  *
  * We provide a set of hooks here - which the provider must take care to set
  * up correctly - to allow extensions to supply their own methods of scanning
- * a relation or joing relations.  For example, a provider might provide GPU
+ * a relation or join relations.  For example, a provider might provide GPU
  * acceleration, a cache-based scan, or some other kind of logic we haven't
  * dreamed up yet.
  *
@@ -2287,6 +2331,7 @@ typedef struct WindowAggPath
 	Path	   *subpath;		/* path representing input source */
 	WindowClause *winclause;	/* WindowClause we'll be using */
 	List	   *qual;			/* lower-level WindowAgg runconditions */
+	List	   *runCondition;	/* OpExpr List to short-circuit execution */
 	bool		topwindow;		/* false for all apart from the WindowAgg
 								 * that's closest to the root of the plan */
 } WindowAggPath;
@@ -2297,13 +2342,12 @@ typedef struct WindowAggPath
 typedef struct SetOpPath
 {
 	Path		path;
-	Path	   *subpath;		/* path representing input source */
+	Path	   *leftpath;		/* paths representing input sources */
+	Path	   *rightpath;
 	SetOpCmd	cmd;			/* what to do, see nodes.h */
 	SetOpStrategy strategy;		/* how to do it, see nodes.h */
-	List	   *distinctList;	/* SortGroupClauses identifying target cols */
-	AttrNumber	flagColIdx;		/* where is the flag column, if any */
-	int			firstFlag;		/* flag value for first input relation */
-	Cardinality numGroups;		/* estimated number of groups in input */
+	List	   *groupList;		/* SortGroupClauses identifying target cols */
+	Cardinality numGroups;		/* estimated number of groups in left input */
 } SetOpPath;
 
 /*
@@ -2355,6 +2399,8 @@ typedef struct ModifyTablePath
 	int			epqParam;		/* ID of Param for EvalPlanQual re-eval */
 	List	   *mergeActionLists;	/* per-target-table lists of actions for
 									 * MERGE */
+	List	   *mergeJoinConditions;	/* per-target-table join conditions
+										 * for MERGE */
 } ModifyTablePath;
 
 /*
@@ -2588,7 +2634,10 @@ typedef struct RestrictInfo
 	 * 2. If we manufacture a commuted version of a qual to use as an index
 	 * condition, it copies the original's rinfo_serial, since it is in
 	 * practice the same condition.
-	 * 3. RestrictInfos made for a child relation copy their parent's
+	 * 3. If we reduce a qual to constant-FALSE, the new constant-FALSE qual
+	 * copies the original's rinfo_serial, since it is in practice the same
+	 * condition.
+	 * 4. RestrictInfos made for a child relation copy their parent's
 	 * rinfo_serial.  Likewise, when an EquivalenceClass makes a derived
 	 * equality clause for a child relation, it copies the rinfo_serial of
 	 * the matching equality clause for the parent.  This allows detection
@@ -2785,9 +2834,9 @@ typedef struct PlaceHolderVar
  * min_lefthand and min_righthand for higher joins.)
  *
  * jointype is never JOIN_RIGHT; a RIGHT JOIN is handled by switching
- * the inputs to make it a LEFT JOIN.  It's never JOIN_RIGHT_ANTI either.
- * So the allowed values of jointype in a join_info_list member are only
- * LEFT, FULL, SEMI, or ANTI.
+ * the inputs to make it a LEFT JOIN.  It's never JOIN_RIGHT_SEMI or
+ * JOIN_RIGHT_ANTI either.  So the allowed values of jointype in a
+ * join_info_list member are only LEFT, FULL, SEMI, or ANTI.
  *
  * ojrelid is the RT index of the join RTE representing this outer join,
  * if there is one.  It is zero when jointype is INNER or SEMI, and can be
@@ -2839,6 +2888,9 @@ typedef struct PlaceHolderVar
  * cost estimation purposes it is sometimes useful to know the join size under
  * plain innerjoin semantics.  Note that lhs_strict and the semi_xxx fields
  * are not set meaningfully within such structs.
+ *
+ * We also create transient SpecialJoinInfos for child joins during
+ * partitionwise join planning, which are also not present in join_info_list.
  */
 #ifndef HAVE_SPECIALJOININFO_TYPEDEF
 typedef struct SpecialJoinInfo SpecialJoinInfo;
@@ -3292,6 +3344,7 @@ typedef struct
 typedef struct JoinCostWorkspace
 {
 	/* Preliminary cost estimates --- must not be larger than final ones! */
+	int			disabled_nodes;
 	Cost		startup_cost;	/* cost expended before fetching any tuples */
 	Cost		total_cost;		/* total cost (assuming all tuples fetched) */
 
@@ -3390,30 +3443,5 @@ typedef struct AggTransInfo
 	Datum		initValue pg_node_attr(read_write_ignore);
 	bool		initValueIsNull;
 } AggTransInfo;
-
-/*
- * UniqueRelInfo caches a fact that a relation is unique when being joined
- * to other relation(s).
- */
-typedef struct UniqueRelInfo
-{
-	pg_node_attr(no_copy_equal, no_read, no_query_jumble)
-
-	NodeTag		type;
-
-	/*
-	 * The relation in consideration is unique when being joined with this set
-	 * of other relation(s).
-	 */
-	Relids		outerrelids;
-
-	/*
-	 * Additional clauses from a baserestrictinfo list that were used to prove
-	 * the uniqueness.   We cache it for the self-join checking procedure: a
-	 * self-join can be removed if the outer relation contains strictly the
-	 * same set of clauses.
-	 */
-	List	   *extra_clauses;
-} UniqueRelInfo;
 
 #endif							/* PATHNODES_H */

@@ -1,11 +1,11 @@
 
-# Copyright (c) 2023, PostgreSQL Global Development Group
+# Copyright (c) 2023-2025, PostgreSQL Global Development Group
 
 # Test logical replication slots are always flushed to disk during a shutdown
 # checkpoint.
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
@@ -60,6 +60,12 @@ $node_subscriber->start;
 $node_publisher->safe_psql('postgres', "CREATE TABLE test_tbl (id int)");
 $node_subscriber->safe_psql('postgres', "CREATE TABLE test_tbl (id int)");
 
+# To avoid a shutdown checkpoint WAL record (that gets generated as part of
+# the publisher restart below) falling into a new page, advance the WAL
+# segment. Otherwise, the confirmed_flush_lsn and shutdown_checkpoint
+# location won't match.
+$node_publisher->advance_wal(1);
+
 # Insert some data
 $node_publisher->safe_psql('postgres',
 	"INSERT INTO test_tbl VALUES (generate_series(1, 5));");
@@ -80,6 +86,10 @@ my $result =
 is($result, qq(5), "check initial copy was done");
 
 my $offset = -s $node_publisher->logfile;
+
+# Note: Don't insert any data on the publisher that may cause the shutdown
+# checkpoint to fall into a new WAL file. See the comments atop advance_wal()
+# above.
 
 # Restart the publisher to ensure that the slot will be flushed if required
 $node_publisher->restart();

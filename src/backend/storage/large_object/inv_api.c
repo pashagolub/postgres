@@ -19,7 +19,7 @@
  * memory context given to inv_open (for LargeObjectDesc structs).
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -35,14 +35,12 @@
 #include "access/detoast.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
-#include "access/sysattr.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_largeobject.h"
-#include "catalog/pg_largeobject_metadata.h"
 #include "libpq/libpq-fs.h"
 #include "miscadmin.h"
 #include "storage/large_object.h"
@@ -125,43 +123,6 @@ close_lo_relation(bool isCommit)
 
 
 /*
- * Same as pg_largeobject.c's LargeObjectExists(), except snapshot to
- * read with can be specified.
- */
-static bool
-myLargeObjectExists(Oid loid, Snapshot snapshot)
-{
-	Relation	pg_lo_meta;
-	ScanKeyData skey[1];
-	SysScanDesc sd;
-	HeapTuple	tuple;
-	bool		retval = false;
-
-	ScanKeyInit(&skey[0],
-				Anum_pg_largeobject_metadata_oid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(loid));
-
-	pg_lo_meta = table_open(LargeObjectMetadataRelationId,
-							AccessShareLock);
-
-	sd = systable_beginscan(pg_lo_meta,
-							LargeObjectMetadataOidIndexId, true,
-							snapshot, 1, skey);
-
-	tuple = systable_getnext(sd);
-	if (HeapTupleIsValid(tuple))
-		retval = true;
-
-	systable_endscan(sd);
-
-	table_close(pg_lo_meta, AccessShareLock);
-
-	return retval;
-}
-
-
-/*
  * Extract data field from a pg_largeobject tuple, detoasting if needed
  * and verifying that the length is sane.  Returns data pointer (a bytea *),
  * data length, and an indication of whether to pfree the data pointer.
@@ -221,11 +182,10 @@ inv_create(Oid lobjId)
 	/*
 	 * dependency on the owner of largeobject
 	 *
-	 * The reason why we use LargeObjectRelationId instead of
-	 * LargeObjectMetadataRelationId here is to provide backward compatibility
-	 * to the applications which utilize a knowledge about internal layout of
-	 * system catalogs. OID of pg_largeobject_metadata and loid of
-	 * pg_largeobject are same value, so there are no actual differences here.
+	 * Note that LO dependencies are recorded using classId
+	 * LargeObjectRelationId for backwards-compatibility reasons.  Using
+	 * LargeObjectMetadataRelationId instead would simplify matters for the
+	 * backend, but it'd complicate pg_dump and possibly break other clients.
 	 */
 	recordDependencyOnOwner(LargeObjectRelationId,
 							lobjId_new, GetUserId());
@@ -281,7 +241,7 @@ inv_open(Oid lobjId, int flags, MemoryContext mcxt)
 		snapshot = GetActiveSnapshot();
 
 	/* Can't use LargeObjectExists here because we need to specify snapshot */
-	if (!myLargeObjectExists(lobjId, snapshot))
+	if (!LargeObjectExistsWithSnapshot(lobjId, snapshot))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("large object %u does not exist", lobjId)));

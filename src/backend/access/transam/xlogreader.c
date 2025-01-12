@@ -3,7 +3,7 @@
  * xlogreader.c
  *		Generic XLog reading facility
  *
- * Portions Copyright (c) 2013-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2013-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/backend/access/transam/xlogreader.c
@@ -34,9 +34,7 @@
 #include "replication/origin.h"
 
 #ifndef FRONTEND
-#include "miscadmin.h"
 #include "pgstat.h"
-#include "utils/memutils.h"
 #else
 #include "common/logging.h"
 #endif
@@ -457,18 +455,37 @@ XLogReadRecordAlloc(XLogReaderState *state, size_t xl_tot_len, bool allow_oversi
 	if (state->decode_buffer_tail >= state->decode_buffer_head)
 	{
 		/* Empty, or tail is to the right of head. */
-		if (state->decode_buffer_tail + required_space <=
-			state->decode_buffer + state->decode_buffer_size)
+		if (required_space <=
+			state->decode_buffer_size -
+			(state->decode_buffer_tail - state->decode_buffer))
 		{
-			/* There is space between tail and end. */
+			/*-
+			 * There is space between tail and end.
+			 *
+			 * +-----+--------------------+-----+
+			 * |     |////////////////////|here!|
+			 * +-----+--------------------+-----+
+			 *       ^                    ^
+			 *       |                    |
+			 *       h                    t
+			 */
 			decoded = (DecodedXLogRecord *) state->decode_buffer_tail;
 			decoded->oversized = false;
 			return decoded;
 		}
-		else if (state->decode_buffer + required_space <
-				 state->decode_buffer_head)
+		else if (required_space <
+				 state->decode_buffer_head - state->decode_buffer)
 		{
-			/* There is space between start and head. */
+			/*-
+			 * There is space between start and head.
+			 *
+			 * +-----+--------------------+-----+
+			 * |here!|////////////////////|     |
+			 * +-----+--------------------+-----+
+			 *       ^                    ^
+			 *       |                    |
+			 *       h                    t
+			 */
 			decoded = (DecodedXLogRecord *) state->decode_buffer;
 			decoded->oversized = false;
 			return decoded;
@@ -477,10 +494,19 @@ XLogReadRecordAlloc(XLogReaderState *state, size_t xl_tot_len, bool allow_oversi
 	else
 	{
 		/* Tail is to the left of head. */
-		if (state->decode_buffer_tail + required_space <
-			state->decode_buffer_head)
+		if (required_space <
+			state->decode_buffer_head - state->decode_buffer_tail)
 		{
-			/* There is space between tail and head. */
+			/*-
+			 * There is space between tail and head.
+			 *
+			 * +-----+--------------------+-----+
+			 * |/////|here!               |/////|
+			 * +-----+--------------------+-----+
+			 *       ^                    ^
+			 *       |                    |
+			 *       t                    h
+			 */
 			decoded = (DecodedXLogRecord *) state->decode_buffer_tail;
 			decoded->oversized = false;
 			return decoded;
@@ -920,9 +946,9 @@ err:
 	XLogReaderInvalReadState(state);
 
 	/*
-	 * If an error was written to errmsg_buf, it'll be returned to the caller
-	 * of XLogReadRecord() after all successfully decoded records from the
-	 * read queue.
+	 * If an error was written to errormsg_buf, it'll be returned to the
+	 * caller of XLogReadRecord() after all successfully decoded records from
+	 * the read queue.
 	 */
 
 	return XLREAD_FAIL;
@@ -1472,9 +1498,6 @@ err:
  *
  * Returns true if succeeded, false if an error occurs, in which case
  * 'errinfo' receives error details.
- *
- * XXX probably this should be improved to suck data directly from the
- * WAL buffers when possible.
  */
 bool
 WALRead(XLogReaderState *state,
@@ -2154,8 +2177,8 @@ XLogRecGetFullXid(XLogReaderState *record)
 	Assert(AmStartupProcess() || !IsUnderPostmaster);
 
 	xid = XLogRecGetXid(record);
-	next_xid = XidFromFullTransactionId(ShmemVariableCache->nextXid);
-	epoch = EpochFromFullTransactionId(ShmemVariableCache->nextXid);
+	next_xid = XidFromFullTransactionId(TransamVariables->nextXid);
+	epoch = EpochFromFullTransactionId(TransamVariables->nextXid);
 
 	/*
 	 * If xid is numerically greater than next_xid, it has to be from the last

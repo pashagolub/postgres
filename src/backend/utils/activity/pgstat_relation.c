@@ -8,7 +8,7 @@
  * storage implementation and the details about individual types of
  * statistics.
  *
- * Copyright (c) 2001-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat_relation.c
@@ -19,13 +19,11 @@
 
 #include "access/twophase_rmgr.h"
 #include "access/xact.h"
-#include "catalog/partition.h"
-#include "postmaster/autovacuum.h"
+#include "catalog/catalog.h"
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 #include "utils/rel.h"
 #include "utils/timestamp.h"
-#include "catalog/catalog.h"
 
 
 /* Record that's written to 2PC state file when pgstat state is persisted */
@@ -246,7 +244,7 @@ pgstat_report_vacuum(Oid tableoid, bool shared,
 	 */
 	tabentry->ins_since_vacuum = 0;
 
-	if (IsAutoVacuumWorkerProcess())
+	if (AmAutoVacuumWorkerProcess())
 	{
 		tabentry->last_autovacuum_time = ts;
 		tabentry->autovacuum_count++;
@@ -266,6 +264,7 @@ pgstat_report_vacuum(Oid tableoid, bool shared,
 	 * VACUUM command has processed all tables and committed.
 	 */
 	pgstat_flush_io(false);
+	pgstat_flush_backend(false, PGSTAT_BACKEND_FLUSH_IO);
 }
 
 /*
@@ -337,7 +336,7 @@ pgstat_report_analyze(Relation rel,
 	if (resetcounter)
 		tabentry->mod_since_analyze = 0;
 
-	if (IsAutoVacuumWorkerProcess())
+	if (AmAutoVacuumWorkerProcess())
 	{
 		tabentry->last_autoanalyze_time = GetCurrentTimestamp();
 		tabentry->autoanalyze_count++;
@@ -352,6 +351,7 @@ pgstat_report_analyze(Relation rel,
 
 	/* see pgstat_report_vacuum() */
 	pgstat_flush_io(false);
+	pgstat_flush_backend(false, PGSTAT_BACKEND_FLUSH_IO);
 }
 
 /*
@@ -478,20 +478,52 @@ pgstat_fetch_stat_tabentry_ext(bool shared, Oid reloid)
  * Find any existing PgStat_TableStatus entry for rel_id in the current
  * database. If not found, try finding from shared tables.
  *
- * If no entry found, return NULL, don't create a new one
+ * If an entry is found, copy it and increment the copy's counters with their
+ * subtransaction counterparts, then return the copy.  The caller may need to
+ * pfree() the copy.
+ *
+ * If no entry found, return NULL, don't create a new one.
  */
 PgStat_TableStatus *
 find_tabstat_entry(Oid rel_id)
 {
 	PgStat_EntryRef *entry_ref;
+	PgStat_TableXactStatus *trans;
+	PgStat_TableStatus *tabentry = NULL;
+	PgStat_TableStatus *tablestatus = NULL;
 
 	entry_ref = pgstat_fetch_pending_entry(PGSTAT_KIND_RELATION, MyDatabaseId, rel_id);
 	if (!entry_ref)
+	{
 		entry_ref = pgstat_fetch_pending_entry(PGSTAT_KIND_RELATION, InvalidOid, rel_id);
+		if (!entry_ref)
+			return tablestatus;
+	}
 
-	if (entry_ref)
-		return entry_ref->pending;
-	return NULL;
+	tabentry = (PgStat_TableStatus *) entry_ref->pending;
+	tablestatus = palloc(sizeof(PgStat_TableStatus));
+	*tablestatus = *tabentry;
+
+	/*
+	 * Reset tablestatus->trans in the copy of PgStat_TableStatus as it may
+	 * point to a shared memory area.  Its data is saved below, so removing it
+	 * does not matter.
+	 */
+	tablestatus->trans = NULL;
+
+	/*
+	 * Live subtransaction counts are not included yet.  This is not a hot
+	 * code path so reconcile tuples_inserted, tuples_updated and
+	 * tuples_deleted even if the caller may not be interested in this data.
+	 */
+	for (trans = tabentry->trans; trans != NULL; trans = trans->upper)
+	{
+		tablestatus->counts.tuples_inserted += trans->tuples_inserted;
+		tablestatus->counts.tuples_updated += trans->tuples_updated;
+		tablestatus->counts.tuples_deleted += trans->tuples_deleted;
+	}
+
+	return tablestatus;
 }
 
 /*
@@ -770,7 +802,6 @@ pgstat_twophase_postabort(TransactionId xid, uint16 info,
 bool
 pgstat_relation_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 {
-	static const PgStat_TableCounts all_zeroes;
 	Oid			dboid;
 	PgStat_TableStatus *lstats; /* pending stats entry  */
 	PgStatShared_Relation *shtabstats;
@@ -785,11 +816,9 @@ pgstat_relation_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 	 * Ignore entries that didn't accumulate any actual counts, such as
 	 * indexes that were opened by the planner but not used.
 	 */
-	if (memcmp(&lstats->counts, &all_zeroes,
-			   sizeof(PgStat_TableCounts)) == 0)
-	{
+	if (pg_memory_is_all_zeros(&lstats->counts,
+							   sizeof(struct PgStat_TableCounts)))
 		return true;
-	}
 
 	if (!pgstat_lock_entry(entry_ref, nowait))
 		return false;

@@ -8,7 +8,7 @@
  *
  * See fe_utils/psqlscan_int.h for additional commentary.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -17,6 +17,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres_fe.h"
+
+#include <ctype.h>
 
 #include "common.h"
 #include "psqlscanslash.h"
@@ -35,12 +37,6 @@
  * doesn't presently make use of that argument, so just declare it as int.
  */
 typedef int YYSTYPE;
-
-/*
- * Set the type of yyextra; we use it as a pointer back to the containing
- * PsqlScanState.
- */
-#define YY_EXTRA_TYPE PsqlScanState
 
 /*
  * These variables do not need to be saved across calls.  Yeah, it's a bit
@@ -85,6 +81,12 @@ extern void slash_yyset_column(int column_no, yyscan_t yyscanner);
 %option noyywrap
 %option warn
 %option prefix="slash_yy"
+
+/*
+ * Set the type of yyextra; we use it as a pointer back to the containing
+ * PsqlScanState.
+ */
+%option extra-type="PsqlScanState"
 
 /*
  * OK, here is a short description of lex/flex rules behavior.
@@ -596,9 +598,9 @@ psql_scan_slash_option(PsqlScanState state,
 	psql_scan_reselect_sql_lexer(state);
 
 	/*
-	 * Check the lex result: we should have gotten back either LEXRES_OK
-	 * or LEXRES_EOL (the latter indicating end of string).  If we were inside
-	 * a quoted string, as indicated by final_state, EOL is an error.
+	 * Check the lex result: we should have gotten back either LEXRES_OK or
+	 * LEXRES_EOL (the latter indicating end of string).  If we were inside a
+	 * quoted string, as indicated by final_state, EOL is an error.
 	 */
 	Assert(lexresult == LEXRES_EOL || lexresult == LEXRES_OK);
 
@@ -608,7 +610,7 @@ psql_scan_slash_option(PsqlScanState state,
 			/* empty arg */
 			break;
 		case xslasharg:
-			/* Strip any unquoted trailing semi-colons if requested */
+			/* Strip any unquoted trailing semicolons if requested */
 			if (semicolon)
 			{
 				while (unquoted_option_chars-- > 0 &&
@@ -640,7 +642,23 @@ psql_scan_slash_option(PsqlScanState state,
 			termPQExpBuffer(&mybuf);
 			return NULL;
 		case xslashwholeline:
-			/* always okay */
+
+			/*
+			 * In whole-line mode, we interpret semicolon = true as stripping
+			 * trailing whitespace as well as semicolons; this gives the
+			 * nearest equivalent to what semicolon = true does in normal
+			 * mode.  Note there's no concept of quoting in this mode.
+			 */
+			if (semicolon)
+			{
+				while (mybuf.len > 0 &&
+					   (mybuf.data[mybuf.len - 1] == ';' ||
+						(isascii((unsigned char) mybuf.data[mybuf.len - 1]) &&
+						 isspace((unsigned char) mybuf.data[mybuf.len - 1]))))
+				{
+					mybuf.data[--mybuf.len] = '\0';
+				}
+			}
 			break;
 		default:
 			/* can't get here */

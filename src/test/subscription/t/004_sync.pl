@@ -1,9 +1,9 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 # Tests for logical replication table syncing
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -165,7 +165,7 @@ $node_subscriber->safe_psql('postgres', "DROP SUBSCRIPTION tap_sub");
 
 # When DROP SUBSCRIPTION tries to drop the tablesync slot, the slot may not
 # have been created, which causes the slot to be created after the DROP
-# SUSCRIPTION finishes. Such slots eventually get dropped at walsender exit
+# SUBSCRIPTION finishes. Such slots eventually get dropped at walsender exit
 # time. So, to prevent being affected by such ephemeral tablesync slots, we
 # wait until all the slots have been cleaned.
 ok( $node_publisher->poll_query_until(

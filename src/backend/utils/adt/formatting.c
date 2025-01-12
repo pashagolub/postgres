@@ -4,7 +4,7 @@
  * src/backend/utils/adt/formatting.c
  *
  *
- *	 Portions Copyright (c) 1999-2023, PostgreSQL Global Development Group
+ *	 Portions Copyright (c) 1999-2025, PostgreSQL Global Development Group
  *
  *
  *	 TO_CHAR(); TO_TIMESTAMP(); TO_DATE(); TO_NUMBER();
@@ -77,13 +77,15 @@
 
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
+#include "common/int.h"
+#include "common/unicode_case.h"
+#include "common/unicode_category.h"
 #include "mb/pg_wchar.h"
 #include "nodes/miscnodes.h"
 #include "parser/scansup.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/datetime.h"
-#include "utils/float.h"
 #include "utils/formatting.h"
 #include "utils/memutils.h"
 #include "utils/numeric.h"
@@ -418,13 +420,23 @@ typedef struct
 				us,
 				yysz,			/* is it YY or YYYY ? */
 				clock,			/* 12 or 24 hour clock? */
-				tzsign,			/* +1, -1 or 0 if timezone info is absent */
+				tzsign,			/* +1, -1, or 0 if no TZH/TZM fields */
 				tzh,
 				tzm,
 				ff;				/* fractional precision */
+	bool		has_tz;			/* was there a TZ field? */
+	int			gmtoffset;		/* GMT offset of fixed-offset zone abbrev */
+	pg_tz	   *tzp;			/* pg_tz for dynamic abbrev */
+	char	   *abbrev;			/* dynamic abbrev */
 } TmFromChar;
 
 #define ZERO_tmfc(_X) memset(_X, 0, sizeof(TmFromChar))
+
+struct fmt_tz					/* do_to_timestamp's timezone info output */
+{
+	bool		has_tz;			/* was there any TZ/TZH/TZM field? */
+	int			gmtoffset;		/* GMT offset in seconds */
+};
 
 /* ----------
  * Debug
@@ -611,7 +623,7 @@ typedef enum
 	DCH_Day,
 	DCH_Dy,
 	DCH_D,
-	DCH_FF1,
+	DCH_FF1,					/* FFn codes must be consecutive */
 	DCH_FF2,
 	DCH_FF3,
 	DCH_FF4,
@@ -777,12 +789,12 @@ static const KeyWord DCH_keywords[] = {
 	{"Day", 3, DCH_Day, false, FROM_CHAR_DATE_NONE},
 	{"Dy", 2, DCH_Dy, false, FROM_CHAR_DATE_NONE},
 	{"D", 1, DCH_D, true, FROM_CHAR_DATE_GREGORIAN},
-	{"FF1", 3, DCH_FF1, false, FROM_CHAR_DATE_NONE},	/* F */
-	{"FF2", 3, DCH_FF2, false, FROM_CHAR_DATE_NONE},
-	{"FF3", 3, DCH_FF3, false, FROM_CHAR_DATE_NONE},
-	{"FF4", 3, DCH_FF4, false, FROM_CHAR_DATE_NONE},
-	{"FF5", 3, DCH_FF5, false, FROM_CHAR_DATE_NONE},
-	{"FF6", 3, DCH_FF6, false, FROM_CHAR_DATE_NONE},
+	{"FF1", 3, DCH_FF1, true, FROM_CHAR_DATE_NONE}, /* F */
+	{"FF2", 3, DCH_FF2, true, FROM_CHAR_DATE_NONE},
+	{"FF3", 3, DCH_FF3, true, FROM_CHAR_DATE_NONE},
+	{"FF4", 3, DCH_FF4, true, FROM_CHAR_DATE_NONE},
+	{"FF5", 3, DCH_FF5, true, FROM_CHAR_DATE_NONE},
+	{"FF6", 3, DCH_FF6, true, FROM_CHAR_DATE_NONE},
 	{"FX", 2, DCH_FX, false, FROM_CHAR_DATE_NONE},
 	{"HH24", 4, DCH_HH24, true, FROM_CHAR_DATE_NONE},	/* H */
 	{"HH12", 4, DCH_HH12, true, FROM_CHAR_DATE_NONE},
@@ -833,12 +845,12 @@ static const KeyWord DCH_keywords[] = {
 	{"dd", 2, DCH_DD, true, FROM_CHAR_DATE_GREGORIAN},
 	{"dy", 2, DCH_dy, false, FROM_CHAR_DATE_NONE},
 	{"d", 1, DCH_D, true, FROM_CHAR_DATE_GREGORIAN},
-	{"ff1", 3, DCH_FF1, false, FROM_CHAR_DATE_NONE},	/* f */
-	{"ff2", 3, DCH_FF2, false, FROM_CHAR_DATE_NONE},
-	{"ff3", 3, DCH_FF3, false, FROM_CHAR_DATE_NONE},
-	{"ff4", 3, DCH_FF4, false, FROM_CHAR_DATE_NONE},
-	{"ff5", 3, DCH_FF5, false, FROM_CHAR_DATE_NONE},
-	{"ff6", 3, DCH_FF6, false, FROM_CHAR_DATE_NONE},
+	{"ff1", 3, DCH_FF1, true, FROM_CHAR_DATE_NONE}, /* f */
+	{"ff2", 3, DCH_FF2, true, FROM_CHAR_DATE_NONE},
+	{"ff3", 3, DCH_FF3, true, FROM_CHAR_DATE_NONE},
+	{"ff4", 3, DCH_FF4, true, FROM_CHAR_DATE_NONE},
+	{"ff5", 3, DCH_FF5, true, FROM_CHAR_DATE_NONE},
+	{"ff6", 3, DCH_FF6, true, FROM_CHAR_DATE_NONE},
 	{"fx", 2, DCH_FX, false, FROM_CHAR_DATE_NONE},
 	{"hh24", 4, DCH_HH24, true, FROM_CHAR_DATE_NONE},	/* h */
 	{"hh12", 4, DCH_HH12, true, FROM_CHAR_DATE_NONE},
@@ -1058,8 +1070,8 @@ static bool from_char_seq_search(int *dest, const char **src,
 								 char **localized_array, Oid collid,
 								 FormatNode *node, Node *escontext);
 static bool do_to_timestamp(text *date_txt, text *fmt, Oid collid, bool std,
-							struct pg_tm *tm, fsec_t *fsec, int *fprec,
-							uint32 *flags, Node *escontext);
+							struct pg_tm *tm, fsec_t *fsec, struct fmt_tz *tz,
+							int *fprec, uint32 *flags, Node *escontext);
 static char *fill_str(char *str, int c, int max);
 static FormatNode *NUM_cache(int len, NUMDesc *Num, text *pars_str, bool *shouldFree);
 static char *int_to_roman(int number);
@@ -1559,52 +1571,6 @@ str_numth(char *dest, char *num, int type)
  *			upper/lower/initcap functions
  *****************************************************************************/
 
-#ifdef USE_ICU
-
-typedef int32_t (*ICU_Convert_Func) (UChar *dest, int32_t destCapacity,
-									 const UChar *src, int32_t srcLength,
-									 const char *locale,
-									 UErrorCode *pErrorCode);
-
-static int32_t
-icu_convert_case(ICU_Convert_Func func, pg_locale_t mylocale,
-				 UChar **buff_dest, UChar *buff_source, int32_t len_source)
-{
-	UErrorCode	status;
-	int32_t		len_dest;
-
-	len_dest = len_source;		/* try first with same length */
-	*buff_dest = palloc(len_dest * sizeof(**buff_dest));
-	status = U_ZERO_ERROR;
-	len_dest = func(*buff_dest, len_dest, buff_source, len_source,
-					mylocale->info.icu.locale, &status);
-	if (status == U_BUFFER_OVERFLOW_ERROR)
-	{
-		/* try again with adjusted length */
-		pfree(*buff_dest);
-		*buff_dest = palloc(len_dest * sizeof(**buff_dest));
-		status = U_ZERO_ERROR;
-		len_dest = func(*buff_dest, len_dest, buff_source, len_source,
-						mylocale->info.icu.locale, &status);
-	}
-	if (U_FAILURE(status))
-		ereport(ERROR,
-				(errmsg("case conversion failed: %s", u_errorName(status))));
-	return len_dest;
-}
-
-static int32_t
-u_strToTitle_default_BI(UChar *dest, int32_t destCapacity,
-						const UChar *src, int32_t srcLength,
-						const char *locale,
-						UErrorCode *pErrorCode)
-{
-	return u_strToTitle(dest, destCapacity, src, srcLength,
-						NULL, locale, pErrorCode);
-}
-
-#endif							/* USE_ICU */
-
 /*
  * If the system provides the needed functions for wide-character manipulation
  * (which are all standardized by C99), then we implement upper/lower/initcap
@@ -1625,6 +1591,7 @@ char *
 str_tolower(const char *buff, size_t nbytes, Oid collid)
 {
 	char	   *result;
+	pg_locale_t mylocale;
 
 	if (!buff)
 		return NULL;
@@ -1642,92 +1609,37 @@ str_tolower(const char *buff, size_t nbytes, Oid collid)
 				 errhint("Use the COLLATE clause to set the collation explicitly.")));
 	}
 
+	mylocale = pg_newlocale_from_collation(collid);
+
 	/* C/POSIX collations use this path regardless of database encoding */
-	if (lc_ctype_is_c(collid))
+	if (mylocale->ctype_is_c)
 	{
 		result = asc_tolower(buff, nbytes);
 	}
 	else
 	{
-		pg_locale_t mylocale;
+		const char *src = buff;
+		size_t		srclen = nbytes;
+		size_t		dstsize;
+		char	   *dst;
+		size_t		needed;
 
-		mylocale = pg_newlocale_from_collation(collid);
+		/* first try buffer of equal size plus terminating NUL */
+		dstsize = srclen + 1;
+		dst = palloc(dstsize);
 
-#ifdef USE_ICU
-		if (mylocale && mylocale->provider == COLLPROVIDER_ICU)
+		needed = pg_strlower(dst, dstsize, src, srclen, mylocale);
+		if (needed + 1 > dstsize)
 		{
-			int32_t		len_uchar;
-			int32_t		len_conv;
-			UChar	   *buff_uchar;
-			UChar	   *buff_conv;
-
-			len_uchar = icu_to_uchar(&buff_uchar, buff, nbytes);
-			len_conv = icu_convert_case(u_strToLower, mylocale,
-										&buff_conv, buff_uchar, len_uchar);
-			icu_from_uchar(&result, buff_conv, len_conv);
-			pfree(buff_uchar);
-			pfree(buff_conv);
+			/* grow buffer if needed and retry */
+			dstsize = needed + 1;
+			dst = repalloc(dst, dstsize);
+			needed = pg_strlower(dst, dstsize, src, srclen, mylocale);
+			Assert(needed + 1 <= dstsize);
 		}
-		else
-#endif
-		{
-			if (pg_database_encoding_max_length() > 1)
-			{
-				wchar_t    *workspace;
-				size_t		curr_char;
-				size_t		result_size;
 
-				/* Overflow paranoia */
-				if ((nbytes + 1) > (INT_MAX / sizeof(wchar_t)))
-					ereport(ERROR,
-							(errcode(ERRCODE_OUT_OF_MEMORY),
-							 errmsg("out of memory")));
-
-				/* Output workspace cannot have more codes than input bytes */
-				workspace = (wchar_t *) palloc((nbytes + 1) * sizeof(wchar_t));
-
-				char2wchar(workspace, nbytes + 1, buff, nbytes, mylocale);
-
-				for (curr_char = 0; workspace[curr_char] != 0; curr_char++)
-				{
-					if (mylocale)
-						workspace[curr_char] = towlower_l(workspace[curr_char], mylocale->info.lt);
-					else
-						workspace[curr_char] = towlower(workspace[curr_char]);
-				}
-
-				/*
-				 * Make result large enough; case change might change number
-				 * of bytes
-				 */
-				result_size = curr_char * pg_database_encoding_max_length() + 1;
-				result = palloc(result_size);
-
-				wchar2char(result, workspace, result_size, mylocale);
-				pfree(workspace);
-			}
-			else
-			{
-				char	   *p;
-
-				result = pnstrdup(buff, nbytes);
-
-				/*
-				 * Note: we assume that tolower_l() will not be so broken as
-				 * to need an isupper_l() guard test.  When using the default
-				 * collation, we apply the traditional Postgres behavior that
-				 * forces ASCII-style treatment of I/i, but in non-default
-				 * collations you get exactly what the collation says.
-				 */
-				for (p = result; *p; p++)
-				{
-					if (mylocale)
-						*p = tolower_l((unsigned char) *p, mylocale->info.lt);
-					else
-						*p = pg_tolower((unsigned char) *p);
-				}
-			}
-		}
+		Assert(dst[needed] == '\0');
+		result = dst;
 	}
 
 	return result;
@@ -1743,6 +1655,7 @@ char *
 str_toupper(const char *buff, size_t nbytes, Oid collid)
 {
 	char	   *result;
+	pg_locale_t mylocale;
 
 	if (!buff)
 		return NULL;
@@ -1760,92 +1673,37 @@ str_toupper(const char *buff, size_t nbytes, Oid collid)
 				 errhint("Use the COLLATE clause to set the collation explicitly.")));
 	}
 
+	mylocale = pg_newlocale_from_collation(collid);
+
 	/* C/POSIX collations use this path regardless of database encoding */
-	if (lc_ctype_is_c(collid))
+	if (mylocale->ctype_is_c)
 	{
 		result = asc_toupper(buff, nbytes);
 	}
 	else
 	{
-		pg_locale_t mylocale;
+		const char *src = buff;
+		size_t		srclen = nbytes;
+		size_t		dstsize;
+		char	   *dst;
+		size_t		needed;
 
-		mylocale = pg_newlocale_from_collation(collid);
+		/* first try buffer of equal size plus terminating NUL */
+		dstsize = srclen + 1;
+		dst = palloc(dstsize);
 
-#ifdef USE_ICU
-		if (mylocale && mylocale->provider == COLLPROVIDER_ICU)
+		needed = pg_strupper(dst, dstsize, src, srclen, mylocale);
+		if (needed + 1 > dstsize)
 		{
-			int32_t		len_uchar,
-						len_conv;
-			UChar	   *buff_uchar;
-			UChar	   *buff_conv;
-
-			len_uchar = icu_to_uchar(&buff_uchar, buff, nbytes);
-			len_conv = icu_convert_case(u_strToUpper, mylocale,
-										&buff_conv, buff_uchar, len_uchar);
-			icu_from_uchar(&result, buff_conv, len_conv);
-			pfree(buff_uchar);
-			pfree(buff_conv);
+			/* grow buffer if needed and retry */
+			dstsize = needed + 1;
+			dst = repalloc(dst, dstsize);
+			needed = pg_strupper(dst, dstsize, src, srclen, mylocale);
+			Assert(needed + 1 <= dstsize);
 		}
-		else
-#endif
-		{
-			if (pg_database_encoding_max_length() > 1)
-			{
-				wchar_t    *workspace;
-				size_t		curr_char;
-				size_t		result_size;
 
-				/* Overflow paranoia */
-				if ((nbytes + 1) > (INT_MAX / sizeof(wchar_t)))
-					ereport(ERROR,
-							(errcode(ERRCODE_OUT_OF_MEMORY),
-							 errmsg("out of memory")));
-
-				/* Output workspace cannot have more codes than input bytes */
-				workspace = (wchar_t *) palloc((nbytes + 1) * sizeof(wchar_t));
-
-				char2wchar(workspace, nbytes + 1, buff, nbytes, mylocale);
-
-				for (curr_char = 0; workspace[curr_char] != 0; curr_char++)
-				{
-					if (mylocale)
-						workspace[curr_char] = towupper_l(workspace[curr_char], mylocale->info.lt);
-					else
-						workspace[curr_char] = towupper(workspace[curr_char]);
-				}
-
-				/*
-				 * Make result large enough; case change might change number
-				 * of bytes
-				 */
-				result_size = curr_char * pg_database_encoding_max_length() + 1;
-				result = palloc(result_size);
-
-				wchar2char(result, workspace, result_size, mylocale);
-				pfree(workspace);
-			}
-			else
-			{
-				char	   *p;
-
-				result = pnstrdup(buff, nbytes);
-
-				/*
-				 * Note: we assume that toupper_l() will not be so broken as
-				 * to need an islower_l() guard test.  When using the default
-				 * collation, we apply the traditional Postgres behavior that
-				 * forces ASCII-style treatment of I/i, but in non-default
-				 * collations you get exactly what the collation says.
-				 */
-				for (p = result; *p; p++)
-				{
-					if (mylocale)
-						*p = toupper_l((unsigned char) *p, mylocale->info.lt);
-					else
-						*p = pg_toupper((unsigned char) *p);
-				}
-			}
-		}
+		Assert(dst[needed] == '\0');
+		result = dst;
 	}
 
 	return result;
@@ -1861,7 +1719,7 @@ char *
 str_initcap(const char *buff, size_t nbytes, Oid collid)
 {
 	char	   *result;
-	int			wasalnum = false;
+	pg_locale_t mylocale;
 
 	if (!buff)
 		return NULL;
@@ -1879,116 +1737,37 @@ str_initcap(const char *buff, size_t nbytes, Oid collid)
 				 errhint("Use the COLLATE clause to set the collation explicitly.")));
 	}
 
+	mylocale = pg_newlocale_from_collation(collid);
+
 	/* C/POSIX collations use this path regardless of database encoding */
-	if (lc_ctype_is_c(collid))
+	if (mylocale->ctype_is_c)
 	{
 		result = asc_initcap(buff, nbytes);
 	}
 	else
 	{
-		pg_locale_t mylocale;
+		const char *src = buff;
+		size_t		srclen = nbytes;
+		size_t		dstsize;
+		char	   *dst;
+		size_t		needed;
 
-		mylocale = pg_newlocale_from_collation(collid);
+		/* first try buffer of equal size plus terminating NUL */
+		dstsize = srclen + 1;
+		dst = palloc(dstsize);
 
-#ifdef USE_ICU
-		if (mylocale && mylocale->provider == COLLPROVIDER_ICU)
+		needed = pg_strtitle(dst, dstsize, src, srclen, mylocale);
+		if (needed + 1 > dstsize)
 		{
-			int32_t		len_uchar,
-						len_conv;
-			UChar	   *buff_uchar;
-			UChar	   *buff_conv;
-
-			len_uchar = icu_to_uchar(&buff_uchar, buff, nbytes);
-			len_conv = icu_convert_case(u_strToTitle_default_BI, mylocale,
-										&buff_conv, buff_uchar, len_uchar);
-			icu_from_uchar(&result, buff_conv, len_conv);
-			pfree(buff_uchar);
-			pfree(buff_conv);
+			/* grow buffer if needed and retry */
+			dstsize = needed + 1;
+			dst = repalloc(dst, dstsize);
+			needed = pg_strtitle(dst, dstsize, src, srclen, mylocale);
+			Assert(needed + 1 <= dstsize);
 		}
-		else
-#endif
-		{
-			if (pg_database_encoding_max_length() > 1)
-			{
-				wchar_t    *workspace;
-				size_t		curr_char;
-				size_t		result_size;
 
-				/* Overflow paranoia */
-				if ((nbytes + 1) > (INT_MAX / sizeof(wchar_t)))
-					ereport(ERROR,
-							(errcode(ERRCODE_OUT_OF_MEMORY),
-							 errmsg("out of memory")));
-
-				/* Output workspace cannot have more codes than input bytes */
-				workspace = (wchar_t *) palloc((nbytes + 1) * sizeof(wchar_t));
-
-				char2wchar(workspace, nbytes + 1, buff, nbytes, mylocale);
-
-				for (curr_char = 0; workspace[curr_char] != 0; curr_char++)
-				{
-					if (mylocale)
-					{
-						if (wasalnum)
-							workspace[curr_char] = towlower_l(workspace[curr_char], mylocale->info.lt);
-						else
-							workspace[curr_char] = towupper_l(workspace[curr_char], mylocale->info.lt);
-						wasalnum = iswalnum_l(workspace[curr_char], mylocale->info.lt);
-					}
-					else
-					{
-						if (wasalnum)
-							workspace[curr_char] = towlower(workspace[curr_char]);
-						else
-							workspace[curr_char] = towupper(workspace[curr_char]);
-						wasalnum = iswalnum(workspace[curr_char]);
-					}
-				}
-
-				/*
-				 * Make result large enough; case change might change number
-				 * of bytes
-				 */
-				result_size = curr_char * pg_database_encoding_max_length() + 1;
-				result = palloc(result_size);
-
-				wchar2char(result, workspace, result_size, mylocale);
-				pfree(workspace);
-			}
-			else
-			{
-				char	   *p;
-
-				result = pnstrdup(buff, nbytes);
-
-				/*
-				 * Note: we assume that toupper_l()/tolower_l() will not be so
-				 * broken as to need guard tests.  When using the default
-				 * collation, we apply the traditional Postgres behavior that
-				 * forces ASCII-style treatment of I/i, but in non-default
-				 * collations you get exactly what the collation says.
-				 */
-				for (p = result; *p; p++)
-				{
-					if (mylocale)
-					{
-						if (wasalnum)
-							*p = tolower_l((unsigned char) *p, mylocale->info.lt);
-						else
-							*p = toupper_l((unsigned char) *p, mylocale->info.lt);
-						wasalnum = isalnum_l((unsigned char) *p, mylocale->info.lt);
-					}
-					else
-					{
-						if (wasalnum)
-							*p = pg_tolower((unsigned char) *p);
-						else
-							*p = pg_toupper((unsigned char) *p);
-						wasalnum = isalnum((unsigned char) *p);
-					}
-				}
-			}
-		}
+		Assert(dst[needed] == '\0');
+		result = dst;
 	}
 
 	return result;
@@ -2509,7 +2288,7 @@ seq_search_localized(const char *name, char **array, int *len, Oid collid)
 	 * Fold to upper case, then to lower case, so that we can match reliably
 	 * even in languages in which case conversions are not injective.
 	 */
-	upper_name = str_toupper(unconstify(char *, name), strlen(name), collid);
+	upper_name = str_toupper(name, strlen(name), collid);
 	lower_name = str_tolower(upper_name, strlen(upper_name), collid);
 	pfree(upper_name);
 
@@ -3444,7 +3223,7 @@ DCH_from_char(FormatNode *node, const char *in, TmFromChar *out,
 			case DCH_FF5:
 			case DCH_FF6:
 				out->ff = n->key->id - DCH_FF1 + 1;
-				/* fall through */
+				/* FALLTHROUGH */
 			case DCH_US:		/* microsecond */
 				len = from_char_parse_int_len(&out->us, &s,
 											  n->key->id == DCH_US ? 6 :
@@ -3467,11 +3246,63 @@ DCH_from_char(FormatNode *node, const char *in, TmFromChar *out,
 				break;
 			case DCH_tz:
 			case DCH_TZ:
+				{
+					int			tzlen;
+
+					tzlen = DecodeTimezoneAbbrevPrefix(s,
+													   &out->gmtoffset,
+													   &out->tzp);
+					if (tzlen > 0)
+					{
+						out->has_tz = true;
+						/* we only need the zone abbrev for DYNTZ case */
+						if (out->tzp)
+							out->abbrev = pnstrdup(s, tzlen);
+						out->tzsign = 0;	/* drop any earlier TZH/TZM info */
+						s += tzlen;
+						break;
+					}
+					else if (isalpha((unsigned char) *s))
+					{
+						/*
+						 * It doesn't match any abbreviation, but it starts
+						 * with a letter.  OF format certainly won't succeed;
+						 * assume it's a misspelled abbreviation and complain
+						 * accordingly.
+						 */
+						ereturn(escontext,,
+								(errcode(ERRCODE_INVALID_DATETIME_FORMAT),
+								 errmsg("invalid value \"%s\" for \"%s\"",
+										s, n->key->name),
+								 errdetail("Time zone abbreviation is not recognized.")));
+					}
+					/* otherwise parse it like OF */
+				}
+				/* FALLTHROUGH */
 			case DCH_OF:
-				ereturn(escontext,,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("formatting field \"%s\" is only supported in to_char",
-								n->key->name)));
+				/* OF is equivalent to TZH or TZH:TZM */
+				/* see TZH comments below */
+				if (*s == '+' || *s == '-' || *s == ' ')
+				{
+					out->tzsign = *s == '-' ? -1 : +1;
+					s++;
+				}
+				else
+				{
+					if (extra_skip > 0 && *(s - 1) == '-')
+						out->tzsign = -1;
+					else
+						out->tzsign = +1;
+				}
+				if (from_char_parse_int_len(&out->tzh, &s, 2, n, escontext) < 0)
+					return;
+				if (*s == ':')
+				{
+					s++;
+					if (from_char_parse_int_len(&out->tzm, &s, 2, n,
+												escontext) < 0)
+						return;
+				}
 				break;
 			case DCH_TZH:
 
@@ -3645,7 +3476,14 @@ DCH_from_char(FormatNode *node, const char *in, TmFromChar *out,
 						ereturn(escontext,,
 								(errcode(ERRCODE_INVALID_DATETIME_FORMAT),
 								 errmsg("invalid input string for \"Y,YYY\"")));
-					years += (millennia * 1000);
+
+					/* years += (millennia * 1000); */
+					if (pg_mul_s32_overflow(millennia, 1000, &millennia) ||
+						pg_add_s32_overflow(years, millennia, &years))
+						ereturn(escontext,,
+								(errcode(ERRCODE_DATETIME_FIELD_OVERFLOW),
+								 errmsg("value for \"Y,YYY\" in source string is out of range")));
+
 					if (!from_char_set_int(&out->year, years, n, escontext))
 						return;
 					out->yysz = 4;
@@ -4127,7 +3965,7 @@ interval_to_char(PG_FUNCTION_ARGS)
 	struct pg_itm tt,
 			   *itm = &tt;
 
-	if (VARSIZE_ANY_EXHDR(fmt) <= 0)
+	if (VARSIZE_ANY_EXHDR(fmt) <= 0 || INTERVAL_NOT_FINITE(it))
 		PG_RETURN_NULL();
 
 	ZERO_tmtc(&tmtc);
@@ -4167,22 +4005,16 @@ to_timestamp(PG_FUNCTION_ARGS)
 	Timestamp	result;
 	int			tz;
 	struct pg_tm tm;
+	struct fmt_tz ftz;
 	fsec_t		fsec;
 	int			fprec;
 
 	do_to_timestamp(date_txt, fmt, collid, false,
-					&tm, &fsec, &fprec, NULL, NULL);
+					&tm, &fsec, &ftz, &fprec, NULL, NULL);
 
 	/* Use the specified time zone, if any. */
-	if (tm.tm_zone)
-	{
-		DateTimeErrorExtra extra;
-		int			dterr = DecodeTimezone(tm.tm_zone, &tz);
-
-		if (dterr)
-			DateTimeParseError(dterr, &extra, text_to_cstring(date_txt),
-							   "timestamptz", NULL);
-	}
+	if (ftz.has_tz)
+		tz = ftz.gmtoffset;
 	else
 		tz = DetermineTimeZoneOffset(&tm, session_timezone);
 
@@ -4211,10 +4043,11 @@ to_date(PG_FUNCTION_ARGS)
 	Oid			collid = PG_GET_COLLATION();
 	DateADT		result;
 	struct pg_tm tm;
+	struct fmt_tz ftz;
 	fsec_t		fsec;
 
 	do_to_timestamp(date_txt, fmt, collid, false,
-					&tm, &fsec, NULL, NULL, NULL);
+					&tm, &fsec, &ftz, NULL, NULL, NULL);
 
 	/* Prevent overflow in Julian-day routines */
 	if (!IS_VALID_JULIAN(tm.tm_year, tm.tm_mon, tm.tm_mday))
@@ -4256,12 +4089,13 @@ parse_datetime(text *date_txt, text *fmt, Oid collid, bool strict,
 			   Node *escontext)
 {
 	struct pg_tm tm;
+	struct fmt_tz ftz;
 	fsec_t		fsec;
 	int			fprec;
 	uint32		flags;
 
 	if (!do_to_timestamp(date_txt, fmt, collid, strict,
-						 &tm, &fsec, &fprec, &flags, escontext))
+						 &tm, &fsec, &ftz, &fprec, &flags, escontext))
 		return (Datum) 0;
 
 	*typmod = fprec ? fprec : -1;	/* fractional part precision */
@@ -4274,18 +4108,9 @@ parse_datetime(text *date_txt, text *fmt, Oid collid, bool strict,
 			{
 				TimestampTz result;
 
-				if (tm.tm_zone)
+				if (ftz.has_tz)
 				{
-					DateTimeErrorExtra extra;
-					int			dterr = DecodeTimezone(tm.tm_zone, tz);
-
-					if (dterr)
-					{
-						DateTimeParseError(dterr, &extra,
-										   text_to_cstring(date_txt),
-										   "timestamptz", escontext);
-						return (Datum) 0;
-					}
+					*tz = ftz.gmtoffset;
 				}
 				else
 				{
@@ -4366,18 +4191,9 @@ parse_datetime(text *date_txt, text *fmt, Oid collid, bool strict,
 		{
 			TimeTzADT  *result = palloc(sizeof(TimeTzADT));
 
-			if (tm.tm_zone)
+			if (ftz.has_tz)
 			{
-				DateTimeErrorExtra extra;
-				int			dterr = DecodeTimezone(tm.tm_zone, tz);
-
-				if (dterr)
-				{
-					DateTimeParseError(dterr, &extra,
-									   text_to_cstring(date_txt),
-									   "timetz", escontext);
-					return (Datum) 0;
-				}
+				*tz = ftz.gmtoffset;
 			}
 			else
 			{
@@ -4427,10 +4243,54 @@ parse_datetime(text *date_txt, text *fmt, Oid collid, bool strict,
 }
 
 /*
+ * Parses the datetime format string in 'fmt_str' and returns true if it
+ * contains a timezone specifier, false if not.
+ */
+bool
+datetime_format_has_tz(const char *fmt_str)
+{
+	bool		incache;
+	int			fmt_len = strlen(fmt_str);
+	int			result;
+	FormatNode *format;
+
+	if (fmt_len > DCH_CACHE_SIZE)
+	{
+		/*
+		 * Allocate new memory if format picture is bigger than static cache
+		 * and do not use cache (call parser always)
+		 */
+		incache = false;
+
+		format = (FormatNode *) palloc((fmt_len + 1) * sizeof(FormatNode));
+
+		parse_format(format, fmt_str, DCH_keywords,
+					 DCH_suff, DCH_index, DCH_FLAG, NULL);
+	}
+	else
+	{
+		/*
+		 * Use cache buffers
+		 */
+		DCHCacheEntry *ent = DCH_cache_fetch(fmt_str, false);
+
+		incache = true;
+		format = ent->format;
+	}
+
+	result = DCH_datetime_type(format);
+
+	if (!incache)
+		pfree(format);
+
+	return result & DCH_ZONED;
+}
+
+/*
  * do_to_timestamp: shared code for to_timestamp and to_date
  *
  * Parse the 'date_txt' according to 'fmt', return results as a struct pg_tm,
- * fractional seconds, and fractional precision.
+ * fractional seconds, struct fmt_tz, and fractional precision.
  *
  * 'collid' identifies the collation to use, if needed.
  * 'std' specifies standard parsing mode.
@@ -4447,12 +4307,12 @@ parse_datetime(text *date_txt, text *fmt, Oid collid, bool strict,
  * 'date_txt'.
  *
  * The TmFromChar is then analysed and converted into the final results in
- * struct 'tm', 'fsec', and 'fprec'.
+ * struct 'tm', 'fsec', struct 'tz', and 'fprec'.
  */
 static bool
 do_to_timestamp(text *date_txt, text *fmt, Oid collid, bool std,
-				struct pg_tm *tm, fsec_t *fsec, int *fprec,
-				uint32 *flags, Node *escontext)
+				struct pg_tm *tm, fsec_t *fsec, struct fmt_tz *tz,
+				int *fprec, uint32 *flags, Node *escontext)
 {
 	FormatNode *format = NULL;
 	TmFromChar	tmfc;
@@ -4469,6 +4329,7 @@ do_to_timestamp(text *date_txt, text *fmt, Oid collid, bool std,
 	ZERO_tmfc(&tmfc);
 	ZERO_tm(tm);
 	*fsec = 0;
+	tz->has_tz = false;
 	if (fprec)
 		*fprec = 0;
 	if (flags)
@@ -4581,10 +4442,35 @@ do_to_timestamp(text *date_txt, text *fmt, Oid collid, bool std,
 			tm->tm_year = tmfc.year % 100;
 			if (tm->tm_year)
 			{
+				int			tmp;
+
 				if (tmfc.cc >= 0)
-					tm->tm_year += (tmfc.cc - 1) * 100;
+				{
+					/* tm->tm_year += (tmfc.cc - 1) * 100; */
+					tmp = tmfc.cc - 1;
+					if (pg_mul_s32_overflow(tmp, 100, &tmp) ||
+						pg_add_s32_overflow(tm->tm_year, tmp, &tm->tm_year))
+					{
+						DateTimeParseError(DTERR_FIELD_OVERFLOW, NULL,
+										   text_to_cstring(date_txt), "timestamp",
+										   escontext);
+						goto fail;
+					}
+				}
 				else
-					tm->tm_year = (tmfc.cc + 1) * 100 - tm->tm_year + 1;
+				{
+					/* tm->tm_year = (tmfc.cc + 1) * 100 - tm->tm_year + 1; */
+					tmp = tmfc.cc + 1;
+					if (pg_mul_s32_overflow(tmp, 100, &tmp) ||
+						pg_sub_s32_overflow(tmp, tm->tm_year, &tmp) ||
+						pg_add_s32_overflow(tmp, 1, &tm->tm_year))
+					{
+						DateTimeParseError(DTERR_FIELD_OVERFLOW, NULL,
+										   text_to_cstring(date_txt), "timestamp",
+										   escontext);
+						goto fail;
+					}
+				}
 			}
 			else
 			{
@@ -4610,11 +4496,31 @@ do_to_timestamp(text *date_txt, text *fmt, Oid collid, bool std,
 		if (tmfc.bc)
 			tmfc.cc = -tmfc.cc;
 		if (tmfc.cc >= 0)
+		{
 			/* +1 because 21st century started in 2001 */
-			tm->tm_year = (tmfc.cc - 1) * 100 + 1;
+			/* tm->tm_year = (tmfc.cc - 1) * 100 + 1; */
+			if (pg_mul_s32_overflow(tmfc.cc - 1, 100, &tm->tm_year) ||
+				pg_add_s32_overflow(tm->tm_year, 1, &tm->tm_year))
+			{
+				DateTimeParseError(DTERR_FIELD_OVERFLOW, NULL,
+								   text_to_cstring(date_txt), "timestamp",
+								   escontext);
+				goto fail;
+			}
+		}
 		else
+		{
 			/* +1 because year == 599 is 600 BC */
-			tm->tm_year = tmfc.cc * 100 + 1;
+			/* tm->tm_year = tmfc.cc * 100 + 1; */
+			if (pg_mul_s32_overflow(tmfc.cc, 100, &tm->tm_year) ||
+				pg_add_s32_overflow(tm->tm_year, 1, &tm->tm_year))
+			{
+				DateTimeParseError(DTERR_FIELD_OVERFLOW, NULL,
+								   text_to_cstring(date_txt), "timestamp",
+								   escontext);
+				goto fail;
+			}
+		}
 		fmask |= DTK_M(YEAR);
 	}
 
@@ -4639,11 +4545,31 @@ do_to_timestamp(text *date_txt, text *fmt, Oid collid, bool std,
 			fmask |= DTK_DATE_M;
 		}
 		else
-			tmfc.ddd = (tmfc.ww - 1) * 7 + 1;
+		{
+			/* tmfc.ddd = (tmfc.ww - 1) * 7 + 1; */
+			if (pg_sub_s32_overflow(tmfc.ww, 1, &tmfc.ddd) ||
+				pg_mul_s32_overflow(tmfc.ddd, 7, &tmfc.ddd) ||
+				pg_add_s32_overflow(tmfc.ddd, 1, &tmfc.ddd))
+			{
+				DateTimeParseError(DTERR_FIELD_OVERFLOW, NULL,
+								   date_str, "timestamp", escontext);
+				goto fail;
+			}
+		}
 	}
 
 	if (tmfc.w)
-		tmfc.dd = (tmfc.w - 1) * 7 + 1;
+	{
+		/* tmfc.dd = (tmfc.w - 1) * 7 + 1; */
+		if (pg_sub_s32_overflow(tmfc.w, 1, &tmfc.dd) ||
+			pg_mul_s32_overflow(tmfc.dd, 7, &tmfc.dd) ||
+			pg_add_s32_overflow(tmfc.dd, 1, &tmfc.dd))
+		{
+			DateTimeParseError(DTERR_FIELD_OVERFLOW, NULL,
+							   date_str, "timestamp", escontext);
+			goto fail;
+		}
+	}
 	if (tmfc.dd)
 	{
 		tm->tm_mday = tmfc.dd;
@@ -4708,7 +4634,18 @@ do_to_timestamp(text *date_txt, text *fmt, Oid collid, bool std,
 	}
 
 	if (tmfc.ms)
-		*fsec += tmfc.ms * 1000;
+	{
+		int			tmp = 0;
+
+		/* *fsec += tmfc.ms * 1000; */
+		if (pg_mul_s32_overflow(tmfc.ms, 1000, &tmp) ||
+			pg_add_s32_overflow(*fsec, tmp, fsec))
+		{
+			DateTimeParseError(DTERR_FIELD_OVERFLOW, NULL,
+							   date_str, "timestamp", escontext);
+			goto fail;
+		}
+	}
 	if (tmfc.us)
 		*fsec += tmfc.us;
 	if (fprec)
@@ -4744,11 +4681,14 @@ do_to_timestamp(text *date_txt, text *fmt, Oid collid, bool std,
 		goto fail;
 	}
 
-	/* Save parsed time-zone into tm->tm_zone if it was specified */
+	/*
+	 * If timezone info was present, reduce it to a GMT offset.  (We cannot do
+	 * this until we've filled all of the tm struct, since the zone's offset
+	 * might be time-varying.)
+	 */
 	if (tmfc.tzsign)
 	{
-		char	   *tz;
-
+		/* TZH and/or TZM fields */
 		if (tmfc.tzh < 0 || tmfc.tzh > MAX_TZDISP_HOUR ||
 			tmfc.tzm < 0 || tmfc.tzm >= MINS_PER_HOUR)
 		{
@@ -4757,10 +4697,27 @@ do_to_timestamp(text *date_txt, text *fmt, Oid collid, bool std,
 			goto fail;
 		}
 
-		tz = psprintf("%c%02d:%02d",
-					  tmfc.tzsign > 0 ? '+' : '-', tmfc.tzh, tmfc.tzm);
-
-		tm->tm_zone = tz;
+		tz->has_tz = true;
+		tz->gmtoffset = (tmfc.tzh * MINS_PER_HOUR + tmfc.tzm) * SECS_PER_MINUTE;
+		/* note we are flipping the sign convention here */
+		if (tmfc.tzsign > 0)
+			tz->gmtoffset = -tz->gmtoffset;
+	}
+	else if (tmfc.has_tz)
+	{
+		/* TZ field */
+		tz->has_tz = true;
+		if (tmfc.tzp == NULL)
+		{
+			/* fixed-offset abbreviation; flip the sign convention */
+			tz->gmtoffset = -tmfc.gmtoffset;
+		}
+		else
+		{
+			/* dynamic-offset abbreviation, resolve using specified time */
+			tz->gmtoffset = DetermineTimeZoneAbbrevOffset(tm, tmfc.abbrev,
+														  tmfc.tzp);
+		}
 	}
 
 	DEBUG_TM(tm);
@@ -4985,6 +4942,11 @@ NUM_cache(int len, NUMDesc *Num, text *pars_str, bool *shouldFree)
 }
 
 
+/*
+ * Convert integer to Roman numerals
+ * Result is upper-case and not blank-padded (NUM_processor converts as needed)
+ * If input is out-of-range, produce '###############'
+ */
 static char *
 int_to_roman(int number)
 {
@@ -4997,32 +4959,42 @@ int_to_roman(int number)
 	result = (char *) palloc(16);
 	*result = '\0';
 
+	/*
+	 * This range limit is the same as in Oracle(TM).  The difficulty with
+	 * handling 4000 or more is that we'd need to use more than 3 "M"'s, and
+	 * more than 3 of the same digit isn't considered a valid Roman string.
+	 */
 	if (number > 3999 || number < 1)
 	{
 		fill_str(result, '#', 15);
 		return result;
 	}
+
+	/* Convert to decimal, then examine each digit */
 	len = snprintf(numstr, sizeof(numstr), "%d", number);
+	Assert(len > 0 && len <= 4);
 
 	for (p = numstr; *p != '\0'; p++, --len)
 	{
 		num = *p - ('0' + 1);
 		if (num < 0)
-			continue;
-
-		if (len > 3)
+			continue;			/* ignore zeroes */
+		/* switch on current column position */
+		switch (len)
 		{
-			while (num-- != -1)
-				strcat(result, "M");
-		}
-		else
-		{
-			if (len == 3)
+			case 4:
+				while (num-- >= 0)
+					strcat(result, "M");
+				break;
+			case 3:
 				strcat(result, rm100[num]);
-			else if (len == 2)
+				break;
+			case 2:
 				strcat(result, rm10[num]);
-			else if (len == 1)
+				break;
+			case 1:
 				strcat(result, rm1[num]);
+				break;
 		}
 	}
 	return result;
@@ -6163,7 +6135,6 @@ numeric_to_char(PG_FUNCTION_ARGS)
 	char	   *numstr,
 			   *orgnum,
 			   *p;
-	Numeric		x;
 
 	NUM_TOCHAR_prepare;
 
@@ -6172,12 +6143,15 @@ numeric_to_char(PG_FUNCTION_ARGS)
 	 */
 	if (IS_ROMAN(&Num))
 	{
-		x = DatumGetNumeric(DirectFunctionCall2(numeric_round,
-												NumericGetDatum(value),
-												Int32GetDatum(0)));
-		numstr =
-			int_to_roman(DatumGetInt32(DirectFunctionCall1(numeric_int4,
-														   NumericGetDatum(x))));
+		int32		intvalue;
+		bool		err;
+
+		/* Round and convert to int */
+		intvalue = numeric_int4_opt_error(value, &err);
+		/* On overflow, just use PG_INT32_MAX; int_to_roman will cope */
+		if (err)
+			intvalue = PG_INT32_MAX;
+		numstr = int_to_roman(intvalue);
 	}
 	else if (IS_EEEE(&Num))
 	{
@@ -6217,6 +6191,7 @@ numeric_to_char(PG_FUNCTION_ARGS)
 	{
 		int			numstr_pre_len;
 		Numeric		val = value;
+		Numeric		x;
 
 		if (IS_MULTI(&Num))
 		{
@@ -6385,12 +6360,18 @@ int8_to_char(PG_FUNCTION_ARGS)
 	NUM_TOCHAR_prepare;
 
 	/*
-	 * On DateType depend part (int32)
+	 * On DateType depend part (int64)
 	 */
 	if (IS_ROMAN(&Num))
 	{
-		/* Currently don't support int8 conversion to roman... */
-		numstr = int_to_roman(DatumGetInt32(DirectFunctionCall1(int84, Int64GetDatum(value))));
+		int32		intvalue;
+
+		/* On overflow, just use PG_INT32_MAX; int_to_roman will cope */
+		if (value <= PG_INT32_MAX && value >= PG_INT32_MIN)
+			intvalue = (int32) value;
+		else
+			intvalue = PG_INT32_MAX;
+		numstr = int_to_roman(intvalue);
 	}
 	else if (IS_EEEE(&Num))
 	{
@@ -6491,7 +6472,18 @@ float4_to_char(PG_FUNCTION_ARGS)
 	NUM_TOCHAR_prepare;
 
 	if (IS_ROMAN(&Num))
-		numstr = int_to_roman((int) rint(value));
+	{
+		int32		intvalue;
+
+		/* See notes in ftoi4() */
+		value = rint(value);
+		/* On overflow, just use PG_INT32_MAX; int_to_roman will cope */
+		if (!isnan(value) && FLOAT4_FITS_IN_INT32(value))
+			intvalue = (int32) value;
+		else
+			intvalue = PG_INT32_MAX;
+		numstr = int_to_roman(intvalue);
+	}
 	else if (IS_EEEE(&Num))
 	{
 		if (isnan(value) || isinf(value))
@@ -6593,7 +6585,18 @@ float8_to_char(PG_FUNCTION_ARGS)
 	NUM_TOCHAR_prepare;
 
 	if (IS_ROMAN(&Num))
-		numstr = int_to_roman((int) rint(value));
+	{
+		int32		intvalue;
+
+		/* See notes in dtoi4() */
+		value = rint(value);
+		/* On overflow, just use PG_INT32_MAX; int_to_roman will cope */
+		if (!isnan(value) && FLOAT8_FITS_IN_INT32(value))
+			intvalue = (int32) value;
+		else
+			intvalue = PG_INT32_MAX;
+		numstr = int_to_roman(intvalue);
+	}
 	else if (IS_EEEE(&Num))
 	{
 		if (isnan(value) || isinf(value))

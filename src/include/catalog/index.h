@@ -4,7 +4,7 @@
  *	  prototypes for catalog/index.c.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/index.h
@@ -80,6 +80,7 @@ extern Oid	index_create(Relation heapRelation,
 						 const Oid *opclassIds,
 						 const Datum *opclassOptions,
 						 const int16 *coloptions,
+						 const NullableDatum *stattargets,
 						 Datum reloptions,
 						 bits16 flags,
 						 bits16 constr_flags,
@@ -92,6 +93,7 @@ extern Oid	index_create(Relation heapRelation,
 #define	INDEX_CONSTR_CREATE_INIT_DEFERRED	(1 << 2)
 #define	INDEX_CONSTR_CREATE_UPDATE_INDEX	(1 << 3)
 #define	INDEX_CONSTR_CREATE_REMOVE_OLD_DEPS	(1 << 4)
+#define	INDEX_CONSTR_CREATE_WITHOUT_OVERLAPS (1 << 5)
 
 extern Oid	index_concurrently_create_copy(Relation heapRelation,
 										   Oid oldIndexId,
@@ -149,8 +151,9 @@ extern void index_set_state_flags(Oid indexId, IndexStateFlagsAction action);
 
 extern Oid	IndexGetRelation(Oid indexId, bool missing_ok);
 
-extern void reindex_index(Oid indexId, bool skip_constraint_checks,
-						  char persistence, const ReindexParams *params);
+extern void reindex_index(const ReindexStmt *stmt, Oid indexId,
+						  bool skip_constraint_checks, char persistence,
+						  const ReindexParams *params);
 
 /* Flag bits for reindex_relation(): */
 #define REINDEX_REL_PROCESS_TOAST			0x01
@@ -159,7 +162,8 @@ extern void reindex_index(Oid indexId, bool skip_constraint_checks,
 #define REINDEX_REL_FORCE_INDEXES_UNLOGGED	0x08
 #define REINDEX_REL_FORCE_INDEXES_PERMANENT 0x10
 
-extern bool reindex_relation(Oid relid, int flags, const ReindexParams *params);
+extern bool reindex_relation(const ReindexStmt *stmt, Oid relid, int flags,
+							 const ReindexParams *params);
 
 extern bool ReindexIsProcessingHeap(Oid heapOid);
 extern bool ReindexIsProcessingIndex(Oid indexOid);

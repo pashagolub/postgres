@@ -44,7 +44,7 @@
  * if the old one gets invalidated.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -63,13 +63,12 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "parser/analyze.h"
-#include "parser/parsetree.h"
 #include "storage/lmgr.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
-#include "utils/resowner_private.h"
+#include "utils/resowner.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -118,6 +117,31 @@ static TupleDesc PlanCacheComputeResultDesc(List *stmt_list);
 static void PlanCacheRelCallback(Datum arg, Oid relid);
 static void PlanCacheObjectCallback(Datum arg, int cacheid, uint32 hashvalue);
 static void PlanCacheSysCallback(Datum arg, int cacheid, uint32 hashvalue);
+
+/* ResourceOwner callbacks to track plancache references */
+static void ResOwnerReleaseCachedPlan(Datum res);
+
+static const ResourceOwnerDesc planref_resowner_desc =
+{
+	.name = "plancache reference",
+	.release_phase = RESOURCE_RELEASE_AFTER_LOCKS,
+	.release_priority = RELEASE_PRIO_PLANCACHE_REFS,
+	.ReleaseResource = ResOwnerReleaseCachedPlan,
+	.DebugPrint = NULL			/* the default message is fine */
+};
+
+/* Convenience wrappers over ResourceOwnerRemember/Forget */
+static inline void
+ResourceOwnerRememberPlanCacheRef(ResourceOwner owner, CachedPlan *plan)
+{
+	ResourceOwnerRemember(owner, PointerGetDatum(plan), &planref_resowner_desc);
+}
+static inline void
+ResourceOwnerForgetPlanCacheRef(ResourceOwner owner, CachedPlan *plan)
+{
+	ResourceOwnerForget(owner, PointerGetDatum(plan), &planref_resowner_desc);
+}
+
 
 /* GUC parameter */
 int			plan_cache_mode = PLAN_CACHE_MODE_AUTO;
@@ -703,8 +727,7 @@ RevalidateCachedQuery(CachedPlanSource *plansource,
 		PopActiveSnapshot();
 
 	/*
-	 * Check or update the result tupdesc.  XXX should we use a weaker
-	 * condition than equalTupleDescs() here?
+	 * Check or update the result tupdesc.
 	 *
 	 * We assume the parameter types didn't change from the first time, so no
 	 * need to update that.
@@ -715,7 +738,7 @@ RevalidateCachedQuery(CachedPlanSource *plansource,
 		/* OK, doesn't return tuples */
 	}
 	else if (resultDesc == NULL || plansource->resultDesc == NULL ||
-			 !equalTupleDescs(resultDesc, plansource->resultDesc))
+			 !equalRowTypes(resultDesc, plansource->resultDesc))
 	{
 		/* can we give a better error message? */
 		if (plansource->fixed_result)
@@ -1233,7 +1256,7 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 
 	/* Flag the plan as in use by caller */
 	if (owner)
-		ResourceOwnerEnlargePlanCacheRefs(owner);
+		ResourceOwnerEnlarge(owner);
 	plan->refcount++;
 	if (owner)
 		ResourceOwnerRememberPlanCacheRef(owner, plan);
@@ -1396,7 +1419,7 @@ CachedPlanAllowsSimpleValidityCheck(CachedPlanSource *plansource,
 	/* Bump refcount if requested. */
 	if (owner)
 	{
-		ResourceOwnerEnlargePlanCacheRefs(owner);
+		ResourceOwnerEnlarge(owner);
 		plan->refcount++;
 		ResourceOwnerRememberPlanCacheRef(owner, plan);
 	}
@@ -1457,7 +1480,7 @@ CachedPlanIsSimplyValid(CachedPlanSource *plansource, CachedPlan *plan,
 	/* It's still good.  Bump refcount if requested. */
 	if (owner)
 	{
-		ResourceOwnerEnlargePlanCacheRefs(owner);
+		ResourceOwnerEnlarge(owner);
 		plan->refcount++;
 		ResourceOwnerRememberPlanCacheRef(owner, plan);
 	}
@@ -1884,8 +1907,7 @@ ScanQueryForLocks(Query *parsetree, bool acquire)
 	 */
 	if (parsetree->hasSubLinks)
 	{
-		query_tree_walker(parsetree, ScanQueryWalker,
-						  (void *) &acquire,
+		query_tree_walker(parsetree, ScanQueryWalker, &acquire,
 						  QTW_IGNORE_RC_SUBQUERIES);
 	}
 }
@@ -1911,8 +1933,7 @@ ScanQueryWalker(Node *node, bool *acquire)
 	 * Do NOT recurse into Query nodes, because ScanQueryForLocks already
 	 * processed subselects of subselects for us.
 	 */
-	return expression_tree_walker(node, ScanQueryWalker,
-								  (void *) acquire);
+	return expression_tree_walker(node, ScanQueryWalker, acquire);
 }
 
 /*
@@ -2202,4 +2223,21 @@ ResetPlanCache(void)
 
 		cexpr->is_valid = false;
 	}
+}
+
+/*
+ * Release all CachedPlans remembered by 'owner'
+ */
+void
+ReleaseAllPlanCacheRefsInOwner(ResourceOwner owner)
+{
+	ResourceOwnerReleaseAllOfKind(owner, &planref_resowner_desc);
+}
+
+/* ResourceOwner callbacks */
+
+static void
+ResOwnerReleaseCachedPlan(Datum res)
+{
+	ReleaseCachedPlan((CachedPlan *) DatumGetPointer(res), NULL);
 }

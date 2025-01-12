@@ -3,7 +3,7 @@
  * connection.c
  *		  Connection management functions for postgres_fdw
  *
- * Portions Copyright (c) 2012-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/postgres_fdw/connection.c
@@ -12,7 +12,10 @@
  */
 #include "postgres.h"
 
-#include "access/htup_details.h"
+#if HAVE_POLL_H
+#include <poll.h>
+#endif
+
 #include "access/xact.h"
 #include "catalog/pg_user_mapping.h"
 #include "commands/defrem.h"
@@ -23,13 +26,10 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postgres_fdw.h"
-#include "storage/fd.h"
 #include "storage/latch.h"
 #include "utils/builtins.h"
-#include "utils/datetime.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
-#include "utils/memutils.h"
 #include "utils/syscache.h"
 
 /*
@@ -95,6 +95,13 @@ static uint32 pgfdw_we_get_result = 0;
  */
 #define CONNECTION_CLEANUP_TIMEOUT	30000
 
+/*
+ * Milliseconds to wait before issuing another cancel request.  This covers
+ * the race condition where the remote session ignored our cancel request
+ * because it arrived while idle.
+ */
+#define RETRY_CANCEL_TIMEOUT	1000
+
 /* Macro for constructing abort command to be sent */
 #define CONSTRUCT_ABORT_COMMAND(sql, entry, toplevel) \
 	do { \
@@ -108,9 +115,19 @@ static uint32 pgfdw_we_get_result = 0;
 	} while(0)
 
 /*
+ * Extension version number, for supporting older extension versions' objects
+ */
+enum pgfdwVersion
+{
+	PGFDW_V1_1 = 0,
+	PGFDW_V1_2,
+};
+
+/*
  * SQL functions
  */
 PG_FUNCTION_INFO_V1(postgres_fdw_get_connections);
+PG_FUNCTION_INFO_V1(postgres_fdw_get_connections_1_2);
 PG_FUNCTION_INFO_V1(postgres_fdw_disconnect);
 PG_FUNCTION_INFO_V1(postgres_fdw_disconnect_all);
 
@@ -133,8 +150,9 @@ static void pgfdw_inval_callback(Datum arg, int cacheid, uint32 hashvalue);
 static void pgfdw_reject_incomplete_xact_state_change(ConnCacheEntry *entry);
 static void pgfdw_reset_xact_state(ConnCacheEntry *entry, bool toplevel);
 static bool pgfdw_cancel_query(PGconn *conn);
-static bool pgfdw_cancel_query_begin(PGconn *conn);
+static bool pgfdw_cancel_query_begin(PGconn *conn, TimestampTz endtime);
 static bool pgfdw_cancel_query_end(PGconn *conn, TimestampTz endtime,
+								   TimestampTz retrycanceltime,
 								   bool consume_input);
 static bool pgfdw_exec_cleanup_query(PGconn *conn, const char *query,
 									 bool ignore_errors);
@@ -144,6 +162,7 @@ static bool pgfdw_exec_cleanup_query_end(PGconn *conn, const char *query,
 										 bool consume_input,
 										 bool ignore_errors);
 static bool pgfdw_get_cleanup_result(PGconn *conn, TimestampTz endtime,
+									 TimestampTz retrycanceltime,
 									 PGresult **result, bool *timed_out);
 static void pgfdw_abort_cleanup(ConnCacheEntry *entry, bool toplevel);
 static bool pgfdw_abort_cleanup_begin(ConnCacheEntry *entry, bool toplevel,
@@ -159,6 +178,10 @@ static void pgfdw_security_check(const char **keywords, const char **values,
 								 UserMapping *user, PGconn *conn);
 static bool UserMappingPasswordRequired(UserMapping *user);
 static bool disconnect_cached_connections(Oid serverid);
+static void postgres_fdw_get_connections_internal(FunctionCallInfo fcinfo,
+												  enum pgfdwVersion api_version);
+static int	pgfdw_conn_check(PGconn *conn);
+static bool pgfdw_conn_checkable(void);
 
 /*
  * Get a PGconn which can be used to execute queries on the remote PostgreSQL
@@ -186,6 +209,10 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
 	if (ConnectionHash == NULL)
 	{
 		HASHCTL		ctl;
+
+		if (pgfdw_we_get_result == 0)
+			pgfdw_we_get_result =
+				WaitEventExtensionNew("PostgresFdwGetResult");
 
 		ctl.keysize = sizeof(ConnCacheKey);
 		ctl.entrysize = sizeof(ConnCacheEntry);
@@ -667,10 +694,12 @@ configure_remote_session(PGconn *conn)
 	 * anyway.  However it makes the regression test outputs more predictable.
 	 *
 	 * We don't risk setting remote zone equal to ours, since the remote
-	 * server might use a different timezone database.  Instead, use UTC
-	 * (quoted, because very old servers are picky about case).
+	 * server might use a different timezone database.  Instead, use GMT
+	 * (quoted, because very old servers are picky about case).  That's
+	 * guaranteed to work regardless of the remote's timezone database,
+	 * because pg_tzset() hard-wires it (at least in PG 9.2 and later).
 	 */
-	do_sql_command(conn, "SET timezone = 'UTC'");
+	do_sql_command(conn, "SET timezone = 'GMT'");
 
 	/*
 	 * Set values needed to ensure unambiguous data output from remote.  (This
@@ -716,7 +745,7 @@ do_sql_command_end(PGconn *conn, const char *sql, bool consume_input)
 	 */
 	if (consume_input && !PQconsumeInput(conn))
 		pgfdw_report_error(ERROR, NULL, conn, false, sql);
-	res = pgfdw_get_result(conn, sql);
+	res = pgfdw_get_result(conn);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 		pgfdw_report_error(ERROR, res, conn, true, sql);
 	PQclear(res);
@@ -819,7 +848,9 @@ GetPrepStmtNumber(PGconn *conn)
 /*
  * Submit a query and wait for the result.
  *
- * This function is interruptible by signals.
+ * Since we don't use non-blocking mode, this can't process interrupts while
+ * pushing the query text to the server.  That risk is relatively small, so we
+ * ignore that for now.
  *
  * Caller is responsible for the error handling on the result.
  */
@@ -830,81 +861,20 @@ pgfdw_exec_query(PGconn *conn, const char *query, PgFdwConnState *state)
 	if (state && state->pendingAreq)
 		process_pending_request(state->pendingAreq);
 
-	/*
-	 * Submit a query.  Since we don't use non-blocking mode, this also can
-	 * block.  But its risk is relatively small, so we ignore that for now.
-	 */
 	if (!PQsendQuery(conn, query))
-		pgfdw_report_error(ERROR, NULL, conn, false, query);
-
-	/* Wait for the result. */
-	return pgfdw_get_result(conn, query);
+		return NULL;
+	return pgfdw_get_result(conn);
 }
 
 /*
- * Wait for the result from a prior asynchronous execution function call.
- *
- * This function offers quick responsiveness by checking for any interruptions.
- *
- * This function emulates PQexec()'s behavior of returning the last result
- * when there are many.
+ * Wrap libpqsrv_get_result_last(), adding wait event.
  *
  * Caller is responsible for the error handling on the result.
  */
 PGresult *
-pgfdw_get_result(PGconn *conn, const char *query)
+pgfdw_get_result(PGconn *conn)
 {
-	PGresult   *volatile last_res = NULL;
-
-	/* In what follows, do not leak any PGresults on an error. */
-	PG_TRY();
-	{
-		for (;;)
-		{
-			PGresult   *res;
-
-			while (PQisBusy(conn))
-			{
-				int			wc;
-
-				/* first time, allocate or get the custom wait event */
-				if (pgfdw_we_get_result == 0)
-					pgfdw_we_get_result = WaitEventExtensionNew("PostgresFdwGetResult");
-
-				/* Sleep until there's something to do */
-				wc = WaitLatchOrSocket(MyLatch,
-									   WL_LATCH_SET | WL_SOCKET_READABLE |
-									   WL_EXIT_ON_PM_DEATH,
-									   PQsocket(conn),
-									   -1L, pgfdw_we_get_result);
-				ResetLatch(MyLatch);
-
-				CHECK_FOR_INTERRUPTS();
-
-				/* Data available in socket? */
-				if (wc & WL_SOCKET_READABLE)
-				{
-					if (!PQconsumeInput(conn))
-						pgfdw_report_error(ERROR, NULL, conn, false, query);
-				}
-			}
-
-			res = PQgetResult(conn);
-			if (res == NULL)
-				break;			/* query is complete */
-
-			PQclear(last_res);
-			last_res = res;
-		}
-	}
-	PG_CATCH();
-	{
-		PQclear(last_res);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-
-	return last_res;
+	return libpqsrv_get_result_last(conn, pgfdw_we_get_result);
 }
 
 /*
@@ -945,8 +915,8 @@ pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
 
 		/*
 		 * If we don't get a message from the PGresult, try the PGconn.  This
-		 * is needed because for connection-level failures, PQexec may just
-		 * return NULL, not a PGresult at all.
+		 * is needed because for connection-level failures, PQgetResult may
+		 * just return NULL, not a PGresult at all.
 		 */
 		if (message_primary == NULL)
 			message_primary = pchomp(PQerrorMessage(conn));
@@ -1046,7 +1016,8 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 					 */
 					if (entry->have_prep_stmt && entry->have_error)
 					{
-						res = PQexec(entry->conn, "DEALLOCATE ALL");
+						res = pgfdw_exec_query(entry->conn, "DEALLOCATE ALL",
+											   NULL);
 						PQclear(res);
 					}
 					entry->have_prep_stmt = false;
@@ -1360,51 +1331,54 @@ pgfdw_reset_xact_state(ConnCacheEntry *entry, bool toplevel)
 static bool
 pgfdw_cancel_query(PGconn *conn)
 {
+	TimestampTz now = GetCurrentTimestamp();
 	TimestampTz endtime;
+	TimestampTz retrycanceltime;
 
 	/*
 	 * If it takes too long to cancel the query and discard the result, assume
 	 * the connection is dead.
 	 */
-	endtime = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
-										  CONNECTION_CLEANUP_TIMEOUT);
-
-	if (!pgfdw_cancel_query_begin(conn))
-		return false;
-	return pgfdw_cancel_query_end(conn, endtime, false);
-}
-
-static bool
-pgfdw_cancel_query_begin(PGconn *conn)
-{
-	PGcancel   *cancel;
-	char		errbuf[256];
+	endtime = TimestampTzPlusMilliseconds(now, CONNECTION_CLEANUP_TIMEOUT);
 
 	/*
-	 * Issue cancel request.  Unfortunately, there's no good way to limit the
-	 * amount of time that we might block inside PQgetCancel().
+	 * Also, lose patience and re-issue the cancel request after a little bit.
+	 * (This serves to close some race conditions.)
 	 */
-	if ((cancel = PQgetCancel(conn)))
-	{
-		if (!PQcancel(cancel, errbuf, sizeof(errbuf)))
-		{
-			ereport(WARNING,
-					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("could not send cancel request: %s",
-							errbuf)));
-			PQfreeCancel(cancel);
-			return false;
-		}
-		PQfreeCancel(cancel);
-	}
+	retrycanceltime = TimestampTzPlusMilliseconds(now, RETRY_CANCEL_TIMEOUT);
 
-	return true;
+	if (!pgfdw_cancel_query_begin(conn, endtime))
+		return false;
+	return pgfdw_cancel_query_end(conn, endtime, retrycanceltime, false);
+}
+
+/*
+ * Submit a cancel request to the given connection, waiting only until
+ * the given time.
+ *
+ * We sleep interruptibly until we receive confirmation that the cancel
+ * request has been accepted, and if it is, return true; if the timeout
+ * lapses without that, or the request fails for whatever reason, return
+ * false.
+ */
+static bool
+pgfdw_cancel_query_begin(PGconn *conn, TimestampTz endtime)
+{
+	const char *errormsg = libpqsrv_cancel(conn, endtime);
+
+	if (errormsg != NULL)
+		ereport(WARNING,
+				errcode(ERRCODE_CONNECTION_FAILURE),
+				errmsg("could not send cancel request: %s", errormsg));
+
+	return errormsg == NULL;
 }
 
 static bool
-pgfdw_cancel_query_end(PGconn *conn, TimestampTz endtime, bool consume_input)
+pgfdw_cancel_query_end(PGconn *conn, TimestampTz endtime,
+					   TimestampTz retrycanceltime, bool consume_input)
 {
-	PGresult   *result = NULL;
+	PGresult   *result;
 	bool		timed_out;
 
 	/*
@@ -1423,7 +1397,8 @@ pgfdw_cancel_query_end(PGconn *conn, TimestampTz endtime, bool consume_input)
 	}
 
 	/* Get and discard the result of the query. */
-	if (pgfdw_get_cleanup_result(conn, endtime, &result, &timed_out))
+	if (pgfdw_get_cleanup_result(conn, endtime, retrycanceltime,
+								 &result, &timed_out))
 	{
 		if (timed_out)
 			ereport(WARNING,
@@ -1476,6 +1451,8 @@ pgfdw_exec_cleanup_query(PGconn *conn, const char *query, bool ignore_errors)
 static bool
 pgfdw_exec_cleanup_query_begin(PGconn *conn, const char *query)
 {
+	Assert(query != NULL);
+
 	/*
 	 * Submit a query.  Since we don't use non-blocking mode, this also can
 	 * block.  But its risk is relatively small, so we ignore that for now.
@@ -1494,8 +1471,10 @@ pgfdw_exec_cleanup_query_end(PGconn *conn, const char *query,
 							 TimestampTz endtime, bool consume_input,
 							 bool ignore_errors)
 {
-	PGresult   *result = NULL;
+	PGresult   *result;
 	bool		timed_out;
+
+	Assert(query != NULL);
 
 	/*
 	 * If requested, consume whatever data is available from the socket. (Note
@@ -1510,12 +1489,12 @@ pgfdw_exec_cleanup_query_end(PGconn *conn, const char *query,
 	}
 
 	/* Get the result of the query. */
-	if (pgfdw_get_cleanup_result(conn, endtime, &result, &timed_out))
+	if (pgfdw_get_cleanup_result(conn, endtime, endtime, &result, &timed_out))
 	{
 		if (timed_out)
 			ereport(WARNING,
 					(errmsg("could not get query result due to timeout"),
-					 query ? errcontext("remote SQL command: %s", query) : 0));
+					 errcontext("remote SQL command: %s", query)));
 		else
 			pgfdw_report_error(WARNING, NULL, conn, false, query);
 
@@ -1534,28 +1513,36 @@ pgfdw_exec_cleanup_query_end(PGconn *conn, const char *query,
 }
 
 /*
- * Get, during abort cleanup, the result of a query that is in progress.  This
- * might be a query that is being interrupted by transaction abort, or it might
- * be a query that was initiated as part of transaction abort to get the remote
- * side back to the appropriate state.
+ * Get, during abort cleanup, the result of a query that is in progress.
+ * This might be a query that is being interrupted by a cancel request or by
+ * transaction abort, or it might be a query that was initiated as part of
+ * transaction abort to get the remote side back to the appropriate state.
  *
- * endtime is the time at which we should give up and assume the remote
- * side is dead.  Returns true if the timeout expired or connection trouble
- * occurred, false otherwise.  Sets *result except in case of a timeout.
- * Sets timed_out to true only when the timeout expired.
+ * endtime is the time at which we should give up and assume the remote side
+ * is dead.  retrycanceltime is the time at which we should issue a fresh
+ * cancel request (pass the same value as endtime if this is not wanted).
+ *
+ * Returns true if the timeout expired or connection trouble occurred,
+ * false otherwise.  Sets *result except in case of a true result.
+ * Sets *timed_out to true only when the timeout expired.
  */
 static bool
-pgfdw_get_cleanup_result(PGconn *conn, TimestampTz endtime, PGresult **result,
+pgfdw_get_cleanup_result(PGconn *conn, TimestampTz endtime,
+						 TimestampTz retrycanceltime,
+						 PGresult **result,
 						 bool *timed_out)
 {
 	volatile bool failed = false;
 	PGresult   *volatile last_res = NULL;
 
+	*result = NULL;
 	*timed_out = false;
 
 	/* In what follows, do not leak any PGresults on an error. */
 	PG_TRY();
 	{
+		int			canceldelta = RETRY_CANCEL_TIMEOUT * 2;
+
 		for (;;)
 		{
 			PGresult   *res;
@@ -1566,8 +1553,33 @@ pgfdw_get_cleanup_result(PGconn *conn, TimestampTz endtime, PGresult **result,
 				TimestampTz now = GetCurrentTimestamp();
 				long		cur_timeout;
 
+				/* If timeout has expired, give up. */
+				if (now >= endtime)
+				{
+					*timed_out = true;
+					failed = true;
+					goto exit;
+				}
+
+				/* If we need to re-issue the cancel request, do that. */
+				if (now >= retrycanceltime)
+				{
+					/* We ignore failure to issue the repeated request. */
+					(void) libpqsrv_cancel(conn, endtime);
+
+					/* Recompute "now" in case that took measurable time. */
+					now = GetCurrentTimestamp();
+
+					/* Adjust re-cancel timeout in increasing steps. */
+					retrycanceltime = TimestampTzPlusMilliseconds(now,
+																  canceldelta);
+					canceldelta += canceldelta;
+				}
+
 				/* If timeout has expired, give up, else get sleep time. */
-				cur_timeout = TimestampDifferenceMilliseconds(now, endtime);
+				cur_timeout = TimestampDifferenceMilliseconds(now,
+															  Min(endtime,
+																  retrycanceltime));
 				if (cur_timeout <= 0)
 				{
 					*timed_out = true;
@@ -1739,7 +1751,11 @@ pgfdw_abort_cleanup_begin(ConnCacheEntry *entry, bool toplevel,
 	 */
 	if (PQtransactionStatus(entry->conn) == PQTRANS_ACTIVE)
 	{
-		if (!pgfdw_cancel_query_begin(entry->conn))
+		TimestampTz endtime;
+
+		endtime = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+											  CONNECTION_CLEANUP_TIMEOUT);
+		if (!pgfdw_cancel_query_begin(entry->conn, endtime))
 			return false;		/* Unable to cancel running query */
 		*cancel_requested = lappend(*cancel_requested, entry);
 	}
@@ -1884,7 +1900,9 @@ pgfdw_finish_abort_cleanup(List *pending_entries, List *cancel_requested,
 		foreach(lc, cancel_requested)
 		{
 			ConnCacheEntry *entry = (ConnCacheEntry *) lfirst(lc);
+			TimestampTz now = GetCurrentTimestamp();
 			TimestampTz endtime;
+			TimestampTz retrycanceltime;
 			char		sql[100];
 
 			Assert(entry->changing_xact_state);
@@ -1898,10 +1916,13 @@ pgfdw_finish_abort_cleanup(List *pending_entries, List *cancel_requested,
 			 * remaining entries in the list, leading to slamming that entry's
 			 * connection shut.
 			 */
-			endtime = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+			endtime = TimestampTzPlusMilliseconds(now,
 												  CONNECTION_CLEANUP_TIMEOUT);
+			retrycanceltime = TimestampTzPlusMilliseconds(now,
+														  RETRY_CANCEL_TIMEOUT);
 
-			if (!pgfdw_cancel_query_end(entry->conn, endtime, true))
+			if (!pgfdw_cancel_query_end(entry->conn, endtime,
+										retrycanceltime, true))
 			{
 				/* Unable to cancel running query */
 				pgfdw_reset_xact_state(entry, toplevel);
@@ -2026,23 +2047,39 @@ pgfdw_finish_abort_cleanup(List *pending_entries, List *cancel_requested,
 	}
 }
 
+/* Number of output arguments (columns) for various API versions */
+#define POSTGRES_FDW_GET_CONNECTIONS_COLS_V1_1	2
+#define POSTGRES_FDW_GET_CONNECTIONS_COLS_V1_2	5
+#define POSTGRES_FDW_GET_CONNECTIONS_COLS	5	/* maximum of above */
+
 /*
- * List active foreign server connections.
+ * Internal function used by postgres_fdw_get_connections variants.
  *
- * This function takes no input parameter and returns setof record made of
- * following values:
+ * For API version 1.1, this function takes no input parameter and
+ * returns a set of records with the following values:
+ *
  * - server_name - server name of active connection. In case the foreign server
  *   is dropped but still the connection is active, then the server name will
  *   be NULL in output.
  * - valid - true/false representing whether the connection is valid or not.
- * 	 Note that the connections can get invalidated in pgfdw_inval_callback.
+ *   Note that connections can become invalid in pgfdw_inval_callback.
+ *
+ * For API version 1.2 and later, this function takes an input parameter
+ * to check a connection status and returns the following
+ * additional values along with the three values from version 1.1:
+ *
+ * - user_name - the local user name of the active connection. In case the
+ *   user mapping is dropped but the connection is still active, then the
+ *   user name will be NULL in the output.
+ * - used_in_xact - true if the connection is used in the current transaction.
+ * - closed - true if the connection is closed.
  *
  * No records are returned when there are no cached connections at all.
  */
-Datum
-postgres_fdw_get_connections(PG_FUNCTION_ARGS)
+static void
+postgres_fdw_get_connections_internal(FunctionCallInfo fcinfo,
+									  enum pgfdwVersion api_version)
 {
-#define POSTGRES_FDW_GET_CONNECTIONS_COLS	2
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	HASH_SEQ_STATUS scan;
 	ConnCacheEntry *entry;
@@ -2051,7 +2088,22 @@ postgres_fdw_get_connections(PG_FUNCTION_ARGS)
 
 	/* If cache doesn't exist, we return no records */
 	if (!ConnectionHash)
-		PG_RETURN_VOID();
+		return;
+
+	/* Check we have the expected number of output arguments */
+	switch (rsinfo->setDesc->natts)
+	{
+		case POSTGRES_FDW_GET_CONNECTIONS_COLS_V1_1:
+			if (api_version != PGFDW_V1_1)
+				elog(ERROR, "incorrect number of output arguments");
+			break;
+		case POSTGRES_FDW_GET_CONNECTIONS_COLS_V1_2:
+			if (api_version != PGFDW_V1_2)
+				elog(ERROR, "incorrect number of output arguments");
+			break;
+		default:
+			elog(ERROR, "incorrect number of output arguments");
+	}
 
 	hash_seq_init(&scan, ConnectionHash);
 	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
@@ -2059,6 +2111,7 @@ postgres_fdw_get_connections(PG_FUNCTION_ARGS)
 		ForeignServer *server;
 		Datum		values[POSTGRES_FDW_GET_CONNECTIONS_COLS] = {0};
 		bool		nulls[POSTGRES_FDW_GET_CONNECTIONS_COLS] = {0};
+		int			i = 0;
 
 		/* We only look for open remote connections */
 		if (!entry->conn)
@@ -2103,15 +2156,87 @@ postgres_fdw_get_connections(PG_FUNCTION_ARGS)
 			Assert(entry->conn && entry->xact_depth > 0 && entry->invalidated);
 
 			/* Show null, if no server name was found */
-			nulls[0] = true;
+			nulls[i++] = true;
 		}
 		else
-			values[0] = CStringGetTextDatum(server->servername);
+			values[i++] = CStringGetTextDatum(server->servername);
 
-		values[1] = BoolGetDatum(!entry->invalidated);
+		if (api_version >= PGFDW_V1_2)
+		{
+			HeapTuple	tp;
+
+			/* Use the system cache to obtain the user mapping */
+			tp = SearchSysCache1(USERMAPPINGOID, ObjectIdGetDatum(entry->key));
+
+			/*
+			 * Just like in the foreign server case, user mappings can also be
+			 * dropped in the current explicit transaction. Therefore, the
+			 * similar check as in the server case is required.
+			 */
+			if (!HeapTupleIsValid(tp))
+			{
+				/*
+				 * If we reach here, this entry must have been invalidated in
+				 * pgfdw_inval_callback, same as in the server case.
+				 */
+				Assert(entry->conn && entry->xact_depth > 0 &&
+					   entry->invalidated);
+
+				nulls[i++] = true;
+			}
+			else
+			{
+				Oid			userid;
+
+				userid = ((Form_pg_user_mapping) GETSTRUCT(tp))->umuser;
+				values[i++] = CStringGetTextDatum(MappingUserName(userid));
+				ReleaseSysCache(tp);
+			}
+		}
+
+		values[i++] = BoolGetDatum(!entry->invalidated);
+
+		if (api_version >= PGFDW_V1_2)
+		{
+			bool		check_conn = PG_GETARG_BOOL(0);
+
+			/* Is this connection used in the current transaction? */
+			values[i++] = BoolGetDatum(entry->xact_depth > 0);
+
+			/*
+			 * If a connection status check is requested and supported, return
+			 * whether the connection is closed. Otherwise, return NULL.
+			 */
+			if (check_conn && pgfdw_conn_checkable())
+				values[i++] = BoolGetDatum(pgfdw_conn_check(entry->conn) != 0);
+			else
+				nulls[i++] = true;
+		}
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
+}
+
+/*
+ * List active foreign server connections.
+ *
+ * The SQL API of this function has changed multiple times, and will likely
+ * do so again in future.  To support the case where a newer version of this
+ * loadable module is being used with an old SQL declaration of the function,
+ * we continue to support the older API versions.
+ */
+Datum
+postgres_fdw_get_connections_1_2(PG_FUNCTION_ARGS)
+{
+	postgres_fdw_get_connections_internal(fcinfo, PGFDW_V1_2);
+
+	PG_RETURN_VOID();
+}
+
+Datum
+postgres_fdw_get_connections(PG_FUNCTION_ARGS)
+{
+	postgres_fdw_get_connections_internal(fcinfo, PGFDW_V1_1);
 
 	PG_RETURN_VOID();
 }
@@ -2240,4 +2365,58 @@ disconnect_cached_connections(Oid serverid)
 	}
 
 	return result;
+}
+
+/*
+ * Check if the remote server closed the connection.
+ *
+ * Returns 1 if the connection is closed, -1 if an error occurred,
+ * and 0 if it's not closed or if the connection check is unavailable
+ * on this platform.
+ */
+static int
+pgfdw_conn_check(PGconn *conn)
+{
+	int			sock = PQsocket(conn);
+
+	if (PQstatus(conn) != CONNECTION_OK || sock == -1)
+		return -1;
+
+#if (defined(HAVE_POLL) && defined(POLLRDHUP))
+	{
+		struct pollfd input_fd;
+		int			result;
+
+		input_fd.fd = sock;
+		input_fd.events = POLLRDHUP;
+		input_fd.revents = 0;
+
+		do
+			result = poll(&input_fd, 1, 0);
+		while (result < 0 && errno == EINTR);
+
+		if (result < 0)
+			return -1;
+
+		return (input_fd.revents &
+				(POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) ? 1 : 0;
+	}
+#else
+	return 0;
+#endif
+}
+
+/*
+ * Check if connection status checking is available on this platform.
+ *
+ * Returns true if available, false otherwise.
+ */
+static bool
+pgfdw_conn_checkable(void)
+{
+#if (defined(HAVE_POLL) && defined(POLLRDHUP))
+	return true;
+#else
+	return false;
+#endif
 }

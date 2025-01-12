@@ -5,7 +5,7 @@
  *
  * See src/backend/utils/misc/README for design notes.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
  *	  src/include/utils/guc_tables.h
  *
@@ -72,6 +72,7 @@ enum config_group
 	WAL_RECOVERY,
 	WAL_ARCHIVE_RECOVERY,
 	WAL_RECOVERY_TARGET,
+	WAL_SUMMARIZATION,
 	REPLICATION_SENDING,
 	REPLICATION_PRIMARY,
 	REPLICATION_STANDBY,
@@ -93,7 +94,7 @@ enum config_group
 	CLIENT_CONN_OTHER,
 	LOCK_MANAGEMENT,
 	COMPAT_OPTIONS_PREVIOUS,
-	COMPAT_OPTIONS_CLIENT,
+	COMPAT_OPTIONS_OTHER,
 	ERROR_HANDLING_OPTIONS,
 	PRESET_OPTIONS,
 	CUSTOM_OPTIONS,
@@ -240,6 +241,16 @@ struct config_real
 	void	   *reset_extra;
 };
 
+/*
+ * A note about string GUCs: the boot_val is allowed to be NULL, which leads
+ * to the reset_val and the actual variable value (*variable) also being NULL.
+ * However, there is no way to set a NULL value subsequently using
+ * set_config_option or any other GUC API.  Also, GUC APIs such as SHOW will
+ * display a NULL value as an empty string.  Callers that choose to use a NULL
+ * boot_val should overwrite the setting later in startup, or else be careful
+ * that NULL doesn't have semantics that are visibly different from an empty
+ * string.
+ */
 struct config_string
 {
 	struct config_generic gen;

@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2025, PostgreSQL Global Development Group
 
 ### Compute pgxs_data, used in src/meson.build to generate Makefile.global
 ### etc, that's complete enough for PGXS to work.
@@ -54,6 +54,7 @@ pgxs_kv = {
 
   'enable_rpath': get_option('rpath') ? 'yes' : 'no',
   'enable_nls': libintl.found() ? 'yes' : 'no',
+  'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
   'enable_tap_tests': tap_tests_enabled ? 'yes' : 'no',
   'enable_debug': get_option('debug') ? 'yes' : 'no',
   'enable_coverage': 'no',
@@ -97,6 +98,8 @@ pgxs_kv = {
   'CXXFLAGS_SL_MODULE': ' '.join(cxxflags_mod),
   'PERMIT_DECLARATION_AFTER_STATEMENT':
     ' '.join(cflags_no_decl_after_statement),
+  'PERMIT_MISSING_VARIABLE_DECLARATIONS':
+    ' '.join(cflags_no_missing_var_decls),
 
   'CFLAGS_CRC': ' '.join(cflags_crc),
   'CFLAGS_UNROLL_LOOPS': ' '.join(unroll_loops_cflags),
@@ -177,6 +180,7 @@ pgxs_empty = [
 
   # Not needed because we don't build the server / PLs with the generated makefile
   'LIBOBJS', 'PG_CRC32C_OBJS', 'TAS',
+  'PG_TEST_EXTRA',
   'DTRACEFLAGS', # only server has dtrace probes
 
   'perl_archlibexp', 'perl_embed_ccflags', 'perl_embed_ldflags', 'perl_includespec', 'perl_privlibexp',

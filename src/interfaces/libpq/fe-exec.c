@@ -3,7 +3,7 @@
  * fe-exec.c
  *	  functions related to sending a query down to the backend
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -41,7 +41,8 @@ char	   *const pgresStatus[] = {
 	"PGRES_COPY_BOTH",
 	"PGRES_SINGLE_TUPLE",
 	"PGRES_PIPELINE_SYNC",
-	"PGRES_PIPELINE_ABORTED"
+	"PGRES_PIPELINE_ABORTED",
+	"PGRES_TUPLES_CHUNK"
 };
 
 /* We return this if we're unable to make a PGresult at all */
@@ -81,6 +82,7 @@ static int	PQsendTypedCommand(PGconn *conn, char command, char type,
 							   const char *target);
 static int	check_field_number(const PGresult *res, int field_num);
 static void pqPipelineProcessQueue(PGconn *conn);
+static int	pqPipelineSyncInternal(PGconn *conn, bool immediate_flush);
 static int	pqPipelineFlush(PGconn *conn);
 
 
@@ -199,6 +201,7 @@ PQmakeEmptyPGresult(PGconn *conn, ExecStatusType status)
 			case PGRES_COPY_IN:
 			case PGRES_COPY_BOTH:
 			case PGRES_SINGLE_TUPLE:
+			case PGRES_TUPLES_CHUNK:
 				/* non-error cases */
 				break;
 			default:
@@ -770,7 +773,7 @@ PQclear(PGresult *res)
 /*
  * Handy subroutine to deallocate any partially constructed async result.
  *
- * Any "next" result gets cleared too.
+ * Any "saved" result gets cleared too.
  */
 void
 pqClearAsyncResult(PGconn *conn)
@@ -778,8 +781,8 @@ pqClearAsyncResult(PGconn *conn)
 	PQclear(conn->result);
 	conn->result = NULL;
 	conn->error_result = false;
-	PQclear(conn->next_result);
-	conn->next_result = NULL;
+	PQclear(conn->saved_result);
+	conn->saved_result = NULL;
 }
 
 /*
@@ -841,6 +844,8 @@ pqSaveWriteError(PGconn *conn)
  * using whatever is in conn->errorMessage.  In any case, clear the async
  * result storage, and update our notion of how much error text has been
  * returned to the application.
+ *
+ * Note that in no case (not even OOM) do we return NULL.
  */
 PGresult *
 pqPrepareAsyncResult(PGconn *conn)
@@ -908,14 +913,14 @@ pqPrepareAsyncResult(PGconn *conn)
 	}
 
 	/*
-	 * Replace conn->result with next_result, if any.  In the normal case
-	 * there isn't a next result and we're just dropping ownership of the
-	 * current result.  In single-row mode this restores the situation to what
-	 * it was before we created the current single-row result.
+	 * Replace conn->result with saved_result, if any.  In the normal case
+	 * there isn't a saved result and we're just dropping ownership of the
+	 * current result.  In partial-result mode this restores the situation to
+	 * what it was before we created the current partial result.
 	 */
-	conn->result = conn->next_result;
-	conn->error_result = false; /* next_result is never an error */
-	conn->next_result = NULL;
+	conn->result = conn->saved_result;
+	conn->error_result = false; /* saved_result is never an error */
+	conn->saved_result = NULL;
 
 	return res;
 }
@@ -1196,11 +1201,6 @@ pqSaveParameterStatus(PGconn *conn, const char *name, const char *value)
  * On error, *errmsgp can be set to an error string to be returned.
  * (Such a string should already be translated via libpq_gettext().)
  * If it is left NULL, the error is presumed to be "out of memory".
- *
- * In single-row mode, we create a new result holding just the current row,
- * stashing the previous result in conn->next_result so that it becomes
- * active again after pqPrepareAsyncResult().  This allows the result metadata
- * (column descriptions) to be carried forward to each result row.
  */
 int
 pqRowProcessor(PGconn *conn, const char **errmsgp)
@@ -1212,11 +1212,14 @@ pqRowProcessor(PGconn *conn, const char **errmsgp)
 	int			i;
 
 	/*
-	 * In single-row mode, make a new PGresult that will hold just this one
-	 * row; the original conn->result is left unchanged so that it can be used
-	 * again as the template for future rows.
+	 * In partial-result mode, if we don't already have a partial PGresult
+	 * then make one by cloning conn->result (which should hold the correct
+	 * result metadata by now).  Then the original conn->result is moved over
+	 * to saved_result so that we can re-use it as a reference for future
+	 * partial results.  The saved result will become active again after
+	 * pqPrepareAsyncResult() returns the partial result to the application.
 	 */
-	if (conn->singleRowMode)
+	if (conn->partialResMode && conn->saved_result == NULL)
 	{
 		/* Copy everything that should be in the result at this point */
 		res = PQcopyResult(res,
@@ -1224,6 +1227,11 @@ pqRowProcessor(PGconn *conn, const char **errmsgp)
 						   PG_COPYRES_NOTICEHOOKS);
 		if (!res)
 			return 0;
+		/* Change result status to appropriate special value */
+		res->resultStatus = (conn->singleRowMode ? PGRES_SINGLE_TUPLE : PGRES_TUPLES_CHUNK);
+		/* And stash it as the active result */
+		conn->saved_result = conn->result;
+		conn->result = res;
 	}
 
 	/*
@@ -1238,7 +1246,7 @@ pqRowProcessor(PGconn *conn, const char **errmsgp)
 	tup = (PGresAttValue *)
 		pqResultAlloc(res, nfields * sizeof(PGresAttValue), true);
 	if (tup == NULL)
-		goto fail;
+		return 0;
 
 	for (i = 0; i < nfields; i++)
 	{
@@ -1257,7 +1265,7 @@ pqRowProcessor(PGconn *conn, const char **errmsgp)
 
 			val = (char *) pqResultAlloc(res, clen + 1, isbinary);
 			if (val == NULL)
-				goto fail;
+				return 0;
 
 			/* copy and zero-terminate the data (even if it's binary) */
 			memcpy(val, columns[i].value, clen);
@@ -1270,30 +1278,16 @@ pqRowProcessor(PGconn *conn, const char **errmsgp)
 
 	/* And add the tuple to the PGresult's tuple array */
 	if (!pqAddTuple(res, tup, errmsgp))
-		goto fail;
+		return 0;
 
 	/*
-	 * Success.  In single-row mode, make the result available to the client
-	 * immediately.
+	 * Success.  In partial-result mode, if we have enough rows then make the
+	 * result available to the client immediately.
 	 */
-	if (conn->singleRowMode)
-	{
-		/* Change result status to special single-row value */
-		res->resultStatus = PGRES_SINGLE_TUPLE;
-		/* Stash old result for re-use later */
-		conn->next_result = conn->result;
-		conn->result = res;
-		/* And mark the result ready to return */
+	if (conn->partialResMode && res->ntups >= conn->maxChunkSize)
 		conn->asyncStatus = PGASYNC_READY_MORE;
-	}
 
 	return 1;
-
-fail:
-	/* release locally allocated PGresult, if we made one */
-	if (res != conn->result)
-		PQclear(res);
-	return 0;
 }
 
 
@@ -1742,8 +1736,10 @@ PQsendQueryStart(PGconn *conn, bool newQuery)
 		 */
 		pqClearAsyncResult(conn);
 
-		/* reset single-row processing mode */
+		/* reset partial-result mode */
+		conn->partialResMode = false;
 		conn->singleRowMode = false;
+		conn->maxChunkSize = 0;
 	}
 
 	/* ready to send command message */
@@ -1923,29 +1919,60 @@ sendFailed:
 }
 
 /*
+ * Is it OK to change partial-result mode now?
+ */
+static bool
+canChangeResultMode(PGconn *conn)
+{
+	/*
+	 * Only allow changing the mode when we have launched a query and not yet
+	 * received any results.
+	 */
+	if (!conn)
+		return false;
+	if (conn->asyncStatus != PGASYNC_BUSY)
+		return false;
+	if (!conn->cmd_queue_head ||
+		(conn->cmd_queue_head->queryclass != PGQUERY_SIMPLE &&
+		 conn->cmd_queue_head->queryclass != PGQUERY_EXTENDED))
+		return false;
+	if (pgHavePendingResult(conn))
+		return false;
+	return true;
+}
+
+/*
  * Select row-by-row processing mode
  */
 int
 PQsetSingleRowMode(PGconn *conn)
 {
-	/*
-	 * Only allow setting the flag when we have launched a query and not yet
-	 * received any results.
-	 */
-	if (!conn)
+	if (canChangeResultMode(conn))
+	{
+		conn->partialResMode = true;
+		conn->singleRowMode = true;
+		conn->maxChunkSize = 1;
+		return 1;
+	}
+	else
 		return 0;
-	if (conn->asyncStatus != PGASYNC_BUSY)
-		return 0;
-	if (!conn->cmd_queue_head ||
-		(conn->cmd_queue_head->queryclass != PGQUERY_SIMPLE &&
-		 conn->cmd_queue_head->queryclass != PGQUERY_EXTENDED))
-		return 0;
-	if (pgHavePendingResult(conn))
-		return 0;
+}
 
-	/* OK, set flag */
-	conn->singleRowMode = true;
-	return 1;
+/*
+ * Select chunked results processing mode
+ */
+int
+PQsetChunkedRowsMode(PGconn *conn, int chunkSize)
+{
+	if (chunkSize > 0 && canChangeResultMode(conn))
+	{
+		conn->partialResMode = true;
+		conn->singleRowMode = false;
+		conn->maxChunkSize = chunkSize;
+		return 1;
+	}
+	else
+		return 0;
 }
 
 /*
@@ -2112,19 +2139,26 @@ PQgetResult(PGconn *conn)
 			break;
 
 		case PGASYNC_READY:
+			res = pqPrepareAsyncResult(conn);
 
 			/*
-			 * For any query type other than simple query protocol, we advance
-			 * the command queue here.  This is because for simple query
-			 * protocol we can get the READY state multiple times before the
-			 * command is actually complete, since the command string can
-			 * contain many queries.  In simple query protocol, the queue
-			 * advance is done by fe-protocol3 when it receives ReadyForQuery.
+			 * Normally pqPrepareAsyncResult will have left conn->result
+			 * empty.  Otherwise, "res" must be a not-full PGRES_TUPLES_CHUNK
+			 * result, which we want to return to the caller while staying in
+			 * PGASYNC_READY state.  Then the next call here will return the
+			 * empty PGRES_TUPLES_OK result that was restored from
+			 * saved_result, after which we can proceed.
 			 */
-			if (conn->cmd_queue_head &&
-				conn->cmd_queue_head->queryclass != PGQUERY_SIMPLE)
-				pqCommandQueueAdvance(conn);
-			res = pqPrepareAsyncResult(conn);
+			if (conn->result)
+			{
+				Assert(res->resultStatus == PGRES_TUPLES_CHUNK);
+				break;
+			}
+
+			/* Advance the queue as appropriate */
+			pqCommandQueueAdvance(conn, false,
+								  res->resultStatus == PGRES_PIPELINE_SYNC);
+
 			if (conn->pipelineStatus != PQ_PIPELINE_OFF)
 			{
 				/*
@@ -2144,7 +2178,7 @@ PQgetResult(PGconn *conn)
 				 * (In other words: we don't return a NULL after a pipeline
 				 * sync.)
 				 */
-				if (res && res->resultStatus == PGRES_PIPELINE_SYNC)
+				if (res->resultStatus == PGRES_PIPELINE_SYNC)
 					pqPipelineProcessQueue(conn);
 			}
 			else
@@ -2593,7 +2627,7 @@ PQsendTypedCommand(PGconn *conn, char command, char type, const char *target)
 	}
 	else
 	{
-		libpq_append_conn_error(conn, "unknown command type provided");
+		libpq_append_conn_error(conn, "unrecognized message type \"%c\"", command);
 		goto sendFailed;
 	}
 
@@ -3088,18 +3122,44 @@ PQexitPipelineMode(PGconn *conn)
 
 /*
  * pqCommandQueueAdvance
- *		Remove one query from the command queue, when we receive
- *		all results from the server that pertain to it.
+ *		Remove one query from the command queue, if appropriate.
+ *
+ * If we have received all results corresponding to the head element
+ * in the command queue, remove it.
+ *
+ * In simple query protocol we must not advance the command queue until the
+ * ReadyForQuery message has been received.  This is because in simple mode a
+ * command can have multiple queries, and we must process result for all of
+ * them before moving on to the next command.
+ *
+ * Another consideration is synchronization during error processing in
+ * extended query protocol: we refuse to advance the queue past a SYNC queue
+ * element, unless the result we've received is also a SYNC.  In particular
+ * this protects us from advancing when an error is received at an
+ * inappropriate moment.
  */
 void
-pqCommandQueueAdvance(PGconn *conn)
+pqCommandQueueAdvance(PGconn *conn, bool isReadyForQuery, bool gotSync)
 {
 	PGcmdQueueEntry *prevquery;
 
 	if (conn->cmd_queue_head == NULL)
 		return;
 
-	/* delink from queue */
+	/*
+	 * If processing a query of simple query protocol, we only advance the
+	 * queue when we receive the ReadyForQuery message for it.
+	 */
+	if (conn->cmd_queue_head->queryclass == PGQUERY_SIMPLE && !isReadyForQuery)
+		return;
+
+	/*
+	 * If we're waiting for a SYNC, don't advance the queue until we get one.
+	 */
+	if (conn->cmd_queue_head->queryclass == PGQUERY_SYNC && !gotSync)
+		return;
+
+	/* delink element from queue */
 	prevquery = conn->cmd_queue_head;
 	conn->cmd_queue_head = conn->cmd_queue_head->next;
 
@@ -3107,7 +3167,7 @@ pqCommandQueueAdvance(PGconn *conn)
 	if (conn->cmd_queue_head == NULL)
 		conn->cmd_queue_tail = NULL;
 
-	/* and make it recyclable */
+	/* and make the queue element recyclable */
 	prevquery->next = NULL;
 	pqRecycleCmdQueueEntry(conn, prevquery);
 }
@@ -3151,10 +3211,12 @@ pqPipelineProcessQueue(PGconn *conn)
 	}
 
 	/*
-	 * Reset single-row processing mode.  (Client has to set it up for each
-	 * query, if desired.)
+	 * Reset partial-result mode.  (Client has to set it up for each query, if
+	 * desired.)
 	 */
+	conn->partialResMode = false;
 	conn->singleRowMode = false;
+	conn->maxChunkSize = 0;
 
 	/*
 	 * If there are no further commands to process in the queue, get us in
@@ -3205,25 +3267,31 @@ pqPipelineProcessQueue(PGconn *conn)
 /*
  * PQpipelineSync
  *		Send a Sync message as part of a pipeline, and flush to server
- *
- * It's legal to start submitting more commands in the pipeline immediately,
- * without waiting for the results of the current pipeline. There's no need to
- * end pipeline mode and start it again.
- *
- * If a command in a pipeline fails, every subsequent command up to and including
- * the result to the Sync message sent by PQpipelineSync gets set to
- * PGRES_PIPELINE_ABORTED state. If the whole pipeline is processed without
- * error, a PGresult with PGRES_PIPELINE_SYNC is produced.
- *
- * Queries can already have been sent before PQpipelineSync is called, but
- * PQpipelineSync need to be called before retrieving command results.
- *
- * The connection will remain in pipeline mode and unavailable for new
- * synchronous command execution functions until all results from the pipeline
- * are processed by the client.
  */
 int
 PQpipelineSync(PGconn *conn)
+{
+	return pqPipelineSyncInternal(conn, true);
+}
+
+/*
+ * PQsendPipelineSync
+ *		Send a Sync message as part of a pipeline, without flushing to server
+ */
+int
+PQsendPipelineSync(PGconn *conn)
+{
+	return pqPipelineSyncInternal(conn, false);
+}
+
+/*
+ * Workhorse function for PQpipelineSync and PQsendPipelineSync.
+ *
+ * immediate_flush controls if the flush happens immediately after sending the
+ * Sync message or not.
+ */
+static int
+pqPipelineSyncInternal(PGconn *conn, bool immediate_flush)
 {
 	PGcmdQueueEntry *entry;
 
@@ -3269,9 +3337,19 @@ PQpipelineSync(PGconn *conn)
 	/*
 	 * Give the data a push.  In nonblock mode, don't complain if we're unable
 	 * to send it all; PQgetResult() will do any additional flushing needed.
+	 * If immediate_flush is disabled, the data is pushed if we are past the
+	 * size threshold.
 	 */
-	if (PQflush(conn) < 0)
-		goto sendFailed;
+	if (immediate_flush)
+	{
+		if (pqFlush(conn) < 0)
+			goto sendFailed;
+	}
+	else
+	{
+		if (pqPipelineFlush(conn) < 0)
+			goto sendFailed;
+	}
 
 	/* OK, it's launched! */
 	pqAppendCmdQueueEntry(conn, entry);
@@ -3315,6 +3393,14 @@ PQsendFlushRequest(PGconn *conn)
 	{
 		return 0;
 	}
+
+	/*
+	 * Give the data a push (in pipeline mode, only if we're past the size
+	 * threshold).  In nonblock mode, don't complain if we're unable to send
+	 * it all; PQgetResult() will do any additional flushing needed.
+	 */
+	if (pqPipelineFlush(conn) < 0)
+		return 0;
 
 	return 1;
 }

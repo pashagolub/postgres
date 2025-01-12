@@ -3,7 +3,7 @@
  * nodeAppend.c
  *	  routines to handle append nodes.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -58,8 +58,8 @@
 #include "postgres.h"
 
 #include "executor/execAsync.h"
-#include "executor/execdebug.h"
 #include "executor/execPartition.h"
+#include "executor/executor.h"
 #include "executor/nodeAppend.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -110,6 +110,7 @@ ExecInitAppend(Append *node, EState *estate, int eflags)
 {
 	AppendState *appendstate = makeNode(AppendState);
 	PlanState **appendplanstates;
+	const TupleTableSlotOps *appendops;
 	Bitmapset  *validsubplans;
 	Bitmapset  *asyncplans;
 	int			nplans;
@@ -176,15 +177,6 @@ ExecInitAppend(Append *node, EState *estate, int eflags)
 		appendstate->as_prune_state = NULL;
 	}
 
-	/*
-	 * Initialize result tuple type and slot.
-	 */
-	ExecInitResultTupleSlotTL(&appendstate->ps, &TTSOpsVirtual);
-
-	/* node returns slots from each of its subnodes, therefore not fixed */
-	appendstate->ps.resultopsset = true;
-	appendstate->ps.resultopsfixed = false;
-
 	appendplanstates = (PlanState **) palloc(nplans *
 											 sizeof(PlanState *));
 
@@ -226,6 +218,28 @@ ExecInitAppend(Append *node, EState *estate, int eflags)
 	appendstate->as_first_partial_plan = firstvalid;
 	appendstate->appendplans = appendplanstates;
 	appendstate->as_nplans = nplans;
+
+	/*
+	 * Initialize Append's result tuple type and slot.  If the child plans all
+	 * produce the same fixed slot type, we can use that slot type; otherwise
+	 * make a virtual slot.  (Note that the result slot itself is used only to
+	 * return a null tuple at end of execution; real tuples are returned to
+	 * the caller in the children's own result slots.  What we are doing here
+	 * is allowing the parent plan node to optimize if the Append will return
+	 * only one kind of slot.)
+	 */
+	appendops = ExecGetCommonSlotOps(appendplanstates, j);
+	if (appendops != NULL)
+	{
+		ExecInitResultTupleSlotTL(&appendstate->ps, appendops);
+	}
+	else
+	{
+		ExecInitResultTupleSlotTL(&appendstate->ps, &TTSOpsVirtual);
+		/* show that the output slot type is not fixed */
+		appendstate->ps.resultopsset = true;
+		appendstate->ps.resultopsfixed = false;
+	}
 
 	/* Initialize async state */
 	appendstate->as_asyncplans = asyncplans;
@@ -1025,7 +1039,8 @@ ExecAppendAsyncEventWait(AppendState *node)
 	/* We should never be called when there are no valid async subplans. */
 	Assert(node->as_nasyncremain > 0);
 
-	node->as_eventset = CreateWaitEventSet(CurrentMemoryContext, nevents);
+	Assert(node->as_eventset == NULL);
+	node->as_eventset = CreateWaitEventSet(CurrentResourceOwner, nevents);
 	AddWaitEventToSet(node->as_eventset, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET,
 					  NULL, NULL);
 
@@ -1050,7 +1065,7 @@ ExecAppendAsyncEventWait(AppendState *node)
 		return;
 	}
 
-	/* We wait on at most EVENT_BUFFER_SIZE events. */
+	/* Return at most EVENT_BUFFER_SIZE events in one call. */
 	if (nevents > EVENT_BUFFER_SIZE)
 		nevents = EVENT_BUFFER_SIZE;
 

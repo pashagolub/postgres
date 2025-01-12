@@ -3,7 +3,7 @@
  * fe-protocol3.c
  *	  functions that are specific to frontend/backend protocol version 3
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -240,13 +240,8 @@ pqParseInput3(PGconn *conn)
 					}
 					else
 					{
-						/*
-						 * In simple query protocol, advance the command queue
-						 * (see PQgetResult).
-						 */
-						if (conn->cmd_queue_head &&
-							conn->cmd_queue_head->queryclass == PGQUERY_SIMPLE)
-							pqCommandQueueAdvance(conn);
+						/* Advance the command queue and set us idle */
+						pqCommandQueueAdvance(conn, true, false);
 						conn->asyncStatus = PGASYNC_IDLE;
 					}
 					break;
@@ -384,7 +379,8 @@ pqParseInput3(PGconn *conn)
 					break;
 				case PqMsg_DataRow:
 					if (conn->result != NULL &&
-						conn->result->resultStatus == PGRES_TUPLES_OK)
+						(conn->result->resultStatus == PGRES_TUPLES_OK ||
+						 conn->result->resultStatus == PGRES_TUPLES_CHUNK))
 					{
 						/* Read another tuple of a normal query response */
 						if (getAnotherTuple(conn, msgLength))
@@ -458,12 +454,8 @@ pqParseInput3(PGconn *conn)
 		/* Successfully consumed this message */
 		if (conn->inCursor == conn->inStart + 5 + msgLength)
 		{
-			/* trace server-to-client message */
-			if (conn->Pfdebug)
-				pqTraceOutputMessage(conn, conn->inBuffer + conn->inStart, false);
-
 			/* Normal case: parsing agrees with specified length */
-			conn->inStart = conn->inCursor;
+			pqParseDone(conn, conn->inCursor);
 		}
 		else
 		{
@@ -1732,12 +1724,8 @@ getCopyDataMessage(PGconn *conn)
 				return -1;
 		}
 
-		/* trace server-to-client message */
-		if (conn->Pfdebug)
-			pqTraceOutputMessage(conn, conn->inBuffer + conn->inStart, false);
-
 		/* Drop the processed message and loop around for another */
-		conn->inStart = conn->inCursor;
+		pqParseDone(conn, conn->inCursor);
 	}
 }
 
@@ -1795,13 +1783,13 @@ pqGetCopyData3(PGconn *conn, char **buffer, int async)
 			(*buffer)[msgLength] = '\0';	/* Add terminating null */
 
 			/* Mark message consumed */
-			conn->inStart = conn->inCursor + msgLength;
+			pqParseDone(conn, conn->inCursor + msgLength);
 
 			return msgLength;
 		}
 
 		/* Empty, so drop it and loop around for another */
-		conn->inStart = conn->inCursor;
+		pqParseDone(conn, conn->inCursor);
 	}
 }
 
@@ -2172,8 +2160,9 @@ pqFunctionCall3(PGconn *conn, Oid fnid,
 			case 'Z':			/* backend is ready for new query */
 				if (getReadyForQuery(conn))
 					continue;
-				/* consume the message and exit */
-				conn->inStart += 5 + msgLength;
+
+				/* consume the message */
+				pqParseDone(conn, conn->inStart + 5 + msgLength);
 
 				/*
 				 * If we already have a result object (probably an error), use
@@ -2198,6 +2187,7 @@ pqFunctionCall3(PGconn *conn, Oid fnid,
 						pqSaveErrorResult(conn);
 					}
 				}
+				/* and we're out */
 				return pqPrepareAsyncResult(conn);
 			case 'S':			/* parameter status */
 				if (getParameterStatus(conn))
@@ -2207,18 +2197,18 @@ pqFunctionCall3(PGconn *conn, Oid fnid,
 				/* The backend violates the protocol. */
 				libpq_append_conn_error(conn, "protocol error: id=0x%x", id);
 				pqSaveErrorResult(conn);
-				/* trust the specified message length as what to skip */
+
+				/*
+				 * We can't call parsing done due to the protocol violation
+				 * (so message tracing wouldn't work), but trust the specified
+				 * message length as what to skip.
+				 */
 				conn->inStart += 5 + msgLength;
 				return pqPrepareAsyncResult(conn);
 		}
 
-		/* trace server-to-client message */
-		if (conn->Pfdebug)
-			pqTraceOutputMessage(conn, conn->inBuffer + conn->inStart, false);
-
-		/* Completed this message, keep going */
-		/* trust the specified message length as what to skip */
-		conn->inStart += 5 + msgLength;
+		/* Completed parsing this message, keep going */
+		pqParseDone(conn, conn->inStart + 5 + msgLength);
 		needInput = false;
 	}
 

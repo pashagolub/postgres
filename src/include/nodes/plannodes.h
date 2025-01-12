@@ -4,7 +4,7 @@
  *	  definitions for query plan nodes
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/plannodes.h
@@ -20,7 +20,6 @@
 #include "lib/stringinfo.h"
 #include "nodes/bitmapset.h"
 #include "nodes/lockoptions.h"
-#include "nodes/parsenodes.h"
 #include "nodes/primnodes.h"
 
 
@@ -54,9 +53,9 @@ typedef struct PlannedStmt
 
 	uint64		queryId;		/* query identifier (copied from Query) */
 
-	bool		hasReturning;	/* is it insert|update|delete RETURNING? */
+	bool		hasReturning;	/* is it insert|update|delete|merge RETURNING? */
 
-	bool		hasModifyingCTE;	/* has insert|update|delete in WITH? */
+	bool		hasModifyingCTE;	/* has insert|update|delete|merge in WITH? */
 
 	bool		canSetTag;		/* do I set the command result tag? */
 
@@ -96,8 +95,8 @@ typedef struct PlannedStmt
 	Node	   *utilityStmt;	/* non-null if this is utility stmt */
 
 	/* statement location in source string (copied from Query) */
-	int			stmt_location;	/* start location, or -1 if unknown */
-	int			stmt_len;		/* length in bytes; 0 means "rest of string" */
+	ParseLoc	stmt_location;	/* start location, or -1 if unknown */
+	ParseLoc	stmt_len;		/* length in bytes; 0 means "rest of string" */
 } PlannedStmt;
 
 /* macro for fetching the Plan associated with a SubPlan node */
@@ -126,6 +125,7 @@ typedef struct Plan
 	/*
 	 * estimated execution costs for plan (see costsize.c for more info)
 	 */
+	int			disabled_nodes; /* count of disabled nodes */
 	Cost		startup_cost;	/* cost expended before fetching any tuples */
 	Cost		total_cost;		/* total cost (assuming all tuples fetched) */
 
@@ -252,6 +252,8 @@ typedef struct ModifyTable
 	List	   *exclRelTlist;	/* tlist of the EXCLUDED pseudo relation */
 	List	   *mergeActionLists;	/* per-target-table lists of actions for
 									 * MERGE */
+	List	   *mergeJoinConditions;	/* per-target-table join conditions
+										 * for MERGE */
 } ModifyTable;
 
 struct PartitionPruneInfo;		/* forward reference to struct below */
@@ -848,7 +850,7 @@ typedef struct MergeJoin
 	Oid		   *mergeCollations pg_node_attr(array_size(mergeclauses));
 
 	/* per-clause ordering (ASC or DESC) */
-	int		   *mergeStrategies pg_node_attr(array_size(mergeclauses));
+	bool	   *mergeReversals pg_node_attr(array_size(mergeclauses));
 
 	/* per-clause nulls ordering */
 	bool	   *mergeNullsFirst pg_node_attr(array_size(mergeclauses));
@@ -1223,23 +1225,20 @@ typedef struct SetOp
 	/* how to do it, see nodes.h */
 	SetOpStrategy strategy;
 
-	/* number of columns to check for duplicate-ness */
+	/* number of columns to compare */
 	int			numCols;
 
 	/* their indexes in the target list */
-	AttrNumber *dupColIdx pg_node_attr(array_size(numCols));
+	AttrNumber *cmpColIdx pg_node_attr(array_size(numCols));
 
-	/* equality operators to compare with */
-	Oid		   *dupOperators pg_node_attr(array_size(numCols));
-	Oid		   *dupCollations pg_node_attr(array_size(numCols));
+	/* comparison operators (either equality operators or sort operators) */
+	Oid		   *cmpOperators pg_node_attr(array_size(numCols));
+	Oid		   *cmpCollations pg_node_attr(array_size(numCols));
 
-	/* where is the flag column, if any */
-	AttrNumber	flagColIdx;
+	/* nulls-first flags if sorting, otherwise not interesting */
+	bool	   *cmpNullsFirst pg_node_attr(array_size(numCols));
 
-	/* flag value for first input relation */
-	int			firstFlag;
-
-	/* estimated number of groups in input */
+	/* estimated number of groups in left input */
 	long		numGroups;
 } SetOp;
 

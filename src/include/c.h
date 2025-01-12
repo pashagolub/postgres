@@ -9,7 +9,7 @@
  *	  polluting the namespace with lots of stuff...
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/c.h
@@ -46,16 +46,17 @@
 #ifndef C_H
 #define C_H
 
-#include "postgres_ext.h"
-
-/* Must undef pg_config_ext.h symbols before including pg_config.h */
-#undef PG_INT64_TYPE
-
+/*
+ * These headers must be included before any system headers, because on some
+ * platforms they affect the behavior of the system headers (for example, by
+ * defining _FILE_OFFSET_BITS).
+ */
 #include "pg_config.h"
 #include "pg_config_manual.h"	/* must be after pg_config.h */
-#include "pg_config_os.h"		/* must be before any system header files */
+#include "pg_config_os.h"		/* config from include/port/PORTNAME.h */
 
 /* System header files that should be available everywhere in Postgres */
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,9 +72,15 @@
 #include <fcntl.h>				/* ensure O_BINARY is available */
 #endif
 #include <locale.h>
+#ifdef HAVE_XLOCALE_H
+#include <xlocale.h>
+#endif
 #ifdef ENABLE_NLS
 #include <libintl.h>
 #endif
+
+ /* Pull in fundamental symbols that we also expose to applications */
+#include "postgres_ext.h"
 
 /* Define before including zlib.h to add const decorations to zlib API. */
 #ifdef HAVE_LIBZ
@@ -105,8 +112,6 @@
  * GCC: https://gcc.gnu.org/onlinedocs/gcc/Type-Attributes.html
  * Clang: https://clang.llvm.org/docs/AttributeReference.html
  * Sunpro: https://docs.oracle.com/cd/E18659_01/html/821-1384/gjzke.html
- * XLC: https://www.ibm.com/support/knowledgecenter/SSGH2K_13.1.2/com.ibm.xlc131.aix.doc/language_ref/function_attributes.html
- * XLC: https://www.ibm.com/support/knowledgecenter/SSGH2K_13.1.2/com.ibm.xlc131.aix.doc/language_ref/type_attrib.html
  */
 
 /*
@@ -138,6 +143,19 @@
 #endif
 
 /*
+ * This macro will disable address safety instrumentation for a function
+ * when running with "-fsanitize=address". Think twice before using this!
+ */
+#if defined(__clang__) || __GNUC__ >= 8
+#define pg_attribute_no_sanitize_address() __attribute__((no_sanitize("address")))
+#elif __has_attribute(no_sanitize_address)
+/* This would work for clang, but it's deprecated. */
+#define pg_attribute_no_sanitize_address() __attribute__((no_sanitize_address))
+#else
+#define pg_attribute_no_sanitize_address()
+#endif
+
+/*
  * Place this macro before functions that should be allowed to make misaligned
  * accesses.  Think twice before using it on non-x86-specific code!
  * Testing can be done with "-fsanitize=alignment -fsanitize-trap=alignment"
@@ -161,6 +179,18 @@
 #endif
 
 /*
+ * pg_attribute_target allows specifying different target options that the
+ * function should be compiled with (e.g., for using special CPU instructions).
+ * Note that there still needs to be a configure-time check to verify that a
+ * specific target is understood by the compiler.
+ */
+#if __has_attribute (target)
+#define pg_attribute_target(...) __attribute__((target(__VA_ARGS__)))
+#else
+#define pg_attribute_target(...)
+#endif
+
+/*
  * Append PG_USED_FOR_ASSERTS_ONLY to definitions of variables that are only
  * used in assert-enabled builds, to avoid compiler warnings about unused
  * variables in assert-disabled builds.
@@ -171,8 +201,8 @@
 #define PG_USED_FOR_ASSERTS_ONLY pg_attribute_unused()
 #endif
 
-/* GCC and XLC support format attributes */
-#if defined(__GNUC__) || defined(__IBMC__)
+/* GCC supports format attributes */
+#if defined(__GNUC__)
 #define pg_attribute_format_arg(a) __attribute__((format_arg(a)))
 #define pg_attribute_printf(f,a) __attribute__((format(PG_PRINTF_ATTRIBUTE, f, a)))
 #else
@@ -180,8 +210,8 @@
 #define pg_attribute_printf(f,a)
 #endif
 
-/* GCC, Sunpro and XLC support aligned, packed and noreturn */
-#if defined(__GNUC__) || defined(__SUNPRO_C) || defined(__IBMC__)
+/* GCC and Sunpro support aligned, packed and noreturn */
+#if defined(__GNUC__) || defined(__SUNPRO_C)
 #define pg_attribute_aligned(a) __attribute__((aligned(a)))
 #define pg_attribute_noreturn() __attribute__((noreturn))
 #define pg_attribute_packed() __attribute__((packed))
@@ -212,8 +242,8 @@
  * choose not to.  But, if possible, don't force inlining in unoptimized
  * debug builds.
  */
-#if (defined(__GNUC__) && __GNUC__ > 3 && defined(__OPTIMIZE__)) || defined(__SUNPRO_C) || defined(__IBMC__)
-/* GCC > 3, Sunpro and XLC support always_inline via __attribute__ */
+#if (defined(__GNUC__) && __GNUC__ > 3 && defined(__OPTIMIZE__)) || defined(__SUNPRO_C)
+/* GCC > 3 and Sunpro support always_inline via __attribute__ */
 #define pg_attribute_always_inline __attribute__((always_inline)) inline
 #elif defined(_MSC_VER)
 /* MSVC has a special keyword for this */
@@ -229,8 +259,8 @@
  * for proper cost attribution.  Note that unlike the pg_attribute_XXX macros
  * above, this should be placed before the function's return type and name.
  */
-/* GCC, Sunpro and XLC support noinline via __attribute__ */
-#if (defined(__GNUC__) && __GNUC__ > 2) || defined(__SUNPRO_C) || defined(__IBMC__)
+/* GCC and Sunpro support noinline via __attribute__ */
+#if (defined(__GNUC__) && __GNUC__ > 2) || defined(__SUNPRO_C)
 #define pg_noinline __attribute__((noinline))
 /* msvc via declspec */
 #elif defined(_MSC_VER)
@@ -424,37 +454,11 @@ typedef void (*pg_funcptr_t) (void);
  * bool
  *		Boolean value, either true or false.
  *
- * We use stdbool.h if available and its bool has size 1.  That's useful for
- * better compiler and debugger output and for compatibility with third-party
- * libraries.  But PostgreSQL currently cannot deal with bool of other sizes;
- * there are static assertions around the code to prevent that.
- *
- * For C++ compilers, we assume the compiler has a compatible built-in
- * definition of bool.
- *
- * See also the version of this code in src/interfaces/ecpg/include/ecpglib.h.
+ * PostgreSQL currently cannot deal with bool of size other than 1; there are
+ * static assertions around the code to prevent that.
  */
 
-#ifndef __cplusplus
-
-#ifdef PG_USE_STDBOOL
 #include <stdbool.h>
-#else
-
-#ifndef bool
-typedef unsigned char bool;
-#endif
-
-#ifndef true
-#define true	((bool) 1)
-#endif
-
-#ifndef false
-#define false	((bool) 0)
-#endif
-
-#endif							/* not PG_USE_STDBOOL */
-#endif							/* not C++ */
 
 
 /* ----------------------------------------------------------------
@@ -471,29 +475,15 @@ typedef unsigned char bool;
  */
 typedef char *Pointer;
 
-/*
- * intN
- *		Signed integer, EXACTLY N BITS IN SIZE,
- *		used for numerical computations and the
- *		frontend/backend protocol.
- */
-#ifndef HAVE_INT8
-typedef signed char int8;		/* == 8 bits */
-typedef signed short int16;		/* == 16 bits */
-typedef signed int int32;		/* == 32 bits */
-#endif							/* not HAVE_INT8 */
-
-/*
- * uintN
- *		Unsigned integer, EXACTLY N BITS IN SIZE,
- *		used for numerical computations and the
- *		frontend/backend protocol.
- */
-#ifndef HAVE_UINT8
-typedef unsigned char uint8;	/* == 8 bits */
-typedef unsigned short uint16;	/* == 16 bits */
-typedef unsigned int uint32;	/* == 32 bits */
-#endif							/* not HAVE_UINT8 */
+/* Historical names for types in <stdint.h>. */
+typedef int8_t int8;
+typedef int16_t int16;
+typedef int32_t int32;
+typedef int64_t int64;
+typedef uint8_t uint8;
+typedef uint16_t uint16;
+typedef uint32_t uint32;
+typedef uint64_t uint64;
 
 /*
  * bitsN
@@ -506,36 +496,14 @@ typedef uint32 bits32;			/* >= 32 bits */
 /*
  * 64-bit integers
  */
-#ifdef HAVE_LONG_INT_64
-/* Plain "long int" fits, use it */
-
-#ifndef HAVE_INT64
-typedef long int int64;
-#endif
-#ifndef HAVE_UINT64
-typedef unsigned long int uint64;
-#endif
-#define INT64CONST(x)  (x##L)
-#define UINT64CONST(x) (x##UL)
-#elif defined(HAVE_LONG_LONG_INT_64)
-/* We have working support for "long long int", use that */
-
-#ifndef HAVE_INT64
-typedef long long int int64;
-#endif
-#ifndef HAVE_UINT64
-typedef unsigned long long int uint64;
-#endif
-#define INT64CONST(x)  (x##LL)
-#define UINT64CONST(x) (x##ULL)
-#else
-/* neither HAVE_LONG_INT_64 nor HAVE_LONG_LONG_INT_64 */
-#error must have a working 64-bit integer datatype
-#endif
+#define INT64CONST(x)  INT64_C(x)
+#define UINT64CONST(x) UINT64_C(x)
 
 /* snprintf format strings to use for 64-bit integers */
-#define INT64_FORMAT "%" INT64_MODIFIER "d"
-#define UINT64_FORMAT "%" INT64_MODIFIER "u"
+#define INT64_FORMAT "%" PRId64
+#define UINT64_FORMAT "%" PRIu64
+#define INT64_HEX_FORMAT "%" PRIx64
+#define UINT64_HEX_FORMAT "%" PRIx64
 
 /*
  * 128-bit signed and unsigned integers
@@ -564,22 +532,19 @@ typedef unsigned PG_INT128_TYPE uint128
 #endif
 #endif
 
-/*
- * stdint.h limits aren't guaranteed to have compatible types with our fixed
- * width types. So just define our own.
- */
-#define PG_INT8_MIN		(-0x7F-1)
-#define PG_INT8_MAX		(0x7F)
-#define PG_UINT8_MAX	(0xFF)
-#define PG_INT16_MIN	(-0x7FFF-1)
-#define PG_INT16_MAX	(0x7FFF)
-#define PG_UINT16_MAX	(0xFFFF)
-#define PG_INT32_MIN	(-0x7FFFFFFF-1)
-#define PG_INT32_MAX	(0x7FFFFFFF)
-#define PG_UINT32_MAX	(0xFFFFFFFFU)
-#define PG_INT64_MIN	(-INT64CONST(0x7FFFFFFFFFFFFFFF) - 1)
-#define PG_INT64_MAX	INT64CONST(0x7FFFFFFFFFFFFFFF)
-#define PG_UINT64_MAX	UINT64CONST(0xFFFFFFFFFFFFFFFF)
+/* Historical names for limits in <stdint.h>. */
+#define PG_INT8_MIN		INT8_MIN
+#define PG_INT8_MAX		INT8_MAX
+#define PG_UINT8_MAX	UINT8_MAX
+#define PG_INT16_MIN	INT16_MIN
+#define PG_INT16_MAX	INT16_MAX
+#define PG_UINT16_MAX	UINT16_MAX
+#define PG_INT32_MIN	INT32_MIN
+#define PG_INT32_MAX	INT32_MAX
+#define PG_UINT32_MAX	UINT32_MAX
+#define PG_INT64_MIN	INT64_MIN
+#define PG_INT64_MAX	INT64_MAX
+#define PG_UINT64_MAX	UINT64_MAX
 
 /*
  * We now always use int64 timestamps, but keep this symbol defined for the
@@ -1061,30 +1026,6 @@ extern void ExceptionalCondition(const char *conditionName,
 
 
 /*
- * MemSetTest/MemSetLoop are a variant version that allow all the tests in
- * MemSet to be done at compile time in cases where "val" and "len" are
- * constants *and* we know the "start" pointer must be word-aligned.
- * If MemSetTest succeeds, then it is okay to use MemSetLoop, otherwise use
- * MemSetAligned.  Beware of multiple evaluations of the arguments when using
- * this approach.
- */
-#define MemSetTest(val, len) \
-	( ((len) & LONG_ALIGN_MASK) == 0 && \
-	(len) <= MEMSET_LOOP_LIMIT && \
-	MEMSET_LOOP_LIMIT != 0 && \
-	(val) == 0 )
-
-#define MemSetLoop(start, val, len) \
-	do \
-	{ \
-		long * _start = (long *) (start); \
-		long * _stop = (long *) ((char *) _start + (Size) (len)); \
-	\
-		while (_start < _stop) \
-			*_start++ = 0; \
-	} while (0)
-
-/*
  * Macros for range-checking float values before converting to integer.
  * We must be careful here that the boundary values are expressed exactly
  * in the float domain.  PG_INTnn_MIN is an exact power of 2, so it will
@@ -1245,7 +1186,10 @@ typedef union PGAlignedXLogBlock
  * Note that this only works in function scope, not for global variables (it'd
  * be nice, but not trivial, to improve that).
  */
-#if defined(HAVE__BUILTIN_TYPES_COMPATIBLE_P)
+#if defined(__cplusplus)
+#define unconstify(underlying_type, expr) const_cast<underlying_type>(expr)
+#define unvolatize(underlying_type, expr) const_cast<underlying_type>(expr)
+#elif defined(HAVE__BUILTIN_TYPES_COMPATIBLE_P)
 #define unconstify(underlying_type, expr) \
 	(StaticAssertExpr(__builtin_types_compatible_p(__typeof(expr), const underlying_type), \
 					  "wrong cast"), \
@@ -1303,21 +1247,25 @@ extern int	fdatasync(int fildes);
  * definition of int64.  (For the naming, compare that POSIX has
  * strtoimax()/strtoumax() which return intmax_t/uintmax_t.)
  */
-#ifdef HAVE_LONG_INT_64
+#if SIZEOF_LONG == 8
 #define strtoi64(str, endptr, base) ((int64) strtol(str, endptr, base))
 #define strtou64(str, endptr, base) ((uint64) strtoul(str, endptr, base))
-#else
+#elif SIZEOF_LONG_LONG == 8
 #define strtoi64(str, endptr, base) ((int64) strtoll(str, endptr, base))
 #define strtou64(str, endptr, base) ((uint64) strtoull(str, endptr, base))
+#else
+#error "cannot find integer type of the same size as int64_t"
 #endif
 
 /*
  * Similarly, wrappers around labs()/llabs() matching our int64.
  */
-#ifdef HAVE_LONG_INT_64
+#if SIZEOF_LONG == 8
 #define i64abs(i) labs(i)
-#else
+#elif SIZEOF_LONG_LONG == 8
 #define i64abs(i) llabs(i)
+#else
+#error "cannot find integer type of the same size as int64_t"
 #endif
 
 /*

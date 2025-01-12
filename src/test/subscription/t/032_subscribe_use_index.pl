@@ -1,8 +1,8 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2025, PostgreSQL Global Development Group
 
 # Test logical replication behavior with subscriber using available index
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -490,7 +490,8 @@ $node_publisher->safe_psql('postgres',
 $node_subscriber->safe_psql('postgres',
 	"CREATE TABLE test_replica_id_full (x int, y text)");
 $node_subscriber->safe_psql('postgres',
-	"CREATE INDEX test_replica_id_full_idx ON test_replica_id_full USING HASH (x)");
+	"CREATE INDEX test_replica_id_full_idx ON test_replica_id_full USING HASH (x)"
+);
 
 # insert some initial data
 $node_publisher->safe_psql('postgres',

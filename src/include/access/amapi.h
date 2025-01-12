@@ -3,7 +3,7 @@
  * amapi.h
  *	  API for Postgres index access methods.
  *
- * Copyright (c) 2015-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2015-2025, PostgreSQL Global Development Group
  *
  * src/include/access/amapi.h
  *
@@ -76,6 +76,10 @@ typedef enum IndexAMProperty
  * opfamily.  This allows ALTER OPERATOR FAMILY DROP, and causes that to
  * happen automatically if the operator or support func is dropped.  This
  * is the right behavior for inessential ("loose") objects.
+ *
+ * We also make dependencies on lefttype/righttype, of the same strength as
+ * the dependency on the operator or support func, unless these dependencies
+ * are redundant with the dependency on the operator or support func.
  */
 typedef struct OpFamilyMember
 {
@@ -113,6 +117,10 @@ typedef bool (*aminsert_function) (Relation indexRelation,
 								   bool indexUnchanged,
 								   struct IndexInfo *indexInfo);
 
+/* cleanup after insert */
+typedef void (*aminsertcleanup_function) (Relation indexRelation,
+										  struct IndexInfo *indexInfo);
+
 /* bulk delete */
 typedef IndexBulkDeleteResult *(*ambulkdelete_function) (IndexVacuumInfo *info,
 														 IndexBulkDeleteResult *stats,
@@ -135,6 +143,13 @@ typedef void (*amcostestimate_function) (struct PlannerInfo *root,
 										 Selectivity *indexSelectivity,
 										 double *indexCorrelation,
 										 double *indexPages);
+
+/* estimate height of a tree-structured index
+ *
+ * XXX This just computes a value that is later used by amcostestimate.  This
+ * API could be expanded to support passing more values if the need arises.
+ */
+typedef int (*amgettreeheight_function) (Relation rel);
 
 /* parse index reloptions */
 typedef bytea *(*amoptions_function) (Datum reloptions,
@@ -191,7 +206,7 @@ typedef void (*amrestrpos_function) (IndexScanDesc scan);
  */
 
 /* estimate size of parallel scan descriptor */
-typedef Size (*amestimateparallelscan_function) (void);
+typedef Size (*amestimateparallelscan_function) (int nkeys, int norderbys);
 
 /* prepare for parallel index scan */
 typedef void (*aminitparallelscan_function) (void *target);
@@ -240,6 +255,8 @@ typedef struct IndexAmRoutine
 	bool		ampredlocks;
 	/* does AM support parallel scan? */
 	bool		amcanparallel;
+	/* does AM support parallel build? */
+	bool		amcanbuildparallel;
 	/* does AM support columns included with clause INCLUDE? */
 	bool		amcaninclude;
 	/* does AM use maintenance_work_mem? */
@@ -261,10 +278,12 @@ typedef struct IndexAmRoutine
 	ambuild_function ambuild;
 	ambuildempty_function ambuildempty;
 	aminsert_function aminsert;
+	aminsertcleanup_function aminsertcleanup;
 	ambulkdelete_function ambulkdelete;
 	amvacuumcleanup_function amvacuumcleanup;
 	amcanreturn_function amcanreturn;	/* can be NULL */
 	amcostestimate_function amcostestimate;
+	amgettreeheight_function amgettreeheight;	/* can be NULL */
 	amoptions_function amoptions;
 	amproperty_function amproperty; /* can be NULL */
 	ambuildphasename_function ambuildphasename; /* can be NULL */

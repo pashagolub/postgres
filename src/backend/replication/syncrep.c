@@ -63,7 +63,7 @@
  * the standbys which are considered as synchronous at that moment
  * will release waiters from the queue.
  *
- * Portions Copyright (c) 2010-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/syncrep.c
@@ -75,15 +75,14 @@
 #include <unistd.h>
 
 #include "access/xact.h"
+#include "common/int.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "replication/syncrep.h"
 #include "replication/walsender.h"
 #include "replication/walsender_private.h"
-#include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
-#include "utils/builtins.h"
 #include "utils/guc_hooks.h"
 #include "utils/ps_status.h"
 
@@ -416,7 +415,7 @@ SyncRepInitConfig(void)
 		SpinLockRelease(&MyWalSnd->mutex);
 
 		ereport(DEBUG1,
-				(errmsg_internal("standby \"%s\" now has synchronous standby priority %u",
+				(errmsg_internal("standby \"%s\" now has synchronous standby priority %d",
 								 application_name, priority)));
 	}
 }
@@ -483,7 +482,7 @@ SyncRepReleaseWaiters(void)
 
 		if (SyncRepConfig->syncrep_method == SYNC_REP_PRIORITY)
 			ereport(LOG,
-					(errmsg("standby \"%s\" is now a synchronous standby with priority %u",
+					(errmsg("standby \"%s\" is now a synchronous standby with priority %d",
 							application_name, MyWalSnd->sync_standby_priority)));
 		else
 			ereport(LOG,
@@ -698,12 +697,7 @@ cmp_lsn(const void *a, const void *b)
 	XLogRecPtr	lsn1 = *((const XLogRecPtr *) a);
 	XLogRecPtr	lsn2 = *((const XLogRecPtr *) b);
 
-	if (lsn1 > lsn2)
-		return -1;
-	else if (lsn1 == lsn2)
-		return 0;
-	else
-		return 1;
+	return pg_cmp_u64(lsn2, lsn1);
 }
 
 /*
@@ -998,6 +992,7 @@ check_synchronous_standby_names(char **newval, void **extra, GucSource source)
 {
 	if (*newval != NULL && (*newval)[0] != '\0')
 	{
+		yyscan_t	scanner;
 		int			parse_rc;
 		SyncRepConfigData *pconf;
 
@@ -1006,9 +1001,9 @@ check_synchronous_standby_names(char **newval, void **extra, GucSource source)
 		syncrep_parse_error_msg = NULL;
 
 		/* Parse the synchronous_standby_names string */
-		syncrep_scanner_init(*newval);
-		parse_rc = syncrep_yyparse();
-		syncrep_scanner_finish();
+		syncrep_scanner_init(*newval, &scanner);
+		parse_rc = syncrep_yyparse(scanner);
+		syncrep_scanner_finish(scanner);
 
 		if (parse_rc != 0 || syncrep_parse_result == NULL)
 		{
@@ -1016,7 +1011,8 @@ check_synchronous_standby_names(char **newval, void **extra, GucSource source)
 			if (syncrep_parse_error_msg)
 				GUC_check_errdetail("%s", syncrep_parse_error_msg);
 			else
-				GUC_check_errdetail("synchronous_standby_names parser failed");
+				GUC_check_errdetail("\"%s\" parser failed.",
+									"synchronous_standby_names");
 			return false;
 		}
 
@@ -1034,7 +1030,7 @@ check_synchronous_standby_names(char **newval, void **extra, GucSource source)
 			return false;
 		memcpy(pconf, syncrep_parse_result, syncrep_parse_result->config_size);
 
-		*extra = (void *) pconf;
+		*extra = pconf;
 
 		/*
 		 * We need not explicitly clean up syncrep_parse_result.  It, and any

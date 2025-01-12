@@ -1,7 +1,7 @@
 /*
  *	pg_upgrade.h
  *
- *	Copyright (c) 2010-2023, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2025, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/pg_upgrade.h
  */
 
@@ -96,7 +96,6 @@ extern char *output_files[];
 #define RMDIR_CMD			"@RMDIR /s/q"
 #define SCRIPT_PREFIX		""
 #define SCRIPT_EXT			"bat"
-#define EXE_EXT				".exe"
 #define ECHO_QUOTE	""
 #define ECHO_BLANK	"."
 #endif
@@ -160,6 +159,8 @@ typedef struct
 	bool		two_phase;		/* can the slot decode 2PC? */
 	bool		caught_up;		/* has the slot caught up to latest changes? */
 	bool		invalid;		/* if true, the slot is unusable */
+	bool		failover;		/* is the slot designated to be synced to the
+								 * physical standby? */
 } LogicalSlotInfo;
 
 typedef struct
@@ -205,7 +206,7 @@ typedef struct
 	char	   *db_collate;
 	char	   *db_ctype;
 	char		db_collprovider;
-	char	   *db_iculocale;
+	char	   *db_locale;
 	int			db_encoding;
 } DbLocaleInfo;
 
@@ -253,6 +254,7 @@ typedef enum
 {
 	TRANSFER_MODE_CLONE,
 	TRANSFER_MODE_COPY,
+	TRANSFER_MODE_COPY_FILE_RANGE,
 	TRANSFER_MODE_LINK,
 } transferMode;
 
@@ -292,6 +294,7 @@ typedef struct
 	char		major_version_str[64];	/* string PG_VERSION of cluster */
 	uint32		bin_version;	/* version returned from pg_ctl */
 	const char *tablespace_suffix;	/* directory specification */
+	int			nsubs;			/* number of subscriptions */
 } ClusterInfo;
 
 
@@ -317,8 +320,8 @@ typedef struct
 */
 typedef struct
 {
-	bool		check;			/* true -> ask user for permission to make
-								 * changes */
+	bool		check;			/* check clusters only, don't change any data */
+	bool		live_check;		/* check clusters only, old server is running */
 	bool		do_sync;		/* flush changes to disk */
 	transferMode transfer_mode; /* copy files or link them? */
 	int			jobs;			/* number of processes/threads to use */
@@ -348,6 +351,9 @@ typedef struct
 } OSInfo;
 
 
+/* Function signature for data type check version hook */
+typedef bool (*DataTypesUsageVersionCheck) (ClusterInfo *cluster);
+
 /*
  * Global variables
  */
@@ -360,20 +366,20 @@ extern OSInfo os_info;
 
 /* check.c */
 
-void		output_check_banner(bool live_check);
-void		check_and_dump_old_cluster(bool live_check);
+void		output_check_banner(void);
+void		check_and_dump_old_cluster(void);
 void		check_new_cluster(void);
 void		report_clusters_compatible(void);
 void		issue_warnings_and_set_wal_level(void);
 void		output_completion_banner(char *deletion_script_file_name);
 void		check_cluster_versions(void);
-void		check_cluster_compatibility(bool live_check);
+void		check_cluster_compatibility(void);
 void		create_script_for_old_cluster_deletion(char **deletion_script_file_name);
 
 
 /* controldata.c */
 
-void		get_control_data(ClusterInfo *cluster, bool live_check);
+void		get_control_data(ClusterInfo *cluster);
 void		check_control_data(ControlData *oldctrl, ControlData *newctrl);
 void		disable_old_cluster(void);
 
@@ -399,11 +405,14 @@ void		cloneFile(const char *src, const char *dst,
 					  const char *schemaName, const char *relName);
 void		copyFile(const char *src, const char *dst,
 					 const char *schemaName, const char *relName);
+void		copyFileByRange(const char *src, const char *dst,
+							const char *schemaName, const char *relName);
 void		linkFile(const char *src, const char *dst,
 					 const char *schemaName, const char *relName);
 void		rewriteVisibilityMap(const char *fromfile, const char *tofile,
 								 const char *schemaName, const char *relName);
 void		check_file_clone(void);
+void		check_copy_file_range(void);
 void		check_hard_link(void);
 
 /* fopen_priv() is no longer different from fopen() */
@@ -419,14 +428,15 @@ void		check_loadable_libraries(void);
 FileNameMap *gen_db_file_maps(DbInfo *old_db,
 							  DbInfo *new_db, int *nmaps, const char *old_pgdata,
 							  const char *new_pgdata);
-void		get_db_rel_and_slot_infos(ClusterInfo *cluster, bool live_check);
+void		get_db_rel_and_slot_infos(ClusterInfo *cluster);
 int			count_old_cluster_logical_slots(void);
+void		get_subscription_count(ClusterInfo *cluster);
 
 /* option.c */
 
 void		parseCommandLine(int argc, char *argv[]);
 void		adjust_data_dir(ClusterInfo *cluster);
-void		get_sock_dir(ClusterInfo *cluster, bool live_check);
+void		get_sock_dir(ClusterInfo *cluster);
 
 /* relfilenumber.c */
 
@@ -471,18 +481,10 @@ unsigned int str2uint(const char *str);
 
 /* version.c */
 
-bool		check_for_data_types_usage(ClusterInfo *cluster,
-									   const char *base_query,
-									   const char *output_path);
-bool		check_for_data_type_usage(ClusterInfo *cluster,
-									  const char *type_name,
-									  const char *output_path);
-void		old_9_3_check_for_line_data_type_usage(ClusterInfo *cluster);
-void		old_9_6_check_for_unknown_data_type_usage(ClusterInfo *cluster);
+bool		jsonb_9_4_check_applicable(ClusterInfo *cluster);
 void		old_9_6_invalidate_hash_indexes(ClusterInfo *cluster,
 											bool check_mode);
 
-void		old_11_check_for_sql_identifier_data_type_usage(ClusterInfo *cluster);
 void		report_extension_updates(ClusterInfo *cluster);
 
 /* parallel.c */
@@ -492,3 +494,24 @@ void		parallel_transfer_all_new_dbs(DbInfoArr *old_db_arr, DbInfoArr *new_db_arr
 										  char *old_pgdata, char *new_pgdata,
 										  char *old_tablespace);
 bool		reap_child(bool wait_for_child);
+
+/* task.c */
+
+typedef void (*UpgradeTaskProcessCB) (DbInfo *dbinfo, PGresult *res, void *arg);
+
+/* struct definition is private to task.c */
+typedef struct UpgradeTask UpgradeTask;
+
+UpgradeTask *upgrade_task_create(void);
+void		upgrade_task_add_step(UpgradeTask *task, const char *query,
+								  UpgradeTaskProcessCB process_cb, bool free_result,
+								  void *arg);
+void		upgrade_task_run(const UpgradeTask *task, const ClusterInfo *cluster);
+void		upgrade_task_free(UpgradeTask *task);
+
+/* convenient type for common private data needed by several tasks */
+typedef struct
+{
+	FILE	   *file;
+	char		path[MAXPGPATH];
+} UpgradeTaskReport;

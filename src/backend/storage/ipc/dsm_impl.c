@@ -36,7 +36,7 @@
  *
  * As ever, Windows requires its own implementation.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -873,7 +873,7 @@ dsm_impl_mmap(dsm_op op, dsm_handle handle, Size request_size,
 		 * transferring data to the kernel.
 		 */
 		char	   *zbuffer = (char *) palloc0(ZBUFFER_SIZE);
-		uint32		remaining = request_size;
+		Size		remaining = request_size;
 		bool		success = true;
 
 		/*

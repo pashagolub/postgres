@@ -3,7 +3,7 @@
  * nodeBitmapIndexscan.c
  *	  Routines to support bitmapped index scans of relations
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,11 +22,10 @@
 #include "postgres.h"
 
 #include "access/genam.h"
-#include "executor/execdebug.h"
+#include "executor/executor.h"
 #include "executor/nodeBitmapIndexscan.h"
 #include "executor/nodeIndexscan.h"
 #include "miscadmin.h"
-#include "utils/memutils.h"
 
 
 /* ----------------------------------------------------------------

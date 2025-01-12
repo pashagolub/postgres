@@ -2,7 +2,7 @@
  * brin_minmax_multi.c
  *		Implementation of Multi Min/Max opclass for BRIN
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -59,16 +59,16 @@
 /* needed for PGSQL_AF_INET */
 #include <sys/socket.h>
 
-#include "access/genam.h"
 #include "access/brin.h"
 #include "access/brin_internal.h"
 #include "access/brin_tuple.h"
+#include "access/genam.h"
+#include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/stratnum.h"
-#include "access/htup_details.h"
-#include "catalog/pg_type.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_amop.h"
+#include "catalog/pg_type.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
@@ -77,7 +77,6 @@
 #include "utils/inet.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
-#include "utils/numeric.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -414,7 +413,7 @@ AssertCheckRanges(Ranges *ranges, FmgrInfo *cmpFn, Oid colloid)
 
 			Assert(bsearch_arg(&value, &ranges->values[2 * ranges->nranges],
 							   ranges->nsorted, sizeof(Datum),
-							   compare_values, (void *) &cxt) == NULL);
+							   compare_values, &cxt) == NULL);
 		}
 	}
 #endif
@@ -551,7 +550,7 @@ range_deduplicate_values(Ranges *range)
 		/* same as preceding value, so store it */
 		if (compare_values(&range->values[start + i - 1],
 						   &range->values[start + i],
-						   (void *) &cxt) == 0)
+						   &cxt) == 0)
 			continue;
 
 		range->values[start + n] = range->values[start + i];
@@ -1086,7 +1085,7 @@ range_contains_value(BrinDesc *bdesc, Oid colloid,
 
 		if (bsearch_arg(&newval, &ranges->values[2 * ranges->nranges],
 						ranges->nsorted, sizeof(Datum),
-						compare_values, (void *) &cxt) != NULL)
+						compare_values, &cxt) != NULL)
 			return true;
 	}
 	else
@@ -1207,7 +1206,7 @@ sort_expanded_ranges(FmgrInfo *cmp, Oid colloid,
 	for (i = 1; i < neranges; i++)
 	{
 		/* if the current range is equal to the preceding one, do nothing */
-		if (!compare_expanded_ranges(&eranges[i - 1], &eranges[i], (void *) &cxt))
+		if (!compare_expanded_ranges(&eranges[i - 1], &eranges[i], &cxt))
 			continue;
 
 		/* otherwise, copy it to n-th place (if not already there) */
@@ -1369,7 +1368,7 @@ build_distances(FmgrInfo *distanceFn, Oid colloid,
 	 * Sort the distances in descending order, so that the longest gaps are at
 	 * the front.
 	 */
-	pg_qsort(distances, ndistances, sizeof(DistanceValue), compare_distances);
+	qsort(distances, ndistances, sizeof(DistanceValue), compare_distances);
 
 	return distances;
 }
@@ -2081,13 +2080,15 @@ brin_minmax_multi_distance_uuid(PG_FUNCTION_ARGS)
 Datum
 brin_minmax_multi_distance_date(PG_FUNCTION_ARGS)
 {
+	float8		delta = 0;
 	DateADT		dateVal1 = PG_GETARG_DATEADT(0);
 	DateADT		dateVal2 = PG_GETARG_DATEADT(1);
 
-	if (DATE_NOT_FINITE(dateVal1) || DATE_NOT_FINITE(dateVal2))
-		PG_RETURN_FLOAT8(0);
+	delta = (float8) dateVal2 - (float8) dateVal1;
 
-	PG_RETURN_FLOAT8(dateVal1 - dateVal2);
+	Assert(delta >= 0);
+
+	PG_RETURN_FLOAT8(delta);
 }
 
 /*
@@ -2141,10 +2142,7 @@ brin_minmax_multi_distance_timestamp(PG_FUNCTION_ARGS)
 	Timestamp	dt1 = PG_GETARG_TIMESTAMP(0);
 	Timestamp	dt2 = PG_GETARG_TIMESTAMP(1);
 
-	if (TIMESTAMP_NOT_FINITE(dt1) || TIMESTAMP_NOT_FINITE(dt2))
-		PG_RETURN_FLOAT8(0);
-
-	delta = dt2 - dt1;
+	delta = (float8) dt2 - (float8) dt1;
 
 	Assert(delta >= 0);
 
@@ -2161,34 +2159,9 @@ brin_minmax_multi_distance_interval(PG_FUNCTION_ARGS)
 
 	Interval   *ia = PG_GETARG_INTERVAL_P(0);
 	Interval   *ib = PG_GETARG_INTERVAL_P(1);
-	Interval   *result;
 
 	int64		dayfraction;
 	int64		days;
-
-	result = (Interval *) palloc(sizeof(Interval));
-
-	result->month = ib->month - ia->month;
-	/* overflow check copied from int4mi */
-	if (!SAMESIGN(ib->month, ia->month) &&
-		!SAMESIGN(result->month, ib->month))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("interval out of range")));
-
-	result->day = ib->day - ia->day;
-	if (!SAMESIGN(ib->day, ia->day) &&
-		!SAMESIGN(result->day, ib->day))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("interval out of range")));
-
-	result->time = ib->time - ia->time;
-	if (!SAMESIGN(ib->time, ia->time) &&
-		!SAMESIGN(result->time, ib->time))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-				 errmsg("interval out of range")));
 
 	/*
 	 * Delta is (fractional) number of days between the intervals. Assume
@@ -2196,10 +2169,10 @@ brin_minmax_multi_distance_interval(PG_FUNCTION_ARGS)
 	 * don't need to be exact, in the worst case we'll build a bit less
 	 * efficient ranges. But we should not contradict interval_cmp.
 	 */
-	dayfraction = result->time % USECS_PER_DAY;
-	days = result->time / USECS_PER_DAY;
-	days += result->month * INT64CONST(30);
-	days += result->day;
+	dayfraction = (ib->time % USECS_PER_DAY) - (ia->time % USECS_PER_DAY);
+	days = (ib->time / USECS_PER_DAY) - (ia->time / USECS_PER_DAY);
+	days += (int64) ib->day - (int64) ia->day;
+	days += ((int64) ib->month - (int64) ia->month) * INT64CONST(30);
 
 	/* convert to double precision */
 	delta = (double) days + dayfraction / (double) USECS_PER_DAY;
@@ -3050,7 +3023,7 @@ brin_minmax_multi_summary_out(PG_FUNCTION_ARGS)
 	 * Detoast to get value with full 4B header (can't be stored in a toast
 	 * table, but can use 1B header).
 	 */
-	ranges = (SerializedRanges *) PG_DETOAST_DATUM_PACKED(PG_GETARG_DATUM(0));
+	ranges = (SerializedRanges *) PG_DETOAST_DATUM(PG_GETARG_DATUM(0));
 
 	/* lookup output func for the type */
 	getTypeOutputInfo(ranges->typid, &outfunc, &isvarlena);

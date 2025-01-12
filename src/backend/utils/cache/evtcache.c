@@ -3,7 +3,7 @@
  * evtcache.c
  *	  Special-purpose cache for event trigger data.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -28,7 +28,6 @@
 #include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
-#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 typedef enum
@@ -91,7 +90,7 @@ BuildEventTriggerCache(void)
 		 * This can happen either because a previous rebuild failed, or
 		 * because an invalidation happened before the rebuild was complete.
 		 */
-		MemoryContextResetAndDeleteChildren(EventTriggerCacheContext);
+		MemoryContextReset(EventTriggerCacheContext);
 	}
 	else
 	{
@@ -262,7 +261,7 @@ InvalidateEventCacheCallback(Datum arg, int cacheid, uint32 hashvalue)
 	 */
 	if (EventTriggerCacheState == ETCS_VALID)
 	{
-		MemoryContextResetAndDeleteChildren(EventTriggerCacheContext);
+		MemoryContextReset(EventTriggerCacheContext);
 		EventTriggerCache = NULL;
 	}
 

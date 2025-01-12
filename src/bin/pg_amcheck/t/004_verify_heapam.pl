@@ -1,8 +1,8 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
@@ -181,7 +181,7 @@ my $aborted_xid;
 # autovacuum workers visiting the table could crash the backend.
 # Disable autovacuum so that won't happen.
 my $node = PostgreSQL::Test::Cluster->new('test');
-$node->init;
+$node->init(no_data_checksums => 1);
 $node->append_conf('postgresql.conf', 'autovacuum=off');
 $node->append_conf('postgresql.conf', 'max_prepared_transactions=10');
 
@@ -367,10 +367,11 @@ for (my $tupidx = 0; $tupidx < $ROWCOUNT; $tupidx++)
 	{
 		close($file);    # ignore errors on close; we're exiting anyway
 		$node->clean_node;
-		plan skip_all =>
-		  sprintf(
+		plan skip_all => sprintf(
 			"Page layout of index %d differs from our expectations: expected (%x, %x, \"%s\"), got (%x, %x, \"%s\")",
-			$tupidx, 0xDEADF9F9, 0xDEADF9F9, "abcdefg", $a_1, $a_2, $b);
+			$tupidx, 0xDEADF9F9, 0xDEADF9F9, "abcdefg", $a_1, $a_2,
+			# escape non-word characters to avoid confusing the terminal
+			$b =~ s{(\W)}{ sprintf '\x%02x', ord($1) }aegr);
 		exit;
 	}
 
